@@ -7,7 +7,11 @@ const CENTER_Y = VIEW_HEIGHT / 2;
 
 const BALL_COUNT = 10;
 const BALL_RADIUS = 18;
-const BALL_SPACING = 43;
+const BALL_DIAMETER = BALL_RADIUS * 2;
+const BALL_GAP = 7;
+const BALL_SPACING = BALL_DIAMETER + BALL_GAP;
+const MIN_MATCH = 3;
+const MATCH_FADE_DURATION = 260;
 const CHAIN_SPEED = 48; // pixels per second
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
@@ -47,6 +51,10 @@ const MARBLE_COLORS = [
   '#c39bff',
 ];
 
+// The first two marbles share a colour so the player can immediately create
+// a three-in-a-row by inserting the first (gold) shot beside them.
+const INITIAL_CHAIN_COLORS = [0, 0, 2, 3, 4, 5, 6, 7, 8, 9];
+
 const DEPTH = {
   backdrop: -40,
   foliage: -20,
@@ -69,6 +77,7 @@ export class GameScene extends Phaser.Scene {
 
     this.trackLength = 0;
     this.chainHeadDistance = 0;
+    this.ballPitchT = 0;
     this.chainComplete = false;
     this.pointerSeen = false;
     this.marbles = [];
@@ -100,7 +109,7 @@ export class GameScene extends Phaser.Scene {
 
     this.game.canvas.setAttribute(
       'aria-label',
-      'Serpentine prototype: ten marbles move along an S-shaped spline. Move the mouse to aim and click to fire marbles at the chain.',
+      'Serpentine: insert fired marbles into the S-shaped chain and match three or more colours to clear them.',
     );
 
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
@@ -112,17 +121,7 @@ export class GameScene extends Phaser.Scene {
   update(_time, delta) {
     const step = Math.min(delta, MAX_FRAME_DELTA) / 1000;
 
-    if (!this.chainComplete) {
-      this.chainHeadDistance = Math.min(
-        this.chainHeadDistance + CHAIN_SPEED * step,
-        this.trackLength,
-      );
-
-      if (this.chainHeadDistance >= this.trackLength) {
-        this.chainComplete = true;
-      }
-    }
-
+    this.updateChainMovement(step);
     this.updateChainPositions();
     this.updateShots(step);
     this.aimAtPointer();
@@ -343,19 +342,28 @@ export class GameScene extends Phaser.Scene {
   createMarbles() {
     this.createMarbleTextures();
 
-    // Start with the head far enough along the spline for all ten marbles to
-    // be visible, then lock every marble to the shared arc-length chain.
-    this.chainHeadDistance = (BALL_COUNT - 1) * BALL_SPACING;
+    // Every marble stores its own normalised arc-length progress (t). The
+    // array is ordered head -> tail, so t is always descending.
+    this.ballPitchT = BALL_SPACING / this.trackLength;
     this.chainComplete = false;
 
-    this.marbles = MARBLE_COLORS.map((_, index) =>
-      this.add
-        .image(0, 0, `zs-marble-${index}`)
+    this.marbles = INITIAL_CHAIN_COLORS.map((colorIndex, index) => {
+      const marble = this.add
+        .image(0, 0, `zs-marble-${colorIndex}`)
         .setDepth(DEPTH.balls)
-        .setData('chainIndex', index)
-        .setData('colorIndex', index),
-    );
+        .setData('colorIndex', colorIndex);
 
+      marble.colorIndex = colorIndex;
+      marble.t = Phaser.Math.Clamp(
+        (BALL_COUNT - 1 - index) * this.ballPitchT,
+        0,
+        1,
+      );
+
+      return marble;
+    });
+
+    this.chainHeadDistance = this.marbles[0].t * this.trackLength;
     this.updateChainPositions();
   }
 
@@ -402,19 +410,38 @@ export class GameScene extends Phaser.Scene {
     graphics.destroy();
   }
 
+  updateChainMovement(step) {
+    const front = this.marbles[0];
+
+    if (!front) {
+      this.chainHeadDistance = this.trackLength;
+      this.chainComplete = true;
+      return;
+    }
+
+    // The chain advances as one unit. Pin the head at t = 1 so the marbles
+    // behind it keep their spacing instead of stacking on the endpoint.
+    const travelT = Math.min(
+      (CHAIN_SPEED * step) / this.trackLength,
+      Math.max(0, 1 - front.t),
+    );
+
+    if (travelT > 0) {
+      for (const marble of this.marbles) {
+        marble.t = Phaser.Math.Clamp(marble.t + travelT, 0, 1);
+      }
+    }
+
+    this.chainHeadDistance = front.t * this.trackLength;
+    this.chainComplete = front.t >= 1;
+  }
+
   updateChainPositions() {
-    this.marbles.forEach((marble) => {
-      // Keep each survivor in its original chain slot. A hit leaves a gap
-      // instead of snapping the remaining marbles forward.
-      const chainIndex = marble.getData('chainIndex');
-      const distance = Phaser.Math.Clamp(
-        this.chainHeadDistance - chainIndex * BALL_SPACING,
-        0,
-        this.trackLength,
-      );
-      const position = this.getTrackPoint(distance);
+    for (const marble of this.marbles) {
+      marble.t = Phaser.Math.Clamp(marble.t, 0, 1);
+      const position = this.track.getPointAt(marble.t);
       marble.setPosition(position.x, position.y);
-    });
+    }
   }
 
   getTrackPoint(distance) {
@@ -569,6 +596,7 @@ export class GameScene extends Phaser.Scene {
       vx: Math.cos(angle) * SHOT_SPEED,
       vy: Math.sin(angle) * SHOT_SPEED,
       radius: SHOT_RADIUS,
+      colorIndex,
     });
 
     this.createMuzzleFlash(muzzleX, muzzleY);
@@ -621,29 +649,140 @@ export class GameScene extends Phaser.Scene {
     return null;
   }
 
-  resolveHit(shot, marble) {
-    const hitX = marble.x;
-    const hitY = marble.y;
-    const colorIndex = marble.getData('colorIndex') ?? 0;
+  resolveHit(shot, hitMarble) {
+    const hitIndex = this.marbles.indexOf(hitMarble);
+
+    // Defensive guard: the chain can change between the collision check and
+    // this handler if several projectiles collide during the same frame.
+    if (hitIndex === -1) {
+      const orphanIndex = this.shots.indexOf(shot);
+      if (orphanIndex !== -1) {
+        this.shots.splice(orphanIndex, 1);
+      }
+      shot.sprite.destroy();
+      return;
+    }
 
     const shotIndex = this.shots.indexOf(shot);
     if (shotIndex !== -1) {
       this.shots.splice(shotIndex, 1);
     }
 
-    const marbleIndex = this.marbles.indexOf(marble);
-    if (marbleIndex !== -1) {
-      this.marbles.splice(marbleIndex, 1);
+    const hitX = hitMarble.x;
+    const hitY = hitMarble.y;
+    const hitT = hitMarble.t;
+
+    // Project the projectile's position onto the track tangent. A positive
+    // dot means it approached from the front half of the struck marble.
+    const tangent = this.track.getTangentAt(hitT);
+    const offsetX = shot.sprite.x - hitX;
+    const offsetY = shot.sprite.y - hitY;
+    const approachedFromFront = offsetX * tangent.x + offsetY * tangent.y >= 0;
+
+    // Do not slide the tail off the start of the spline. If a rear insertion
+    // would produce t < 0, mirror it to the front side instead.
+    const isTail = hitIndex === this.marbles.length - 1;
+    const wouldFallOffStart =
+      !approachedFromFront && isTail && hitT < this.ballPitchT;
+    const insertInFront = approachedFromFront || wouldFallOffStart;
+    const insertIndex = insertInFront ? hitIndex : hitIndex + 1;
+
+    // Convert the projectile into a permanent marble on the chain.
+    const insertedMarble = shot.sprite;
+    insertedMarble
+      .setDepth(DEPTH.balls)
+      .setData('type', 'marble')
+      .setData('colorIndex', shot.colorIndex);
+    insertedMarble.colorIndex = shot.colorIndex;
+
+    // Pushing: every marble at/after the insertion point on the tail side
+    // gives up exactly one marble pitch of progress along the spline.
+    const shiftStart = insertInFront ? hitIndex : hitIndex + 1;
+    for (let index = shiftStart; index < this.marbles.length; index += 1) {
+      const marble = this.marbles[index];
+      marble.t = Phaser.Math.Clamp(marble.t - this.ballPitchT, 0, 1);
     }
 
-    // Phase 02 scope: both the projectile and the struck chain marble vanish.
-    shot.sprite.destroy();
-    marble.destroy();
+    insertedMarble.t = Phaser.Math.Clamp(
+      insertInFront ? hitT : hitT - this.ballPitchT,
+      0,
+      1,
+    );
+    this.marbles.splice(insertIndex, 0, insertedMarble);
+    this.updateChainPositions();
+
+    this.chainHeadDistance = this.marbles[0].t * this.trackLength;
+    this.updateMarbleCount();
+    this.createInsertPulse(hitX, hitY, shot.colorIndex);
 
     console.log('Hit!');
 
-    this.createHitBurst(hitX, hitY, colorIndex);
+    this.resolveMatches(insertedMarble);
+  }
+
+  resolveMatches(insertedMarble) {
+    const insertedIndex = this.marbles.indexOf(insertedMarble);
+
+    if (insertedIndex === -1) {
+      return 0;
+    }
+
+    const colorIndex = insertedMarble.colorIndex;
+
+    // Scan both directions first, without mutating the array. Only after the
+    // complete run is known do we splice once, so no index can fall out of
+    // sync or point at undefined mid-loop.
+    let start = insertedIndex;
+    while (
+      start > 0 &&
+      this.marbles[start - 1].colorIndex === colorIndex
+    ) {
+      start -= 1;
+    }
+
+    let end = insertedIndex;
+    while (
+      end < this.marbles.length - 1 &&
+      this.marbles[end + 1].colorIndex === colorIndex
+    ) {
+      end += 1;
+    }
+
+    const matchLength = end - start + 1;
+
+    if (matchLength < MIN_MATCH) {
+      return 0;
+    }
+
+    const matched = this.marbles.splice(start, matchLength);
+    let centerX = 0;
+    let centerY = 0;
+    for (const marble of matched) {
+      centerX += marble.x;
+      centerY += marble.y;
+    }
+    centerX /= matched.length;
+    centerY /= matched.length;
+
     this.updateMarbleCount();
+
+    // Remove from the collision array immediately, then let the visuals
+    // pop/fade away safely before destroying the sprites.
+    matched.forEach((marble, index) => {
+      this.tweens.add({
+        targets: marble,
+        scale: 1.45,
+        alpha: 0,
+        angle: marble.angle + 24,
+        duration: MATCH_FADE_DURATION,
+        delay: index * 28,
+        ease: 'Back.easeIn',
+        onComplete: () => marble.destroy(),
+      });
+    });
+
+    this.createMatchBurst(centerX, centerY, colorIndex);
+    return matchLength;
   }
 
   createMuzzleFlash(x, y) {
@@ -662,13 +801,33 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
-  createHitBurst(x, y, colorIndex) {
+  createInsertPulse(x, y, colorIndex) {
     const color = Phaser.Display.Color.HexStringToColor(
       MARBLE_COLORS[colorIndex % MARBLE_COLORS.length],
     ).color;
 
     const ring = this.add
-      .circle(x, y, 20, color, 0.14)
+      .circle(x, y, 24, color, 0.08)
+      .setStrokeStyle(2, color, 0.58)
+      .setDepth(DEPTH.effects);
+
+    this.tweens.add({
+      targets: ring,
+      scale: 1.8,
+      alpha: 0,
+      duration: 260,
+      ease: 'Cubic.easeOut',
+      onComplete: () => ring.destroy(),
+    });
+  }
+
+  createMatchBurst(x, y, colorIndex) {
+    const color = Phaser.Display.Color.HexStringToColor(
+      MARBLE_COLORS[colorIndex % MARBLE_COLORS.length],
+    ).color;
+
+    const ring = this.add
+      .circle(x, y, 22, color, 0.14)
       .setStrokeStyle(2, color, 0.8)
       .setDepth(DEPTH.effects);
 
@@ -746,7 +905,7 @@ export class GameScene extends Phaser.Scene {
     title.setShadow(0, 2, '#000000', 8, false, true);
 
     this.add
-      .text(30, 51, 'PHASE 02 / SHOOT & COLLIDE', {
+      .text(30, 51, 'PHASE 03 / INSERT / PUSH / MATCH', {
         fontFamily: '"Courier New", monospace',
         fontSize: '9px',
         color: '#b4c79d',
@@ -765,7 +924,7 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     this.marbleCountText = this.add
-      .text(770, 44, '10 MARBLES / 01 PATH', {
+      .text(770, 44, `${this.marbles.length} MARBLES / 01 PATH`, {
         fontFamily: '"Courier New", monospace',
         fontSize: '9px',
         color: '#c8d8b2',
