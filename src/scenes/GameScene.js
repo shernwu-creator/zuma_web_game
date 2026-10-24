@@ -12,6 +12,9 @@ const BALL_GAP = 7;
 const BALL_SPACING = BALL_DIAMETER + BALL_GAP;
 const MIN_MATCH = 3;
 const MATCH_FADE_DURATION = 260;
+const SHOOTER_BALL_SCALE = 0.8;
+const INITIAL_CURRENT_COLOR = 0;
+const INITIAL_NEXT_COLOR = 1;
 const CHAIN_SPEED = 48; // pixels per second
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
@@ -77,12 +80,15 @@ export class GameScene extends Phaser.Scene {
 
     this.trackLength = 0;
     this.chainHeadDistance = 0;
-    this.ballPitchT = 0;
+    this.initialGapT = 0;
+    this.deltaT = 0;
     this.chainComplete = false;
     this.pointerSeen = false;
     this.marbles = [];
     this.shots = [];
-    this.nextShotColor = 0;
+    this.currentBulletColor = INITIAL_CURRENT_COLOR;
+    this.nextBulletColor = INITIAL_NEXT_COLOR;
+    this.shooterIndicator = null;
   }
 
   create() {
@@ -342,29 +348,82 @@ export class GameScene extends Phaser.Scene {
   createMarbles() {
     this.createMarbleTextures();
 
-    // Every marble stores its own normalised arc-length progress (t). The
-    // array is ordered head -> tail, so t is always descending.
-    this.ballPitchT = BALL_SPACING / this.trackLength;
+    // deltaT is the proportion of the spline covered by one physical marble
+    // diameter. This is the exact amount every trailing marble is pushed.
+    this.initialGapT = BALL_SPACING / this.trackLength;
+    this.deltaT = BALL_DIAMETER / this.trackLength;
     this.chainComplete = false;
 
-    this.marbles = INITIAL_CHAIN_COLORS.map((colorIndex, index) => {
-      const marble = this.add
-        .image(0, 0, `zs-marble-${colorIndex}`)
-        .setDepth(DEPTH.balls)
-        .setData('colorIndex', colorIndex);
-
-      marble.colorIndex = colorIndex;
-      marble.t = Phaser.Math.Clamp(
-        (BALL_COUNT - 1 - index) * this.ballPitchT,
-        0,
-        1,
-      );
-
-      return marble;
-    });
+    // Every chain marble is a genuine PathFollower. Its t is driven manually
+    // so the chain can be moved, inserted into and pushed as a group.
+    this.marbles = INITIAL_CHAIN_COLORS.map((colorIndex, index) =>
+      this.createPathMarble(
+        colorIndex,
+        (BALL_COUNT - 1 - index) * this.initialGapT,
+      ),
+    );
 
     this.chainHeadDistance = this.marbles[0].t * this.trackLength;
     this.updateChainPositions();
+  }
+
+  createPathMarble(colorIndex, t, x = 0, y = 0) {
+    const marble = this.add
+      .follower(this.track, x, y, `zs-marble-${colorIndex}`)
+      .setDepth(DEPTH.balls)
+      .setData('type', 'marble')
+      .setData('colorIndex', colorIndex);
+
+    marble.colorIndex = colorIndex;
+    marble.t = Phaser.Math.Clamp(t, 0, 1);
+
+    return marble;
+  }
+
+  normalizePushedChain() {
+    if (this.marbles.length === 0) {
+      return;
+    }
+
+    // If pushing a marble past the entrance would put it below t = 0, slide
+    // the whole chain forward by the deficit. The spacing relative to the
+    // insertion point is preserved, but the tail never overlaps at the start.
+    let minT = Infinity;
+    let maxT = -Infinity;
+
+    for (const marble of this.marbles) {
+      minT = Math.min(minT, marble.t);
+      maxT = Math.max(maxT, marble.t);
+    }
+
+    if (minT < 0) {
+      const forwardShift = -minT;
+      for (const marble of this.marbles) {
+        marble.t += forwardShift;
+      }
+      maxT += forwardShift;
+    }
+
+    if (maxT > 1) {
+      const backwardShift = 1 - maxT;
+      for (const marble of this.marbles) {
+        marble.t += backwardShift;
+      }
+    }
+
+    // Safety net: no pair may be closer than one physical diameter, even
+    // after boundary shifts or floating-point drift.
+    for (let index = 1; index < this.marbles.length; index += 1) {
+      const maxTrailingT = this.marbles[index - 1].t - this.deltaT;
+
+      if (this.marbles[index].t > maxTrailingT) {
+        this.marbles[index].t = Math.max(0, maxTrailingT);
+      }
+    }
+
+    for (const marble of this.marbles) {
+      marble.t = Phaser.Math.Clamp(marble.t, 0, 1);
+    }
   }
 
   createMarbleTextures() {
@@ -501,9 +560,9 @@ export class GameScene extends Phaser.Scene {
 
     // Subtle aim guide, rotating with the triangle.
     turret.lineStyle(1, 0xf7e7ab, 0.2);
-    turret.lineBetween(45, 0, 104, 0);
+    turret.lineBetween(68, 0, 112, 0);
     turret.fillStyle(0xf7e7ab, 0.28);
-    turret.fillCircle(104, 0, 2);
+    turret.fillCircle(112, 0, 2);
 
     // Shadow and dark silhouette.
     turret.fillStyle(0x000000, 0.35);
@@ -529,7 +588,26 @@ export class GameScene extends Phaser.Scene {
     turret.fillStyle(0xffffff, 0.45);
     turret.fillCircle(-6.5, -1.5, 1.6);
 
-    this.cannon.add(turret);
+    // The loaded marble sits at the muzzle and is a child of the cannon,
+    // so it rotates together with the launcher when aiming.
+    this.shooterIndicator = this.add
+      .image(53, 0, `zs-marble-${this.currentBulletColor}`)
+      .setScale(SHOOTER_BALL_SCALE)
+      .setName('shooter-indicator')
+      .setData('type', 'shooter-indicator')
+      .setData('colorIndex', this.currentBulletColor);
+
+    this.cannon.add([turret, this.shooterIndicator]);
+  }
+
+  updateShooterIndicator() {
+    if (!this.shooterIndicator) {
+      return;
+    }
+
+    this.shooterIndicator
+      .setTexture(`zs-marble-${this.currentBulletColor}`)
+      .setData('colorIndex', this.currentBulletColor);
   }
 
   aimAtPointer() {
@@ -581,15 +659,22 @@ export class GameScene extends Phaser.Scene {
 
     const muzzleX = CENTER_X + Math.cos(angle) * SHOT_SPAWN_OFFSET;
     const muzzleY = CENTER_Y + Math.sin(angle) * SHOT_SPAWN_OFFSET;
-    const colorIndex = this.nextShotColor % MARBLE_COLORS.length;
+    const colorIndex = this.currentBulletColor;
 
-    this.nextShotColor += 1;
+    // Consume the loaded marble and immediately promote the queued colour.
+    this.currentBulletColor = this.nextBulletColor;
+    this.nextBulletColor = (this.nextBulletColor + 1) % MARBLE_COLORS.length;
+    this.updateShooterIndicator();
     this.cannon.setRotation(angle);
 
+    // Projectiles are PathFollowers too. While in flight they are moved
+    // manually in a straight line; on impact the very same object is rebound
+    // to the chain by assigning it a t value.
     const sprite = this.add
-      .image(muzzleX, muzzleY, `zs-marble-${colorIndex}`)
+      .follower(this.track, muzzleX, muzzleY, `zs-marble-${colorIndex}`)
       .setDepth(DEPTH.shots)
-      .setData('type', 'projectile');
+      .setData('type', 'projectile')
+      .setData('colorIndex', colorIndex);
 
     this.shots.push({
       sprite,
@@ -668,53 +753,58 @@ export class GameScene extends Phaser.Scene {
       this.shots.splice(shotIndex, 1);
     }
 
+    const shotX = shot.sprite.x;
+    const shotY = shot.sprite.y;
     const hitX = hitMarble.x;
     const hitY = hitMarble.y;
     const hitT = hitMarble.t;
 
-    // Project the projectile's position onto the track tangent. A positive
-    // dot means it approached from the front half of the struck marble.
+    // The distance check already happened in findMarbleHit(). Here the angle
+    // between the impact point and the path tangent decides which side of the
+    // struck marble owns the new slot.
     const tangent = this.track.getTangentAt(hitT);
-    const offsetX = shot.sprite.x - hitX;
-    const offsetY = shot.sprite.y - hitY;
-    const approachedFromFront = offsetX * tangent.x + offsetY * tangent.y >= 0;
+    const tangentAngle = Math.atan2(tangent.y, tangent.x);
+    const impactAngle = Math.atan2(shotY - hitY, shotX - hitX);
+    const angleFromTangent = Phaser.Math.Angle.Wrap(
+      impactAngle - tangentAngle,
+    );
+    const approachedFromFront = Math.abs(angleFromTangent) <= Math.PI / 2;
 
-    // Do not slide the tail off the start of the spline. If a rear insertion
-    // would produce t < 0, mirror it to the front side instead.
+    // Do not push the tail past t = 0. A rear insertion at the entrance is
+    // mirrored to the front side so it can always open a legal slot.
     const isTail = hitIndex === this.marbles.length - 1;
     const wouldFallOffStart =
-      !approachedFromFront && isTail && hitT < this.ballPitchT;
+      !approachedFromFront && isTail && hitT < this.deltaT;
     const insertInFront = approachedFromFront || wouldFallOffStart;
     const insertIndex = insertInFront ? hitIndex : hitIndex + 1;
 
-    // Convert the projectile into a permanent marble on the chain.
+    // The projectile is already a PathFollower. Rebind the exact same object
+    // to the chain now that its t value can be assigned.
     const insertedMarble = shot.sprite;
     insertedMarble
       .setDepth(DEPTH.balls)
       .setData('type', 'marble')
       .setData('colorIndex', shot.colorIndex);
     insertedMarble.colorIndex = shot.colorIndex;
+    insertedMarble.t = insertInFront ? hitT : hitT - this.deltaT;
 
-    // Pushing: every marble at/after the insertion point on the tail side
-    // gives up exactly one marble pitch of progress along the spline.
+    // Push every marble on the tail side of the insertion by exactly one
+    // physical diameter (deltaT), not by an arbitrary slot size.
     const shiftStart = insertInFront ? hitIndex : hitIndex + 1;
     for (let index = shiftStart; index < this.marbles.length; index += 1) {
-      const marble = this.marbles[index];
-      marble.t = Phaser.Math.Clamp(marble.t - this.ballPitchT, 0, 1);
+      this.marbles[index].t -= this.deltaT;
     }
 
-    insertedMarble.t = Phaser.Math.Clamp(
-      insertInFront ? hitT : hitT - this.ballPitchT,
-      0,
-      1,
-    );
     this.marbles.splice(insertIndex, 0, insertedMarble);
-    this.updateChainPositions();
 
+    // Commit all pushed t values to screen coordinates BEFORE scanning for
+    // matches. This keeps the visual chain and the matching logic in sync.
+    this.normalizePushedChain();
+    this.updateChainPositions();
     this.chainHeadDistance = this.marbles[0].t * this.trackLength;
     this.updateMarbleCount();
-    this.createInsertPulse(hitX, hitY, shot.colorIndex);
 
+    this.createInsertPulse(hitX, hitY, shot.colorIndex);
     console.log('Hit!');
 
     this.resolveMatches(insertedMarble);
