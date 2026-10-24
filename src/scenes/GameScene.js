@@ -9,6 +9,10 @@ const BALL_COUNT = 10;
 const BALL_RADIUS = 18;
 const BALL_SPACING = 43;
 const CHAIN_SPEED = 48; // pixels per second
+const SHOT_SPEED = 520; // pixels per second
+const SHOT_RADIUS = BALL_RADIUS;
+const SHOT_SPAWN_OFFSET = 56;
+const SHOT_CULL_MARGIN = 48;
 const MAX_FRAME_DELTA = 50;
 
 // A wide, winding S that crosses the whole board. The middle pass sits below
@@ -51,9 +55,11 @@ const DEPTH = {
   track: 2,
   trackDebug: 3,
   balls: 5,
+  shots: 6,
   launcherGlow: 7,
   launcherBase: 8,
   launcher: 9,
+  effects: 12,
   hud: 30,
 };
 
@@ -66,6 +72,8 @@ export class GameScene extends Phaser.Scene {
     this.chainComplete = false;
     this.pointerSeen = false;
     this.marbles = [];
+    this.shots = [];
+    this.nextShotColor = 0;
   }
 
   create() {
@@ -86,12 +94,19 @@ export class GameScene extends Phaser.Scene {
       this.pointerSeen = true;
     });
 
+    this.input.on('pointerdown', this.handlePointerDown, this);
+
     this.aimAtPointer();
 
     this.game.canvas.setAttribute(
       'aria-label',
-      'Serpentine prototype: ten marbles move along an S-shaped spline. Move the mouse to aim the central launcher.',
+      'Serpentine prototype: ten marbles move along an S-shaped spline. Move the mouse to aim and click to fire marbles at the chain.',
     );
+
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      this.input.off('pointerdown', this.handlePointerDown, this);
+      this.shots = [];
+    });
   }
 
   update(_time, delta) {
@@ -109,6 +124,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.updateChainPositions();
+    this.updateShots(step);
     this.aimAtPointer();
   }
 
@@ -333,7 +349,11 @@ export class GameScene extends Phaser.Scene {
     this.chainComplete = false;
 
     this.marbles = MARBLE_COLORS.map((_, index) =>
-      this.add.image(0, 0, `zs-marble-${index}`).setDepth(DEPTH.balls),
+      this.add
+        .image(0, 0, `zs-marble-${index}`)
+        .setDepth(DEPTH.balls)
+        .setData('chainIndex', index)
+        .setData('colorIndex', index),
     );
 
     this.updateChainPositions();
@@ -383,9 +403,12 @@ export class GameScene extends Phaser.Scene {
   }
 
   updateChainPositions() {
-    this.marbles.forEach((marble, index) => {
+    this.marbles.forEach((marble) => {
+      // Keep each survivor in its original chain slot. A hit leaves a gap
+      // instead of snapping the remaining marbles forward.
+      const chainIndex = marble.getData('chainIndex');
       const distance = Phaser.Math.Clamp(
-        this.chainHeadDistance - index * BALL_SPACING,
+        this.chainHeadDistance - chainIndex * BALL_SPACING,
         0,
         this.trackLength,
       );
@@ -499,6 +522,187 @@ export class GameScene extends Phaser.Scene {
   }
 
   /* ------------------------------------------------------------------ */
+  /* Shooting and collision                                              */
+  /* ------------------------------------------------------------------ */
+
+  handlePointerDown(pointer) {
+    if (!pointer || pointer.button !== 0) {
+      return;
+    }
+
+    this.pointerSeen = true;
+    this.shootAt(pointer.worldX, pointer.worldY);
+  }
+
+  shootAt(targetX, targetY) {
+    if (!this.cannon) {
+      return;
+    }
+
+    const distanceToTarget = Phaser.Math.Distance.Between(
+      CENTER_X,
+      CENTER_Y,
+      targetX,
+      targetY,
+    );
+
+    // A click directly on the pivot has no direction; reuse the current aim.
+    const angle =
+      distanceToTarget < 1
+        ? this.cannon.rotation
+        : Phaser.Math.Angle.Between(CENTER_X, CENTER_Y, targetX, targetY);
+
+    const muzzleX = CENTER_X + Math.cos(angle) * SHOT_SPAWN_OFFSET;
+    const muzzleY = CENTER_Y + Math.sin(angle) * SHOT_SPAWN_OFFSET;
+    const colorIndex = this.nextShotColor % MARBLE_COLORS.length;
+
+    this.nextShotColor += 1;
+    this.cannon.setRotation(angle);
+
+    const sprite = this.add
+      .image(muzzleX, muzzleY, `zs-marble-${colorIndex}`)
+      .setDepth(DEPTH.shots)
+      .setData('type', 'projectile');
+
+    this.shots.push({
+      sprite,
+      vx: Math.cos(angle) * SHOT_SPEED,
+      vy: Math.sin(angle) * SHOT_SPEED,
+      radius: SHOT_RADIUS,
+    });
+
+    this.createMuzzleFlash(muzzleX, muzzleY);
+  }
+
+  updateShots(step) {
+    for (let index = this.shots.length - 1; index >= 0; index -= 1) {
+      const shot = this.shots[index];
+
+      // Straight-line, constant-speed travel. The direction was captured at
+      // the moment of the click and never changes afterwards.
+      shot.sprite.x += shot.vx * step;
+      shot.sprite.y += shot.vy * step;
+
+      const marble = this.findMarbleHit(shot);
+      if (marble) {
+        this.resolveHit(shot, marble);
+        continue;
+      }
+
+      const { x, y } = shot.sprite;
+      if (
+        x < -SHOT_CULL_MARGIN ||
+        x > VIEW_WIDTH + SHOT_CULL_MARGIN ||
+        y < -SHOT_CULL_MARGIN ||
+        y > VIEW_HEIGHT + SHOT_CULL_MARGIN
+      ) {
+        shot.sprite.destroy();
+        this.shots.splice(index, 1);
+      }
+    }
+  }
+
+  findMarbleHit(shot) {
+    const hitDistanceSq = (SHOT_RADIUS + BALL_RADIUS) ** 2;
+
+    for (const marble of this.marbles) {
+      if (!marble.active) {
+        continue;
+      }
+
+      const dx = marble.x - shot.sprite.x;
+      const dy = marble.y - shot.sprite.y;
+
+      if (dx * dx + dy * dy <= hitDistanceSq) {
+        return marble;
+      }
+    }
+
+    return null;
+  }
+
+  resolveHit(shot, marble) {
+    const hitX = marble.x;
+    const hitY = marble.y;
+    const colorIndex = marble.getData('colorIndex') ?? 0;
+
+    const shotIndex = this.shots.indexOf(shot);
+    if (shotIndex !== -1) {
+      this.shots.splice(shotIndex, 1);
+    }
+
+    const marbleIndex = this.marbles.indexOf(marble);
+    if (marbleIndex !== -1) {
+      this.marbles.splice(marbleIndex, 1);
+    }
+
+    // Phase 02 scope: both the projectile and the struck chain marble vanish.
+    shot.sprite.destroy();
+    marble.destroy();
+
+    console.log('Hit!');
+
+    this.createHitBurst(hitX, hitY, colorIndex);
+    this.updateMarbleCount();
+  }
+
+  createMuzzleFlash(x, y) {
+    const flash = this.add
+      .circle(x, y, 10, 0xffeaa8, 0.55)
+      .setDepth(DEPTH.effects)
+      .setBlendMode(Phaser.BlendModes.ADD);
+
+    this.tweens.add({
+      targets: flash,
+      scale: 2.2,
+      alpha: 0,
+      duration: 170,
+      ease: 'Quad.easeOut',
+      onComplete: () => flash.destroy(),
+    });
+  }
+
+  createHitBurst(x, y, colorIndex) {
+    const color = Phaser.Display.Color.HexStringToColor(
+      MARBLE_COLORS[colorIndex % MARBLE_COLORS.length],
+    ).color;
+
+    const ring = this.add
+      .circle(x, y, 20, color, 0.14)
+      .setStrokeStyle(2, color, 0.8)
+      .setDepth(DEPTH.effects);
+
+    this.tweens.add({
+      targets: ring,
+      scale: 2.3,
+      alpha: 0,
+      duration: 360,
+      ease: 'Cubic.easeOut',
+      onComplete: () => ring.destroy(),
+    });
+
+    for (let i = 0; i < 7; i += 1) {
+      const angle = (i / 7) * Math.PI * 2 + Phaser.Math.FloatBetween(-0.2, 0.2);
+      const spread = Phaser.Math.FloatBetween(24, 44);
+      const spark = this.add
+        .circle(x, y, Phaser.Math.FloatBetween(1.8, 3.2), color, 0.9)
+        .setDepth(DEPTH.effects)
+        .setBlendMode(Phaser.BlendModes.ADD);
+
+      this.tweens.add({
+        targets: spark,
+        x: x + Math.cos(angle) * spread,
+        y: y + Math.sin(angle) * spread,
+        scale: 0.2,
+        alpha: 0,
+        duration: Phaser.Math.Between(300, 460),
+        ease: 'Cubic.easeOut',
+        onComplete: () => spark.destroy(),
+      });
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Atmosphere and HUD                                                  */
   /* ------------------------------------------------------------------ */
 
@@ -542,7 +746,7 @@ export class GameScene extends Phaser.Scene {
     title.setShadow(0, 2, '#000000', 8, false, true);
 
     this.add
-      .text(30, 51, 'PHASE 01 / SPLINE PROTOTYPE', {
+      .text(30, 51, 'PHASE 02 / SHOOT & COLLIDE', {
         fontFamily: '"Courier New", monospace',
         fontSize: '9px',
         color: '#b4c79d',
@@ -551,7 +755,7 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     this.add
-      .text(770, 27, 'MOVE MOUSE TO AIM', {
+      .text(770, 27, 'AIM + CLICK TO SHOOT', {
         fontFamily: '"Courier New", monospace',
         fontSize: '9px',
         color: '#c8d8b2',
@@ -560,7 +764,7 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.62)
       .setDepth(DEPTH.hud);
 
-    this.add
+    this.marbleCountText = this.add
       .text(770, 44, '10 MARBLES / 01 PATH', {
         fontFamily: '"Courier New", monospace',
         fontSize: '9px',
@@ -569,5 +773,16 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(1, 0)
       .setAlpha(0.38)
       .setDepth(DEPTH.hud);
+  }
+
+  updateMarbleCount() {
+    if (!this.marbleCountText) {
+      return;
+    }
+
+    const count = this.marbles.length;
+    this.marbleCountText.setText(
+      `${count} ${count === 1 ? 'MARBLE' : 'MARBLES'} / 01 PATH`,
+    );
   }
 }
