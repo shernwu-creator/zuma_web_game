@@ -16,6 +16,7 @@ const SHOOTER_BALL_SCALE = 0.75;
 const INITIAL_CURRENT_COLOR = 0;
 const INITIAL_NEXT_COLOR = 1;
 const CHAIN_SPEED = 48; // pixels per second
+const CATCH_UP_SPEED = CHAIN_SPEED * 3.5;
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
 const SHOT_SPAWN_OFFSET = 56;
@@ -475,17 +476,39 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    // The chain advances as one unit. Pin the head at t = 1 so the marbles
-    // behind it keep their spacing instead of stacking on the endpoint.
-    const travelT = Math.min(
-      (CHAIN_SPEED * step) / this.trackLength,
-      Math.max(0, 1 - front.t),
-    );
+    const standardTravelT = (CHAIN_SPEED * step) / this.trackLength;
+    const catchUpTravelT = (CATCH_UP_SPEED * step) / this.trackLength;
 
-    if (travelT > 0) {
-      for (const marble of this.marbles) {
-        marble.t = Phaser.Math.Clamp(marble.t + travelT, 0, 1);
+    // The locomotive always advances at the base chain speed. Once the head
+    // reaches the end, it stops but the trailing cars may still close gaps.
+    if (!this.chainComplete) {
+      front.t = Math.min(front.t + standardTravelT, 1);
+    }
+
+    for (let index = 1; index < this.marbles.length; index += 1) {
+      const ahead = this.marbles[index - 1];
+      const marble = this.marbles[index];
+      const gap = ahead.t - marble.t;
+      const hasAbnormalGap = gap > this.initialGapT + 0.005;
+      const travelT = hasAbnormalGap ? catchUpTravelT : standardTravelT;
+
+      if (hasAbnormalGap) {
+        // Magnetic catch-up: accelerate, but dock exactly one resting pitch
+        // behind the car ahead so it can never overlap it.
+        marble.t = Math.min(
+          marble.t + travelT,
+          ahead.t - this.initialGapT,
+        );
+      } else {
+        // Normal convoy spacing. Only guard against actual overlap; never
+        // drag an already tightly-packed marble backwards.
+        marble.t = Math.min(
+          marble.t + travelT,
+          ahead.t - this.deltaT,
+        );
       }
+
+      marble.t = Math.max(0, marble.t);
     }
 
     this.chainHeadDistance = front.t * this.trackLength;
