@@ -8,8 +8,6 @@ const CENTER_Y = VIEW_HEIGHT / 2;
 const BALL_COUNT = 10;
 const BALL_RADIUS = 18;
 const BALL_DIAMETER = BALL_RADIUS * 2;
-const BALL_GAP = 7;
-const BALL_SPACING = BALL_DIAMETER + BALL_GAP;
 const MIN_MATCH = 3;
 const MATCH_FADE_DURATION = 260;
 const SHOOTER_BALL_SCALE = 0.75;
@@ -86,9 +84,11 @@ export class GameScene extends Phaser.Scene {
     this.currentBulletColor = INITIAL_CURRENT_COLOR;
     this.nextBulletColor = INITIAL_NEXT_COLOR;
     this.shooterIndicator = null;
+    this.slowdownTimer = 0;
   }
 
   create() {
+    this.slowdownTimer = 0;
     this.createBackdrop();
 
     this.track = new Phaser.Curves.Spline(
@@ -347,8 +347,8 @@ export class GameScene extends Phaser.Scene {
 
     // deltaT is the proportion of the spline covered by one physical marble
     // diameter. This is the exact amount every trailing marble is pushed.
-    this.initialGapT = BALL_SPACING / this.trackLength;
     this.deltaT = BALL_DIAMETER / this.trackLength;
+    this.initialGapT = this.deltaT;
     this.chainComplete = false;
 
     // Every chain marble is a genuine PathFollower. Its t is driven manually
@@ -374,6 +374,7 @@ export class GameScene extends Phaser.Scene {
     marble.colorIndex = colorIndex;
     marble.t = Phaser.Math.Clamp(t, 0, 1);
     marble.pushOffset = 0;
+    marble.magnetApproaching = false;
 
     return marble;
   }
@@ -468,6 +469,12 @@ export class GameScene extends Phaser.Scene {
   }
 
   updateChainMovement(step) {
+    const isSlowed = this.slowdownTimer > 0;
+
+    if (isSlowed) {
+      this.slowdownTimer = Math.max(0, this.slowdownTimer - step);
+    }
+
     const front = this.marbles[0];
 
     if (!front) {
@@ -476,37 +483,80 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    const standardTravelT = (CHAIN_SPEED * step) / this.trackLength;
+    const standardTravelT =
+      (CHAIN_SPEED * (isSlowed ? 0.3 : 1) * step) / this.trackLength;
     const catchUpTravelT = (CATCH_UP_SPEED * step) / this.trackLength;
 
-    // The locomotive always advances at the base chain speed. Once the head
-    // reaches the end, it stops but the trailing cars may still close gaps.
+    // The locomotive advances at base speed (or 30% after a clear). Once the
+    // head reaches the end, it stops but the trailing cars still close gaps.
     if (!this.chainComplete) {
       front.t = Math.min(front.t + standardTravelT, 1);
     }
 
+    let magneticPull = false;
+    let comboMarble = null;
+
     for (let index = 1; index < this.marbles.length; index += 1) {
       const ahead = this.marbles[index - 1];
       const marble = this.marbles[index];
-      const gap = ahead.t - marble.t;
+      const gapBefore = ahead.t - marble.t;
 
-      if (gap > this.deltaT + 0.002) {
-        // Magnetic catch-up: close the gap but never pass the rigid limit.
+      if (gapBefore > this.deltaT + 0.002) {
+        const sameColor = marble.colorIndex === ahead.colorIndex;
+
+        if (sameColor) {
+          // A same-colour gap energises the whole rear convoy and marks this
+          // marble as an incoming magnetic contact.
+          magneticPull = true;
+          marble.magnetApproaching = true;
+        } else if (!magneticPull) {
+          // Different colours apply the brakes: this marble and everything
+          // behind it must wait for the gap to close by other means.
+          break;
+        }
+
         marble.t = Math.min(
           marble.t + catchUpTravelT,
           ahead.t - this.deltaT,
         );
-      } else {
-        // Tight cars are hard-linked to the car ahead. They inherit its
-        // motion and keep an exact one-diameter spacing every frame.
-        marble.t = ahead.t - this.deltaT;
-      }
+        marble.t = Math.max(0, marble.t);
 
-      marble.t = Math.max(0, marble.t);
+        const gapAfter = ahead.t - marble.t;
+        if (
+          sameColor &&
+          marble.magnetApproaching &&
+          !comboMarble &&
+          gapAfter <= this.deltaT + 1e-9
+        ) {
+          comboMarble = marble;
+          marble.magnetApproaching = false;
+        }
+      } else {
+        const wasMagnetic = marble.magnetApproaching === true;
+        const sameColor = marble.colorIndex === ahead.colorIndex;
+
+        // Tight cars are hard-linked to the car ahead, inheriting its motion
+        // and holding an exact one-diameter spacing.
+        marble.t = Math.max(0, ahead.t - this.deltaT);
+        marble.magnetApproaching = false;
+
+        if (wasMagnetic && sameColor && !comboMarble) {
+          comboMarble = marble;
+        }
+      }
     }
 
-    this.chainHeadDistance = front.t * this.trackLength;
-    this.chainComplete = front.t >= 1;
+    // A magnetic landing can complete a same-colour run across the old gap.
+    // resolveMatches mutates this.marbles, so it runs after the movement loop.
+    if (comboMarble && this.marbles.includes(comboMarble)) {
+      this.resolveMatches(comboMarble);
+    }
+
+    const currentFront = this.marbles[0];
+    this.chainHeadDistance = currentFront
+      ? currentFront.t * this.trackLength
+      : this.trackLength;
+    this.chainComplete = currentFront ? currentFront.t >= 1 : true;
   }
 
   updateChainPositions() {
@@ -699,6 +749,7 @@ export class GameScene extends Phaser.Scene {
       .setData('type', 'projectile')
       .setData('colorIndex', colorIndex);
     sprite.pushOffset = 0;
+    sprite.magnetApproaching = false;
 
     this.shots.push({
       sprite,
@@ -812,6 +863,7 @@ export class GameScene extends Phaser.Scene {
     insertedMarble.colorIndex = shot.colorIndex;
     insertedMarble.t = insertInFront ? hitT : hitT - this.deltaT;
     insertedMarble.pushOffset = 0;
+    insertedMarble.magnetApproaching = false;
 
     // Insert first, then propagate the pressure forwards through the chain.
     // A sufficiently large pre-existing gap absorbs the force completely.
@@ -884,6 +936,8 @@ export class GameScene extends Phaser.Scene {
       return 0;
     }
 
+    // The marble directly after the removed run receives an elastic kickback.
+    const pushbackMarble = this.marbles[end + 1] ?? null;
     const matched = this.marbles.splice(start, matchLength);
     let centerX = 0;
     let centerY = 0;
@@ -893,6 +947,12 @@ export class GameScene extends Phaser.Scene {
     }
     centerX /= matched.length;
     centerY /= matched.length;
+
+    this.slowdownTimer = 1.5;
+
+    if (pushbackMarble) {
+      pushbackMarble.pushOffset = this.deltaT * 1.5;
+    }
 
     this.updateMarbleCount();
 
@@ -956,25 +1016,41 @@ export class GameScene extends Phaser.Scene {
       MARBLE_COLORS[colorIndex % MARBLE_COLORS.length],
     ).color;
 
+    // White impact flash pulse.
+    const whiteFlash = this.add
+      .circle(x, y, 16, 0xffffff, 0.95)
+      .setDepth(DEPTH.effects)
+      .setBlendMode(Phaser.BlendModes.ADD);
+
+    this.tweens.add({
+      targets: whiteFlash,
+      scale: 4.2,
+      alpha: 0,
+      duration: 320,
+      ease: 'Cubic.easeOut',
+      onComplete: () => whiteFlash.destroy(),
+    });
+
     const ring = this.add
-      .circle(x, y, 22, color, 0.14)
-      .setStrokeStyle(2, color, 0.8)
+      .circle(x, y, 24, color, 0.16)
+      .setStrokeStyle(2, color, 0.85)
       .setDepth(DEPTH.effects);
 
     this.tweens.add({
       targets: ring,
-      scale: 2.3,
+      scale: 3,
       alpha: 0,
-      duration: 360,
+      duration: 420,
       ease: 'Cubic.easeOut',
       onComplete: () => ring.destroy(),
     });
 
-    for (let i = 0; i < 7; i += 1) {
-      const angle = (i / 7) * Math.PI * 2 + Phaser.Math.FloatBetween(-0.2, 0.2);
-      const spread = Phaser.Math.FloatBetween(24, 44);
+    for (let i = 0; i < 20; i += 1) {
+      const angle =
+        (i / 20) * Math.PI * 2 + Phaser.Math.FloatBetween(-0.28, 0.28);
+      const spread = Phaser.Math.FloatBetween(42, 96);
       const spark = this.add
-        .circle(x, y, Phaser.Math.FloatBetween(1.8, 3.2), color, 0.9)
+        .circle(x, y, Phaser.Math.FloatBetween(2, 4.2), color, 0.92)
         .setDepth(DEPTH.effects)
         .setBlendMode(Phaser.BlendModes.ADD);
 
@@ -982,9 +1058,9 @@ export class GameScene extends Phaser.Scene {
         targets: spark,
         x: x + Math.cos(angle) * spread,
         y: y + Math.sin(angle) * spread,
-        scale: 0.2,
+        scale: 0.15,
         alpha: 0,
-        duration: Phaser.Math.Between(300, 460),
+        duration: Phaser.Math.Between(340, 560),
         ease: 'Cubic.easeOut',
         onComplete: () => spark.destroy(),
       });
