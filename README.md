@@ -18,15 +18,16 @@
 
 ## 第三階段：插入、推擠與三消
 
+- **五色高對比調色盤**：`MARBLE_COLORS` 僅保留紅 `#FF3366`、藍 `#33CCFF`、黃 `#FFCC00`、綠 `#33FF55`、紫 `#B84DFF` 五色；`INITIAL_CHAIN_COLORS` 的索引全部落在 0–4。
 - **待發射球狀態**：場景保存 `currentBulletColor` 與 `nextBulletColor`。砲台正中央 `(0, 0)` 有一顆 `scale 0.75` 的核心寶石，由 `currentBulletColor` 驅動並跟著砲台旋轉；發射後立即用 `nextBulletColor` 遞補並更新寶石顏色。
 - **插入方向判定**：碰撞時使用「撞擊點相對目標球的角度」與該處軌道切線比較，決定插入目標球陣列索引的前方或後方。
 - **PathFollower 球串**：每顆軌道球都是 `Phaser.GameObjects.PathFollower`，以 `marble.t` 手動控制它在 Spline 上的弧長位置。子彈本身也是 PathFollower，命中後直接綁定 `t` 並加入 `marbles` 陣列。
-- **直徑推擠**：`deltaT = BALL_DIAMETER / trackLength`。插入點後方的所有球，其物理 `t` 會精確減去一個 `deltaT`。
-- **平滑推擠動畫**：被推擠的球（以及往後插入的新球）會設定 `pushOffset = deltaT`，讓畫面先維持原本位置；`updateChainPositions()` 每幀以 `Phaser.Math.Linear(pushOffset, 0, 0.15)` 遞減，位置則以 `getPointAt(t + pushOffset)` 計算，形成平滑後退效果。
+- **空隙吸收推擠 (Cascade Push)**：`deltaT = BALL_DIAMETER / trackLength`。先將新球 `splice` 進陣列，再從插入索引往尾端逐對檢查 `gap = t[i] - t[i+1]`；只有 `gap < deltaT` 才把後方球推開 `deltaT - gap`。一旦遇到 `gap >= deltaT`，代表既有空隙已吸收推力，立即 `break`，更後方的球完全不受影響。
+- **平滑推擠動畫**：每個被推開的球會加上 `pushOffset += shiftAmount`，在畫面上先留在原位；`updateChainPositions()` 每幀以 `Phaser.Math.Linear(pushOffset, 0, 0.15)` 遞減，位置以 `getPointAt(t + pushOffset)` 計算。
 - **防止重疊**：推擠後執行間距校正；若尾端被推出 t < 0，整串會往前平移不足的距離，使所有 `t` 保持在 0–1 且任兩球中心距至少為一顆球的直徑。
 - **時序控制**：先完成推擠與座標更新，才觸發同色掃描。三消達到 3 顆以上時先一次性 `splice` 移除陣列元素，再播放放大淡出動畫，動畫結束後 `destroy()` 精靈。
 - **遊戲回饋**：插入漣漪、消除爆裂粒子、剩餘球數 HUD。
-- **可立即測試**：球串最前方預先放了兩顆同色（金色）球，`currentBulletColor` 初始也是金色，將第一發插在兩顆金球旁即可立刻觸發三消。
+- **可立即測試**：球串最前方預先放了兩顆同色（紅色）球，`currentBulletColor` 初始也是紅色，將第一發插在兩顆紅球旁即可立刻觸發三消。
 
 ## 開發指令
 
@@ -56,8 +57,9 @@ zuma_web_game/
 ## 實作備註
 
 - 球串陣列由隊首排到隊尾，`t` 由大到小。`getPointAt()` 採弧長映射，因此固定 `Δt` 即等於固定像素間距。
-- 初始球串維持 43 px 的視覺間距；插入推擠則採嚴格的一顆球直徑（36 px）作為 `deltaT`，因此插入處會形成剛好相切的球距。
-- 插入時先完成方向判定與推擠，再將 PathFollower `splice` 進陣列；所有球的座標更新完成後才進行同色掃描。
+- 初始球串維持 43 px 的視覺間距；插入推擠則採嚴格的一顆球直徑（36 px）作為 `deltaT`，因此局部被擠壓的球會形成剛好相切的球距。
+- 插入順序是「先 splice 新球 → 空隙吸收 cascade → 更新座標 → 同色掃描」。三消留下的空格會自然成為下一次推擠的緩衝區。
+- 調色盤只有 5 色，子彈與下一顆顏色的循環也使用同一組 0–4 索引，不會存取不存在的紋理。
 - 物理位置 `t` 與視覺位移 `pushOffset` 分離：`t` 決定最終排列與碰撞，`pushOffset` 只影響畫面上的平滑推擠，不會回饋到匹配邏輯。
 - 三消掃描使用 `while` 先找出完整連續區段，確認長度後只做一次 `splice`；不會在走訪陣列的同時刪除元素。
 - 被消除的球會立即退出碰撞與更新陣列，精靈則在縮放淡出動畫的 `onComplete` 中銷毀。

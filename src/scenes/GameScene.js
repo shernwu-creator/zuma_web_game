@@ -42,21 +42,17 @@ const PATH_POINTS = [
 ];
 
 const MARBLE_COLORS = [
-  '#f4c75a',
-  '#ef6f6c',
-  '#4fd1b5',
-  '#8b9dff',
-  '#d7ee70',
-  '#ff8fd8',
-  '#ff9d5c',
-  '#7fe3ff',
-  '#f2e7bd',
-  '#c39bff',
+  '#FF3366',
+  '#33CCFF',
+  '#FFCC00',
+  '#33FF55',
+  '#B84DFF',
 ];
 
 // The first two marbles share a colour so the player can immediately create
-// a three-in-a-row by inserting the first (gold) shot beside them.
-const INITIAL_CHAIN_COLORS = [0, 0, 2, 3, 4, 5, 6, 7, 8, 9];
+// a three-in-a-row by inserting the first (red) shot beside them. Every index
+// must remain within the five-colour palette.
+const INITIAL_CHAIN_COLORS = [0, 0, 2, 3, 4, 1, 2, 3, 4, 1];
 
 const DEPTH = {
   backdrop: -40,
@@ -798,22 +794,31 @@ export class GameScene extends Phaser.Scene {
       .setData('colorIndex', shot.colorIndex);
     insertedMarble.colorIndex = shot.colorIndex;
     insertedMarble.t = insertInFront ? hitT : hitT - this.deltaT;
+    insertedMarble.pushOffset = 0;
 
-    // The new marble can already be part of the rearward push if it was
-    // inserted behind the struck marble. Keep its visual position for a beat.
-    insertedMarble.pushOffset = insertInFront ? 0 : this.deltaT;
-
-    // Push every existing marble on the tail side of the insertion by exactly
-    // one physical diameter. pushOffset keeps each sprite visually at its old
-    // position first; updateChainPositions() then eases it back to zero.
-    const shiftStart = insertInFront ? hitIndex : hitIndex + 1;
-    for (let index = shiftStart; index < this.marbles.length; index += 1) {
-      const marble = this.marbles[index];
-      marble.t -= this.deltaT;
-      marble.pushOffset = this.deltaT;
-    }
-
+    // Insert first, then propagate the pressure forwards through the chain.
+    // A sufficiently large pre-existing gap absorbs the force completely.
     this.marbles.splice(insertIndex, 0, insertedMarble);
+
+    for (
+      let index = insertIndex;
+      index < this.marbles.length - 1;
+      index += 1
+    ) {
+      const current = this.marbles[index];
+      const behind = this.marbles[index + 1];
+      const gap = current.t - behind.t;
+
+      if (gap >= this.deltaT) {
+        // The gap is large enough to absorb the push. The rest of the chain
+        // must not move at all.
+        break;
+      }
+
+      const shiftAmount = this.deltaT - gap;
+      behind.t -= shiftAmount;
+      behind.pushOffset += shiftAmount;
+    }
 
     // Commit all pushed t values to screen coordinates BEFORE scanning for
     // matches. This keeps the visual chain and the matching logic in sync.
