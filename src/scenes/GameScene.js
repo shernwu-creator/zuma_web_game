@@ -12,7 +12,7 @@ const BALL_GAP = 7;
 const BALL_SPACING = BALL_DIAMETER + BALL_GAP;
 const MIN_MATCH = 3;
 const MATCH_FADE_DURATION = 260;
-const SHOOTER_BALL_SCALE = 0.8;
+const SHOOTER_BALL_SCALE = 0.75;
 const INITIAL_CURRENT_COLOR = 0;
 const INITIAL_NEXT_COLOR = 1;
 const CHAIN_SPEED = 48; // pixels per second
@@ -376,6 +376,7 @@ export class GameScene extends Phaser.Scene {
 
     marble.colorIndex = colorIndex;
     marble.t = Phaser.Math.Clamp(t, 0, 1);
+    marble.pushOffset = 0;
 
     return marble;
   }
@@ -498,7 +499,16 @@ export class GameScene extends Phaser.Scene {
   updateChainPositions() {
     for (const marble of this.marbles) {
       marble.t = Phaser.Math.Clamp(marble.t, 0, 1);
-      const position = this.track.getPointAt(marble.t);
+      marble.pushOffset = Phaser.Math.Linear(marble.pushOffset ?? 0, 0, 0.15);
+
+      // Physical progress (t) is authoritative; pushOffset only delays the
+      // visual slide so the insertion reads as a physical shove.
+      const visualT = Phaser.Math.Clamp(
+        marble.t + marble.pushOffset,
+        0,
+        1,
+      );
+      const position = this.track.getPointAt(visualT);
       marble.setPosition(position.x, position.y);
     }
   }
@@ -591,7 +601,7 @@ export class GameScene extends Phaser.Scene {
     // The loaded marble sits at the muzzle and is a child of the cannon,
     // so it rotates together with the launcher when aiming.
     this.shooterIndicator = this.add
-      .image(53, 0, `zs-marble-${this.currentBulletColor}`)
+      .image(0, 0, `zs-marble-${this.currentBulletColor}`)
       .setScale(SHOOTER_BALL_SCALE)
       .setName('shooter-indicator')
       .setData('type', 'shooter-indicator')
@@ -675,6 +685,7 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.shots)
       .setData('type', 'projectile')
       .setData('colorIndex', colorIndex);
+    sprite.pushOffset = 0;
 
     this.shots.push({
       sprite,
@@ -788,11 +799,18 @@ export class GameScene extends Phaser.Scene {
     insertedMarble.colorIndex = shot.colorIndex;
     insertedMarble.t = insertInFront ? hitT : hitT - this.deltaT;
 
-    // Push every marble on the tail side of the insertion by exactly one
-    // physical diameter (deltaT), not by an arbitrary slot size.
+    // The new marble can already be part of the rearward push if it was
+    // inserted behind the struck marble. Keep its visual position for a beat.
+    insertedMarble.pushOffset = insertInFront ? 0 : this.deltaT;
+
+    // Push every existing marble on the tail side of the insertion by exactly
+    // one physical diameter. pushOffset keeps each sprite visually at its old
+    // position first; updateChainPositions() then eases it back to zero.
     const shiftStart = insertInFront ? hitIndex : hitIndex + 1;
     for (let index = shiftStart; index < this.marbles.length; index += 1) {
-      this.marbles[index].t -= this.deltaT;
+      const marble = this.marbles[index];
+      marble.t -= this.deltaT;
+      marble.pushOffset = this.deltaT;
     }
 
     this.marbles.splice(insertIndex, 0, insertedMarble);
