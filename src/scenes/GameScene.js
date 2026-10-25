@@ -16,7 +16,7 @@ const SHOOTER_BALL_SCALE = 0.75;
 const INITIAL_CURRENT_COLOR = 0;
 const INITIAL_NEXT_COLOR = 1;
 const CHAIN_SPEED = 48; // pixels per second
-const CATCH_UP_SPEED = CHAIN_SPEED * 3.5;
+const CATCH_UP_SPEED = CHAIN_SPEED * 1.8;
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
 const SHOT_SPAWN_OFFSET = 56;
@@ -489,23 +489,17 @@ export class GameScene extends Phaser.Scene {
       const ahead = this.marbles[index - 1];
       const marble = this.marbles[index];
       const gap = ahead.t - marble.t;
-      const hasAbnormalGap = gap > this.initialGapT + 0.005;
-      const travelT = hasAbnormalGap ? catchUpTravelT : standardTravelT;
 
-      if (hasAbnormalGap) {
-        // Magnetic catch-up: accelerate, but dock exactly one resting pitch
-        // behind the car ahead so it can never overlap it.
+      if (gap > this.deltaT + 0.002) {
+        // Magnetic catch-up: close the gap but never pass the rigid limit.
         marble.t = Math.min(
-          marble.t + travelT,
-          ahead.t - this.initialGapT,
-        );
-      } else {
-        // Normal convoy spacing. Only guard against actual overlap; never
-        // drag an already tightly-packed marble backwards.
-        marble.t = Math.min(
-          marble.t + travelT,
+          marble.t + catchUpTravelT,
           ahead.t - this.deltaT,
         );
+      } else {
+        // Tight cars are hard-linked to the car ahead. They inherit its
+        // motion and keep an exact one-diameter spacing every frame.
+        marble.t = ahead.t - this.deltaT;
       }
 
       marble.t = Math.max(0, marble.t);
