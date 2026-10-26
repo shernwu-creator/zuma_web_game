@@ -475,9 +475,9 @@ export class GameScene extends Phaser.Scene {
       this.slowdownTimer = Math.max(0, this.slowdownTimer - step);
     }
 
-    const front = this.marbles[0];
+    const first = this.marbles[0];
 
-    if (!front) {
+    if (!first) {
       this.chainHeadDistance = this.trackLength;
       this.chainComplete = true;
       return;
@@ -487,69 +487,61 @@ export class GameScene extends Phaser.Scene {
       (CHAIN_SPEED * (isSlowed ? 0.3 : 1) * step) / this.trackLength;
     const catchUpTravelT = (CATCH_UP_SPEED * step) / this.trackLength;
 
-    // The locomotive advances at base speed (or 30% after a clear). Once the
-    // head reaches the end, it stops but the trailing cars still close gaps.
+    // Segment 1 locomotive: it always moves at standard speed until the end.
     if (!this.chainComplete) {
-      front.t = Math.min(front.t + standardTravelT, 1);
+      first.t = Math.min(first.t + standardTravelT, 1);
     }
-
-    let magneticPull = false;
-    let comboMarble = null;
 
     for (let index = 1; index < this.marbles.length; index += 1) {
       const ahead = this.marbles[index - 1];
       const marble = this.marbles[index];
-      const gapBefore = ahead.t - marble.t;
+      const gap = ahead.t - marble.t;
 
-      if (gapBefore > this.deltaT + 0.002) {
-        const sameColor = marble.colorIndex === ahead.colorIndex;
-
-        if (sameColor) {
-          // A same-colour gap energises the whole rear convoy and marks this
-          // marble as an incoming magnetic contact.
-          magneticPull = true;
-          marble.magnetApproaching = true;
-        } else if (!magneticPull) {
-          // Different colours apply the brakes: this marble and everything
-          // behind it must wait for the gap to close by other means.
-          break;
-        }
-
-        marble.t = Math.min(
-          marble.t + catchUpTravelT,
-          ahead.t - this.deltaT,
-        );
-        marble.t = Math.max(0, marble.t);
-
-        const gapAfter = ahead.t - marble.t;
-        if (
-          sameColor &&
-          marble.magnetApproaching &&
-          !comboMarble &&
-          gapAfter <= this.deltaT + 1e-9
-        ) {
-          comboMarble = marble;
-          marble.magnetApproaching = false;
-        }
-      } else {
-        const wasMagnetic = marble.magnetApproaching === true;
-        const sameColor = marble.colorIndex === ahead.colorIndex;
-
-        // Tight cars are hard-linked to the car ahead, inheriting its motion
-        // and holding an exact one-diameter spacing.
+      if (gap <= this.deltaT + 0.002) {
+        // Cart rule: no independent speed, hard-link to the car ahead.
         marble.t = Math.max(0, ahead.t - this.deltaT);
         marble.magnetApproaching = false;
+        continue;
+      }
 
-        if (wasMagnetic && sameColor && !comboMarble) {
-          comboMarble = marble;
+      // This marble is the locomotive of a new, disconnected segment.
+      const sameColor = marble.colorIndex === ahead.colorIndex;
+
+      if (!sameColor) {
+        // Different colours at the break: this segment waits in place.
+        marble.magnetApproaching = false;
+        continue;
+      }
+
+      // Same-colour magnetic traction for this independent segment head.
+      marble.magnetApproaching = true;
+      marble.t = Math.min(
+        marble.t + catchUpTravelT,
+        ahead.t - this.deltaT,
+      );
+      marble.t = Math.max(0, marble.t);
+
+      const newGap = ahead.t - marble.t;
+      if (newGap <= this.deltaT + 0.002) {
+        marble.magnetApproaching = false;
+
+        // Confirm the entire contiguous colour run includes at least three
+        // marbles before mutating anything or firing the chain reaction.
+        const run = this.findMatchRun(marble);
+        if (run && run.length >= MIN_MATCH) {
+          this.resolveMatches(marble);
+          this.slowdownTimer = 1.5;
+
+          const front = this.marbles[0];
+          this.chainHeadDistance = front
+            ? front.t * this.trackLength
+            : this.trackLength;
+          this.chainComplete = front ? front.t >= 1 : true;
+
+          // Do not process any further segments in the same frame.
+          return;
         }
       }
-    }
-
-    // A magnetic landing can complete a same-colour run across the old gap.
-    // resolveMatches mutates this.marbles, so it runs after the movement loop.
-    if (comboMarble && this.marbles.includes(comboMarble)) {
-      this.resolveMatches(comboMarble);
     }
 
     const currentFront = this.marbles[0];
@@ -902,19 +894,17 @@ export class GameScene extends Phaser.Scene {
     this.resolveMatches(insertedMarble);
   }
 
-  resolveMatches(insertedMarble) {
-    const insertedIndex = this.marbles.indexOf(insertedMarble);
+  findMatchRun(marble) {
+    const insertedIndex = this.marbles.indexOf(marble);
 
     if (insertedIndex === -1) {
-      return 0;
+      return null;
     }
 
-    const colorIndex = insertedMarble.colorIndex;
-
-    // Scan both directions first, without mutating the array. Only after the
-    // complete run is known do we splice once, so no index can fall out of
-    // sync or point at undefined mid-loop.
+    const colorIndex = marble.colorIndex;
     let start = insertedIndex;
+    let end = insertedIndex;
+
     while (
       start > 0 &&
       this.marbles[start - 1].colorIndex === colorIndex
@@ -922,7 +912,6 @@ export class GameScene extends Phaser.Scene {
       start -= 1;
     }
 
-    let end = insertedIndex;
     while (
       end < this.marbles.length - 1 &&
       this.marbles[end + 1].colorIndex === colorIndex
@@ -930,11 +919,23 @@ export class GameScene extends Phaser.Scene {
       end += 1;
     }
 
-    const matchLength = end - start + 1;
+    return {
+      start,
+      end,
+      length: end - start + 1,
+    };
+  }
 
-    if (matchLength < MIN_MATCH) {
+  resolveMatches(insertedMarble) {
+    const run = this.findMatchRun(insertedMarble);
+
+    if (!run || run.length < MIN_MATCH) {
       return 0;
     }
+
+    const { start, end } = run;
+    const matchLength = run.length;
+    const colorIndex = insertedMarble.colorIndex;
 
     // The marble directly after the removed run receives an elastic kickback.
     const pushbackMarble = this.marbles[end + 1] ?? null;
@@ -952,6 +953,11 @@ export class GameScene extends Phaser.Scene {
 
     if (pushbackMarble) {
       pushbackMarble.pushOffset = this.deltaT * 1.5;
+      pushbackMarble.t = Math.max(
+        0,
+        pushbackMarble.t - this.deltaT * 1.5,
+      );
+      pushbackMarble.magnetApproaching = false;
     }
 
     this.updateMarbleCount();
