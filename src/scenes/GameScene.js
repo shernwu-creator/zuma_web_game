@@ -5,7 +5,7 @@ const VIEW_HEIGHT = 600;
 const CENTER_X = VIEW_WIDTH / 2;
 const CENTER_Y = VIEW_HEIGHT / 2;
 
-const BALL_COUNT = 10;
+const TOTAL_LEVEL_MARBLES = 40;
 const BALL_RADIUS = 18;
 const BALL_DIAMETER = BALL_RADIUS * 2;
 const MIN_MATCH = 3;
@@ -28,6 +28,8 @@ const BONUS_RADIUS = 16;
 const BONUS_SCORE = 100;
 const GAP_SHOT_SCORE = 300;
 const TRACK_CLEARANCE = 44;
+const BONUS_SPAWN_INTERVAL = 8;
+const WIN_BONUS = 500;
 
 // A wide, winding S that crosses the whole board. The middle pass sits below
 // the launch pad, leaving the center of the screen clear for the cannon.
@@ -56,11 +58,6 @@ const MARBLE_COLORS = [
   '#B84DFF',
 ];
 
-// The first two marbles share a colour so the player can immediately create
-// a three-in-a-row by inserting the first (red) shot beside them. Every index
-// must remain within the five-colour palette.
-const INITIAL_CHAIN_COLORS = [0, 0, 2, 3, 4, 1, 2, 3, 4, 1];
-
 const DEPTH = {
   backdrop: -40,
   foliage: -20,
@@ -77,6 +74,7 @@ const DEPTH = {
   effects: 12,
   textFx: 15,
   hud: 30,
+  overlay: 200,
 };
 
 export class GameScene extends Phaser.Scene {
@@ -107,11 +105,28 @@ export class GameScene extends Phaser.Scene {
     this.bonusItems = [];
     this.scoreText = null;
     this.highScoreText = null;
+    this.gameState = 'MENU';
+    this.spawnedMarblesCount = 0;
+    this.bonusTimer = 0;
+    this.tailPushActive = true;
+    this.levelWon = false;
+    this.menuOverlay = null;
+    this.gameOverOverlay = null;
+    this.menuButton = null;
+    this.restartButton = null;
+    this.hudObjects = [];
+    this.launcherHalo = null;
+    this.launcherBase = null;
   }
 
   create() {
     this.slowdownTimer = 0;
     this.score = 0;
+    this.spawnedMarblesCount = 0;
+    this.bonusTimer = 0;
+    this.tailPushActive = true;
+    this.levelWon = false;
+    this.gameState = 'MENU';
     this.bonusItems = [];
     this.createBackdrop();
 
@@ -124,17 +139,21 @@ export class GameScene extends Phaser.Scene {
     this.createTrack();
     this.createMarbles();
     this.createLauncher();
-    this.createBonusItems();
     this.createAmbientMotes();
     this.createHud();
+
+    this.hudObjects = this.children.list.filter(
+      (object) => object.depth === DEPTH.hud,
+    );
+    this.setHudVisible(false);
+    this.setLauncherVisible(false);
+    this.createMenu();
 
     this.input.on('pointermove', () => {
       this.pointerSeen = true;
     });
 
     this.input.on('pointerdown', this.handlePointerDown, this);
-
-    this.aimAtPointer();
 
     this.game.canvas.setAttribute(
       'aria-label',
@@ -148,12 +167,409 @@ export class GameScene extends Phaser.Scene {
   }
 
   update(_time, delta) {
+    if (this.gameState !== 'PLAYING') {
+      return;
+    }
+
     const step = Math.min(delta, MAX_FRAME_DELTA) / 1000;
 
     this.updateChainMovement(step);
+
+    if (this.gameState !== 'PLAYING') {
+      return;
+    }
+
     this.updateChainPositions();
     this.updateShots(step);
+    this.updateSpawner();
+    this.updateBonusSpawner(step);
     this.aimAtPointer();
+    this.checkWinCondition();
+  }
+
+  setHudVisible(visible) {
+    for (const object of this.hudObjects) {
+      object.setVisible(visible);
+    }
+  }
+
+  setLauncherVisible(visible) {
+    if (this.launcherHalo) {
+      this.launcherHalo.setVisible(visible);
+    }
+
+    if (this.launcherBase) {
+      this.launcherBase.setVisible(visible);
+    }
+
+    if (this.cannon) {
+      this.cannon.setVisible(visible);
+    }
+  }
+
+  destroyOverlays() {
+    if (this.menuButton) {
+      this.tweens.killTweensOf(this.menuButton);
+    }
+
+    if (this.restartButton) {
+      this.tweens.killTweensOf(this.restartButton);
+    }
+
+    if (this.menuOverlay) {
+      this.menuOverlay.destroy();
+      this.menuOverlay = null;
+    }
+
+    if (this.gameOverOverlay) {
+      this.gameOverOverlay.destroy();
+      this.gameOverOverlay = null;
+    }
+
+    this.menuButton = null;
+    this.restartButton = null;
+  }
+
+  clearRoundObjects() {
+    for (const marble of this.marbles) {
+      this.tweens.killTweensOf(marble);
+      marble.destroy();
+    }
+    this.marbles = [];
+
+    for (const shot of this.shots) {
+      shot.sprite.destroy();
+    }
+    this.shots = [];
+
+    for (const item of this.bonusItems) {
+      item.destroy();
+    }
+    this.bonusItems = [];
+
+    this.updateMarbleCount();
+  }
+
+  startGame() {
+    this.destroyOverlays();
+    this.clearRoundObjects();
+
+    this.gameState = 'PLAYING';
+    this.score = 0;
+    this.spawnedMarblesCount = 0;
+    this.bonusTimer = 0;
+    this.tailPushActive = true;
+    this.slowdownTimer = 0;
+    this.chainComplete = false;
+    this.chainHeadDistance = 0;
+    this.levelWon = false;
+    this.currentBulletColor = INITIAL_CURRENT_COLOR;
+    this.nextBulletColor = INITIAL_NEXT_COLOR;
+    this.updateShooterIndicator();
+    this.updateScoreHud();
+    this.updateMarbleCount();
+    this.setHudVisible(true);
+    this.setLauncherVisible(true);
+    this.createBonusItems();
+    this.trySpawnMarble();
+    this.pointerSeen = true;
+    this.aimAtPointer();
+    this.cameras.main.resetFX();
+  }
+
+  endGame(isWin) {
+    if (this.gameState !== 'PLAYING') {
+      return;
+    }
+
+    this.gameState = 'GAMEOVER';
+    this.levelWon = isWin;
+    this.slowdownTimer = 0;
+
+    if (isWin) {
+      this.addScore(WIN_BONUS);
+    }
+
+    this.setHudVisible(false);
+    this.setLauncherVisible(false);
+    this.showGameOverOverlay(isWin);
+  }
+
+  checkWinCondition() {
+    if (this.gameState !== 'PLAYING') {
+      return;
+    }
+
+    if (
+      this.spawnedMarblesCount >= TOTAL_LEVEL_MARBLES &&
+      this.marbles.length === 0
+    ) {
+      this.endGame(true);
+    }
+  }
+
+  updateBonusSpawner(step) {
+    if (this.gameState !== 'PLAYING') {
+      return;
+    }
+
+    this.bonusTimer += step;
+
+    if (this.bonusTimer < BONUS_SPAWN_INTERVAL) {
+      return;
+    }
+
+    this.bonusTimer = Math.max(0, this.bonusTimer - BONUS_SPAWN_INTERVAL);
+
+    if (this.bonusItems.length < BONUS_COUNT) {
+      this.spawnRandomBonusItem();
+    }
+  }
+
+  spawnRandomBonusItem() {
+    const anchors = Phaser.Utils.Array.Shuffle([
+      { x: 240, y: 220 },
+      { x: 560, y: 220 },
+      { x: 200, y: 300 },
+      { x: 600, y: 300 },
+      { x: 240, y: 260 },
+      { x: 560, y: 260 },
+    ]);
+
+    for (const anchor of anchors) {
+      const x = Phaser.Math.Clamp(
+        anchor.x + Phaser.Math.Between(-15, 15),
+        70,
+        VIEW_WIDTH - 70,
+      );
+      const y = Phaser.Math.Clamp(
+        anchor.y + Phaser.Math.Between(-15, 15),
+        80,
+        VIEW_HEIGHT - 70,
+      );
+
+      if (
+        this.isBonusPositionClear(x, y, this.bonusItems, 48) &&
+        !this.shotPathCrossesTrack(x, y)
+      ) {
+        this.spawnBonusItem(x, y);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  createMenu() {
+    this.destroyOverlays();
+    this.setHudVisible(false);
+    this.setLauncherVisible(false);
+
+    const overlay = this.add
+      .container(0, 0)
+      .setDepth(DEPTH.overlay);
+
+    const backdrop = this.add.rectangle(
+      CENTER_X,
+      CENTER_Y,
+      VIEW_WIDTH,
+      VIEW_HEIGHT,
+      0x041009,
+      0.8,
+    );
+
+    const kicker = this.add
+      .text(CENTER_X, 126, 'JUNGLE ARCADE', {
+        fontFamily: '"Courier New", monospace',
+        fontSize: '12px',
+        color: '#c6d5ad',
+      })
+      .setOrigin(0.5)
+      .setAlpha(0.72);
+
+    const title = this.add
+      .text(CENTER_X, 190, 'SERPENTINE', {
+        fontFamily: 'Georgia, "Times New Roman", serif',
+        fontSize: '58px',
+        color: '#f7e9c2',
+      })
+      .setOrigin(0.5)
+      .setShadow(0, 5, '#000000', 16, false, true);
+
+    const rule = this.add.rectangle(
+      CENTER_X,
+      242,
+      260,
+      1,
+      0xd7c17d,
+      0.4,
+    );
+
+    const highScore = this.add
+      .text(
+        CENTER_X,
+        278,
+        `HIGH SCORE  ${this.formatScore(this.highScore)}`,
+        {
+          fontFamily: '"Courier New", monospace',
+          fontSize: '12px',
+          color: '#d9c68c',
+        },
+      )
+      .setOrigin(0.5)
+      .setAlpha(0.8);
+
+    const hint = this.add
+      .text(CENTER_X, 326, 'MATCH 3  ·  SHOOT BOMBS  ·  CHASE STARS', {
+        fontFamily: '"Courier New", monospace',
+        fontSize: '9px',
+        color: '#a9bd96',
+      })
+      .setOrigin(0.5)
+      .setAlpha(0.52);
+
+    const startButton = this.add
+      .text(CENTER_X, 392, 'CLICK TO START', {
+        fontFamily: 'Georgia, "Times New Roman", serif',
+        fontSize: '20px',
+        color: '#ffe39a',
+      })
+      .setOrigin(0.5)
+      .setShadow(0, 2, '#000000', 8, false, true);
+
+    overlay.add([
+      backdrop,
+      kicker,
+      title,
+      rule,
+      highScore,
+      hint,
+      startButton,
+    ]);
+
+    this.menuOverlay = overlay;
+    this.menuButton = startButton;
+
+    this.tweens.add({
+      targets: startButton,
+      alpha: { from: 1, to: 0.24 },
+      duration: 850,
+      yoyo: true,
+      repeat: -1,
+      ease: 'Sine.easeInOut',
+    });
+  }
+
+  showGameOverOverlay(isWin) {
+    this.destroyOverlays();
+
+    const overlay = this.add
+      .container(0, 0)
+      .setDepth(DEPTH.overlay);
+
+    const backdrop = this.add.rectangle(
+      CENTER_X,
+      CENTER_Y,
+      VIEW_WIDTH,
+      VIEW_HEIGHT,
+      0x041009,
+      0.84,
+    );
+
+    const title = this.add
+      .text(
+        CENTER_X,
+        172,
+        isWin ? 'YOU WIN!' : 'GAME OVER',
+        {
+          fontFamily: 'Georgia, "Times New Roman", serif',
+          fontSize: '52px',
+          color: isWin ? '#ffe39a' : '#ff7777',
+        },
+      )
+      .setOrigin(0.5)
+      .setShadow(0, 4, '#000000', 14, false, true);
+
+    const bonusLine = isWin
+      ? this.add
+          .text(CENTER_X, 228, `LEVEL CLEAR  +${WIN_BONUS}`, {
+            fontFamily: '"Courier New", monospace',
+            fontSize: '11px',
+            color: '#d9ee9f',
+          })
+          .setOrigin(0.5)
+          .setAlpha(0.78)
+      : this.add
+          .text(CENTER_X, 228, 'THE CHAIN REACHED THE HOLE', {
+            fontFamily: '"Courier New", monospace',
+            fontSize: '11px',
+            color: '#d3b2a2',
+          })
+          .setOrigin(0.5)
+          .setAlpha(0.68);
+
+    const finalLabel = this.add
+      .text(CENTER_X, 278, 'FINAL SCORE', {
+        fontFamily: '"Courier New", monospace',
+        fontSize: '10px',
+        color: '#c4d3b0',
+      })
+      .setOrigin(0.5)
+      .setAlpha(0.65);
+
+    const finalScore = this.add
+      .text(CENTER_X, 306, this.formatScore(this.score), {
+        fontFamily: 'Georgia, "Times New Roman", serif',
+        fontSize: '32px',
+        color: '#ffe39a',
+      })
+      .setOrigin(0.5)
+      .setShadow(0, 2, '#000000', 8, false, true);
+
+    const highLine = this.add
+      .text(
+        CENTER_X,
+        348,
+        `HIGH SCORE  ${this.formatScore(this.highScore)}`,
+        {
+          fontFamily: '"Courier New", monospace',
+          fontSize: '10px',
+          color: '#b8c7a4',
+        },
+      )
+      .setOrigin(0.5)
+      .setAlpha(0.6);
+
+    const restartButton = this.add
+      .text(CENTER_X, 420, 'CLICK TO RESTART', {
+        fontFamily: 'Georgia, "Times New Roman", serif',
+        fontSize: '18px',
+        color: '#ffe39a',
+      })
+      .setOrigin(0.5)
+      .setShadow(0, 2, '#000000', 8, false, true);
+
+    overlay.add([
+      backdrop,
+      title,
+      bonusLine,
+      finalLabel,
+      finalScore,
+      highLine,
+      restartButton,
+    ]);
+
+    this.gameOverOverlay = overlay;
+    this.restartButton = restartButton;
+
+    this.tweens.add({
+      targets: restartButton,
+      alpha: { from: 1, to: 0.24 },
+      duration: 850,
+      yoyo: true,
+      repeat: -1,
+      ease: 'Sine.easeInOut',
+    });
   }
 
   /* ------------------------------------------------------------------ */
@@ -371,48 +787,50 @@ export class GameScene extends Phaser.Scene {
   createMarbles() {
     this.createMarbleTextures();
 
-    // deltaT is the proportion of the spline covered by one physical marble
-    // diameter. This is the exact amount every trailing marble is pushed.
     this.deltaT = BALL_DIAMETER / this.trackLength;
     this.initialGapT = this.deltaT;
     this.chainComplete = false;
+    this.chainHeadDistance = 0;
+    this.spawnedMarblesCount = 0;
+    this.marbles = [];
+  }
 
-    // Every chain marble is a genuine PathFollower. Its t is driven manually
-    // so the chain can be moved, inserted into and pushed as a group.
-    this.marbles = INITIAL_CHAIN_COLORS.map((colorIndex, index) =>
-      this.createPathMarble(
-        colorIndex,
-        (BALL_COUNT - 1 - index) * this.initialGapT,
-      ),
-    );
-
-    // 10% bomb roll per initial marble. Always guarantee one bomb with a
-    // full two-neighbour blast radius so the mechanic is demonstrable.
-    const bombFlags = this.marbles.map(
-      () => Phaser.Math.FloatBetween(0, 1) < BOMB_CHANCE,
-    );
-    const centralStart = BOMB_BLAST_NEIGHBOURS;
-    const centralEnd =
-      this.marbles.length - 1 - BOMB_BLAST_NEIGHBOURS;
-
-    if (
-      !bombFlags
-        .slice(centralStart, centralEnd + 1)
-        .some(Boolean)
-    ) {
-      bombFlags[Phaser.Math.Between(centralStart, centralEnd)] = true;
+  trySpawnMarble() {
+    if (this.gameState !== 'PLAYING') {
+      return false;
     }
 
-    this.marbles.forEach((marble, index) => {
-      marble.isBomb = bombFlags[index];
+    if (this.spawnedMarblesCount >= TOTAL_LEVEL_MARBLES) {
+      return false;
+    }
 
-      if (marble.isBomb) {
-        marble.setTexture(`zs-marble-bomb-${marble.colorIndex}`);
-      }
-    });
+    if (
+      this.marbles.length > 0 &&
+      this.marbles[this.marbles.length - 1].t <= this.deltaT
+    ) {
+      return false;
+    }
 
-    this.chainHeadDistance = this.marbles[0].t * this.trackLength;
+    const colorIndex = Phaser.Math.Between(0, MARBLE_COLORS.length - 1);
+    const marble = this.createPathMarble(colorIndex, 0);
+
+    marble.isBomb = Phaser.Math.FloatBetween(0, 1) < BOMB_CHANCE;
+
+    if (marble.isBomb) {
+      marble.setTexture(`zs-marble-bomb-${colorIndex}`);
+    }
+
+    this.marbles.push(marble);
+    this.spawnedMarblesCount += 1;
+    this.chainComplete = false;
     this.updateChainPositions();
+    this.updateMarbleCount();
+
+    return true;
+  }
+
+  updateSpawner() {
+    this.trySpawnMarble();
   }
 
   createPathMarble(colorIndex, t, x = 0, y = 0) {
@@ -565,8 +983,9 @@ export class GameScene extends Phaser.Scene {
     }
 
     if (this.marbles.length === 0) {
-      this.chainHeadDistance = this.trackLength;
-      this.chainComplete = true;
+      this.chainHeadDistance = 0;
+      this.chainComplete =
+        this.spawnedMarblesCount >= TOTAL_LEVEL_MARBLES;
       return;
     }
 
@@ -600,7 +1019,11 @@ export class GameScene extends Phaser.Scene {
     }
 
     const rearMost = segments[segments.length - 1];
-    rearMost.speed = standardTravelT;
+    rearMost.speed =
+      this.spawnedMarblesCount < TOTAL_LEVEL_MARBLES ||
+      this.tailPushActive
+        ? standardTravelT
+        : 0;
 
     for (let index = segments.length - 1; index >= 1; index -= 1) {
       const rear = segments[index];
@@ -668,11 +1091,27 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
+    if (
+      this.spawnedMarblesCount >= TOTAL_LEVEL_MARBLES &&
+      this.tailPushActive &&
+      segments.length === 1
+    ) {
+      this.tailPushActive = false;
+    }
+
     const currentFront = this.marbles[0];
     this.chainHeadDistance = currentFront
       ? currentFront.t * this.trackLength
-      : this.trackLength;
-    this.chainComplete = currentFront ? currentFront.t >= 1 : true;
+      : 0;
+    this.chainComplete = currentFront ? currentFront.t >= 1 : false;
+
+    if (
+      this.gameState === 'PLAYING' &&
+      currentFront &&
+      currentFront.t >= 1
+    ) {
+      this.endGame(false);
+    }
   }
 
   updateChainPositions() {
@@ -702,7 +1141,9 @@ export class GameScene extends Phaser.Scene {
   /* ------------------------------------------------------------------ */
 
   createLauncher() {
-    const halo = this.add.graphics().setDepth(DEPTH.launcherGlow);
+    const halo = (this.launcherHalo = this.add
+      .graphics()
+      .setDepth(DEPTH.launcherGlow));
     halo.fillStyle(0xe7cd7c, 0.035);
     halo.fillCircle(CENTER_X, CENTER_Y, 76);
     halo.fillStyle(0xe7cd7c, 0.045);
@@ -710,7 +1151,9 @@ export class GameScene extends Phaser.Scene {
     halo.lineStyle(1, 0xd5bd75, 0.16);
     halo.strokeCircle(CENTER_X, CENTER_Y, 70);
 
-    const base = this.add.graphics().setDepth(DEPTH.launcherBase);
+    const base = (this.launcherBase = this.add
+      .graphics()
+      .setDepth(DEPTH.launcherBase));
 
     base.fillStyle(0x000000, 0.32);
     base.fillCircle(CENTER_X + 2, CENTER_Y + 9, 53);
@@ -929,6 +1372,16 @@ export class GameScene extends Phaser.Scene {
 
   handlePointerDown(pointer) {
     if (!pointer || pointer.button !== 0) {
+      return;
+    }
+
+    if (this.gameState === 'MENU') {
+      this.startGame();
+      return;
+    }
+
+    if (this.gameState === 'GAMEOVER') {
+      this.startGame();
       return;
     }
 
@@ -1174,10 +1627,8 @@ export class GameScene extends Phaser.Scene {
     this.updateMarbleCount();
 
     const front = this.marbles[0];
-    this.chainHeadDistance = front
-      ? front.t * this.trackLength
-      : this.trackLength;
-    this.chainComplete = front ? front.t >= 1 : true;
+    this.chainHeadDistance = front ? front.t * this.trackLength : 0;
+    this.chainComplete = front ? front.t >= 1 : false;
 
     this.addScore(BOMB_SCORE);
     this.slowdownTimer = 1.5;
@@ -1785,7 +2236,7 @@ export class GameScene extends Phaser.Scene {
     title.setShadow(0, 2, '#000000', 8, false, true);
 
     this.add
-      .text(30, 51, 'PHASE 04 / SCORE / BONUS / BOMB', {
+      .text(30, 51, 'PHASE 05 / 40-MARBLE RUN', {
         fontFamily: '"Courier New", monospace',
         fontSize: '9px',
         color: '#b4c79d',
@@ -1835,11 +2286,16 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     this.marbleCountText = this.add
-      .text(770, 87, `${this.marbles.length} MARBLES / 01 PATH`, {
+      .text(
+        770,
+        87,
+        `0 ON TRACK · 0/${TOTAL_LEVEL_MARBLES} SPAWNED`,
+        {
         fontFamily: '"Courier New", monospace',
-        fontSize: '9px',
-        color: '#c8d8b2',
-      })
+          fontSize: '9px',
+          color: '#c8d8b2',
+        },
+      )
       .setOrigin(1, 0)
       .setAlpha(0.38)
       .setDepth(DEPTH.hud);
@@ -1854,7 +2310,7 @@ export class GameScene extends Phaser.Scene {
 
     const count = this.marbles.length;
     this.marbleCountText.setText(
-      `${count} ${count === 1 ? 'MARBLE' : 'MARBLES'} / 01 PATH`,
+      `${count} ON TRACK · ${this.spawnedMarblesCount}/${TOTAL_LEVEL_MARBLES} SPAWNED`,
     );
   }
 }
