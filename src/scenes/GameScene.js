@@ -30,9 +30,17 @@ const SHOT_RADIUS = BALL_RADIUS;
 const SHOT_SPAWN_OFFSET = 56;
 const SHOT_CULL_MARGIN = 48;
 const MAX_FRAME_DELTA = 50;
-const BOMB_CHANCE = 0.1;
-const REVERSE_CHANCE = 0.08;
+// Progressive special-marble chances. `difficulty` = min(level, 10) / 10:
+//   bomb    = 0.02 + 0.08 * difficulty  (L1 2.8% ... L10 10%)
+//   reverse = 0.00 + 0.08 * difficulty  (L1 0.8% ... L10 8%)
+//   pause   = 0.02 + 0.06 * difficulty  (L1 2.6% ... L10 8%)
+const BOMB_BASE_CHANCE = 0.02;
+const BOMB_LEVEL_CHANCE = 0.08;
+const REVERSE_LEVEL_CHANCE = 0.08;
+const PAUSE_BASE_CHANCE = 0.02;
+const PAUSE_LEVEL_CHANCE = 0.06;
 const REVERSE_DURATION = 2.0;
+const PAUSE_DURATION = 3.0;
 const BOMB_BLAST_NEIGHBOURS = 2;
 const BOMB_SCORE = 300;
 const BONUS_COUNT = 3;
@@ -49,12 +57,16 @@ const WIN_BONUS = 500;
 //   - top-left HUD title/level area  (about 15..300 x 15..110)
 //   - top-right score HUD            (about 610..800 x 10..110)
 //   - bottom-right home capsule      (about 646..770 x 536..570 + margin)
-// The entrance (t = 0) is always on the left/upper-left edge, and each layout
-// keeps a distinct silhouette:
+// Most entrances (t = 0) are on the left/upper-left edge; layout 4 is the
+// exception and enters from the bottom-right corner. Each layout keeps a
+// distinct silhouette:
 //   layout 1 - wide S crossing the board (original S shape, re-routed around UI)
 //   layout 2 - two staggered S-bands (upper serpentine -> right descent ->
 //              lower serpentine) with more, tighter bends than layout 1
 //   layout 3 - a wavy loop that encircles the launcher and opens on the left
+//   layout 4 - enters bottom-right (clear of the home capsule) and spirals
+//              inwards towards the middle of the board
+//   layout 5 - continuous hairpin switchbacks running up and down the board
 const TRACK_LAYOUTS = [
   // Layout 1: wide S, re-routed around the UI corners.
   [
@@ -79,6 +91,24 @@ const TRACK_LAYOUTS = [
     [734, 356], [750, 412], [716, 456], [680, 470], [594, 500], [490, 492],
     [386, 524], [282, 496], [178, 532], [72, 544], [50, 486], [58, 418],
     [56, 360], [82, 306], [126, 268], [162, 246],
+  ],
+  // Layout 4: enters bottom-right (outside the home capsule) and spirals
+  // inwards towards the middle of the board.
+  [
+    [720, 470], [676, 494], [620, 492], [560, 512], [490, 536], [400, 540],
+    [300, 528], [190, 540], [104, 512], [64, 440], [58, 360], [72, 286],
+    [110, 220], [168, 166], [260, 142], [350, 130], [430, 112], [520, 130],
+    [590, 164], [646, 206], [694, 258], [716, 322], [700, 388], [650, 430],
+    [590, 458], [520, 468], [452, 446], [398, 406], [352, 392],
+  ],
+  // Layout 5: continuous hairpin switchbacks sweeping across the board.
+  [
+    [46, 150], [160, 142], [280, 138], [400, 128], [520, 140], [630, 150],
+    [700, 160], [742, 192], [752, 238], [744, 290], [728, 342], [706, 382],
+    [672, 404], [640, 424], [560, 420], [480, 438], [400, 420], [320, 440],
+    [240, 420], [160, 440], [96, 420], [64, 448], [56, 492], [82, 522],
+    [140, 540], [220, 530], [320, 548], [420, 530], [520, 548], [590, 536],
+    [618, 512], [636, 486], [664, 470], [680, 460],
   ],
 ];
 
@@ -123,6 +153,7 @@ export class GameScene extends Phaser.Scene {
     this.trackDebugGraphics = null;
     this.startGlow = null;
     this.startRing = null;
+    this.tunnelEntrance = null;
     this.chainHeadDistance = 0;
     this.initialGapT = 0;
     this.deltaT = 0;
@@ -135,6 +166,7 @@ export class GameScene extends Phaser.Scene {
     this.shooterIndicator = null;
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
+    this.pauseTimer = 0;
     this.audioCtx = null;
     this.score = 0;
     this.highScore = 0;
@@ -181,6 +213,7 @@ export class GameScene extends Phaser.Scene {
   create() {
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
+    this.pauseTimer = 0;
     this.score = 0;
     this.currentLevel = 1;
     this.spawnedMarblesCount = 0;
@@ -341,6 +374,17 @@ export class GameScene extends Phaser.Scene {
       MARBLE_COLORS.length,
       3 + Math.floor((level - 1) / 2),
     );
+  }
+
+  // Special-marble odds ramp with difficulty from level 1 to level 10.
+  getSpecialChances() {
+    const difficulty = Math.min(this.currentLevel, 10) / 10;
+
+    return {
+      bomb: BOMB_BASE_CHANCE + BOMB_LEVEL_CHANCE * difficulty,
+      reverse: REVERSE_LEVEL_CHANCE * difficulty,
+      pause: PAUSE_BASE_CHANCE + PAUSE_LEVEL_CHANCE * difficulty,
+    };
   }
 
   // Highest level unlocked so far, persisted in localStorage under
@@ -517,25 +561,88 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
+  playBonusSound() {
+    if (!this.audioCtx) {
+      return;
+    }
+
+    // Bright C-major arpeggio: C6, E6, G6, C7 - fast, short, sine only.
+    const now = this.audioCtx.currentTime;
+    const notes = [1046.5, 1318.5, 1568, 2093];
+
+    notes.forEach((frequency, index) => {
+      const start = now + index * 0.06;
+      const osc = this.audioCtx.createOscillator();
+      const gain = this.audioCtx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(frequency, start);
+
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(0.18, start + 0.006);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.075);
+
+      osc.connect(gain);
+      gain.connect(this.audioCtx.destination);
+      osc.start(start);
+      osc.stop(start + 0.08);
+    });
+  }
+
   playExplosionSound() {
     if (!this.audioCtx) {
       return;
     }
 
     const now = this.audioCtx.currentTime;
+    const duration = 0.8;
+
+    // Main rumble: a low sawtooth sweeping down 45 Hz -> 24 Hz with a
+    // loud, long exponential decay (0.8 -> silence over ~0.8 s).
     const osc = this.audioCtx.createOscillator();
     const gain = this.audioCtx.createGain();
 
     osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(40, now);
+    osc.frequency.setValueAtTime(45, now);
+    osc.frequency.exponentialRampToValueAtTime(24, now + duration);
 
-    gain.gain.setValueAtTime(0.5, now);
-    gain.gain.linearRampToValueAtTime(0, now + 0.5);
+    gain.gain.setValueAtTime(0.8, now);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
 
     osc.connect(gain);
     gain.connect(this.audioCtx.destination);
     osc.start(now);
-    osc.stop(now + 0.52);
+    osc.stop(now + duration + 0.02);
+
+    // A second, deeper detuned oscillator adds a physical shake underneath.
+    const sub = this.audioCtx.createOscillator();
+    const subGain = this.audioCtx.createGain();
+
+    sub.type = 'sawtooth';
+    sub.frequency.setValueAtTime(30, now);
+    sub.frequency.exponentialRampToValueAtTime(15, now + duration);
+    sub.detune.setValueAtTime(-14, now);
+
+    subGain.gain.setValueAtTime(0.45, now);
+    subGain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+
+    sub.connect(subGain);
+    subGain.connect(this.audioCtx.destination);
+    sub.start(now);
+    sub.stop(now + duration + 0.02);
+
+    // 9 Hz gain tremor makes the tail of the boom shake.
+    const lfo = this.audioCtx.createOscillator();
+    const lfoGain = this.audioCtx.createGain();
+
+    lfo.type = 'sine';
+    lfo.frequency.setValueAtTime(9, now);
+    lfoGain.gain.setValueAtTime(0.12, now);
+
+    lfo.connect(lfoGain);
+    lfoGain.connect(gain.gain);
+    lfo.start(now);
+    lfo.stop(now + duration);
   }
 
   // Fresh run from the home menu or after a loss: start the selected level
@@ -573,6 +680,7 @@ export class GameScene extends Phaser.Scene {
     this.bonusTimer = 0;
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
+    this.pauseTimer = 0;
     this.chainComplete = false;
     this.chainHeadDistance = 0;
     this.levelWon = false;
@@ -927,6 +1035,7 @@ export class GameScene extends Phaser.Scene {
     // slate even if the player sits on the menu for a while.
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
+    this.pauseTimer = 0;
     this.bonusTimer = 0;
     this.chainComplete = false;
     this.levelWon = false;
@@ -1234,6 +1343,11 @@ export class GameScene extends Phaser.Scene {
       this.startGlow = null;
     }
 
+    if (this.tunnelEntrance) {
+      this.tunnelEntrance.destroy();
+      this.tunnelEntrance = null;
+    }
+
     if (this.trackGraphics) {
       this.trackGraphics.destroy();
       this.trackGraphics = null;
@@ -1298,6 +1412,57 @@ export class GameScene extends Phaser.Scene {
       .setStrokeStyle(1.5, 0xe8cf82, 0.52)
       .setDepth(DEPTH.trackDebug);
 
+    // Dark jungle cave mouth at the track start, rebuilt for every layout.
+    // It sits ABOVE the marble layer (DEPTH.balls + 1) so a freshly spawned
+    // ball at t = 0 is hidden under the tunnel and only becomes visible as it
+    // rolls out of the mouth.
+    const startTangent = this.track.getTangentAt(0).normalize();
+    const startAngle = Math.atan2(startTangent.y, startTangent.x);
+    const tunnelRadius = 30;
+    const tunnel = (this.tunnelEntrance = this.add
+      .graphics()
+      .setPosition(start.x, start.y)
+      .setRotation(startAngle)
+      .setDepth(DEPTH.balls + 1));
+
+    // Soft outer shadow that sinks the mouth into the jungle floor.
+    tunnel.fillStyle(0x000000, 0.3);
+    tunnel.fillCircle(0, 0, tunnelRadius + 5);
+
+    // Faint rock ring separates the mouth from the dark jungle floor.
+    tunnel.lineStyle(2, 0x53734c, 0.3);
+    tunnel.strokeCircle(0, 0, tunnelRadius + 1);
+
+    // Dark rock rim, heavier on the back half of the mouth.
+    tunnel.lineStyle(7, 0x0f2415, 0.98);
+    tunnel.beginPath();
+    tunnel.arc(0, 0, tunnelRadius - 1, Math.PI / 2, Math.PI * 1.5, false);
+    tunnel.strokePath();
+    tunnel.lineStyle(2, 0x3c5c3a, 0.45);
+    tunnel.beginPath();
+    tunnel.arc(0, 0, tunnelRadius - 4, Math.PI * 0.6, Math.PI * 1.4, false);
+    tunnel.strokePath();
+
+    // Cave mouth void with an oval inner depth.
+    tunnel.fillStyle(0x010603, 0.97);
+    tunnel.fillCircle(0, 0, tunnelRadius - 2);
+    tunnel.fillStyle(0x000000, 0.9);
+    tunnel.fillEllipse(3, 0, tunnelRadius * 1.35, tunnelRadius * 1.7);
+
+    // Thin lit lip on the side the marbles roll out of.
+    tunnel.lineStyle(2, 0xb6cf9b, 0.3);
+    tunnel.beginPath();
+    tunnel.arc(0, 0, tunnelRadius - 1, -Math.PI / 2, Math.PI / 2, false);
+    tunnel.strokePath();
+
+    // A few mossy rocks blend the rim into the surrounding foliage.
+    tunnel.fillStyle(0x102616, 1);
+    tunnel.fillCircle(-tunnelRadius + 4, -tunnelRadius + 8, 6);
+    tunnel.fillCircle(-tunnelRadius + 2, tunnelRadius - 10, 5);
+    tunnel.fillCircle(-tunnelRadius - 2, 2, 4);
+    tunnel.fillStyle(0x4f7048, 0.6);
+    tunnel.fillCircle(-tunnelRadius + 7, -tunnelRadius + 5, 2.5);
+
     this.tweens.add({
       targets: this.startRing,
       scale: 2.4,
@@ -1352,17 +1517,24 @@ export class GameScene extends Phaser.Scene {
     const colorIndex = Phaser.Math.Between(0, this.getActiveColorCount() - 1);
     const marble = this.createPathMarble(colorIndex, 0);
 
-    // One roll, two mutually exclusive power-ups: 10% bomb then 8%
-    // reverse-time marble, everything else is a normal chain marble.
+    // One mutually exclusive special roll (bomb, then reverse, then pause);
+    // the odds grow with the level difficulty.
+    const chances = this.getSpecialChances();
     const specialRoll = Phaser.Math.FloatBetween(0, 1);
-    marble.isBomb = specialRoll < BOMB_CHANCE;
-    marble.isReverse =
-      !marble.isBomb && specialRoll < BOMB_CHANCE + REVERSE_CHANCE;
+    const reverseThreshold = chances.bomb + chances.reverse;
+    const pauseThreshold = reverseThreshold + chances.pause;
+
+    marble.isBomb = specialRoll < chances.bomb;
+    marble.isReverse = !marble.isBomb && specialRoll < reverseThreshold;
+    marble.isPause =
+      !marble.isBomb && !marble.isReverse && specialRoll < pauseThreshold;
 
     if (marble.isBomb) {
       marble.setTexture(`zs-marble-bomb-${colorIndex}`);
     } else if (marble.isReverse) {
       marble.setTexture(`zs-marble-reverse-${colorIndex}`);
+    } else if (marble.isPause) {
+      marble.setTexture(`zs-marble-pause-${colorIndex}`);
     }
 
     this.marbles.push(marble);
@@ -1375,6 +1547,11 @@ export class GameScene extends Phaser.Scene {
   }
 
   updateSpawner() {
+    // New marbles must not feed in while time is paused.
+    if (this.pauseTimer > 0) {
+      return;
+    }
+
     this.trySpawnMarble();
   }
 
@@ -1391,6 +1568,7 @@ export class GameScene extends Phaser.Scene {
     marble.magnetApproaching = false;
     marble.isBomb = false;
     marble.isReverse = false;
+    marble.isPause = false;
 
     return marble;
   }
@@ -1445,7 +1623,8 @@ export class GameScene extends Phaser.Scene {
     if (
       this.textures.exists('zs-marble-0') &&
       this.textures.exists('zs-marble-bomb-0') &&
-      this.textures.exists('zs-marble-reverse-0')
+      this.textures.exists('zs-marble-reverse-0') &&
+      this.textures.exists('zs-marble-pause-0')
     ) {
       return;
     }
@@ -1560,12 +1739,66 @@ export class GameScene extends Phaser.Scene {
       drawChevron(center + 2.4);
 
       graphics.generateTexture(`zs-marble-reverse-${index}`, size, size);
+
+      // Pause variant: the same coloured marble with a deep blue inset
+      // core and two bright vertical bars (||) that read as a stop sign.
+      graphics.clear();
+
+      graphics.fillStyle(0x000000, 0.3);
+      graphics.fillCircle(center + 2.5, center + 4.5, BALL_RADIUS + 1);
+      graphics.fillStyle(0x07130b, 1);
+      graphics.fillCircle(center, center, BALL_RADIUS + 2.5);
+      graphics.fillStyle(color, 1);
+      graphics.fillCircle(center, center, BALL_RADIUS);
+      graphics.fillStyle(0x000000, 0.13);
+      graphics.fillCircle(center + 4, center + 5, BALL_RADIUS - 3.5);
+      graphics.fillStyle(0xffffff, 0.16);
+      graphics.fillCircle(center - 6, center - 7, 7.5);
+      graphics.fillStyle(0xffffff, 0.56);
+      graphics.fillCircle(center - 7, center - 8, 3.5);
+      graphics.lineStyle(1.2, 0xffffff, 0.3);
+      graphics.strokeCircle(center, center, BALL_RADIUS - 2.6);
+
+      graphics.fillStyle(0x061a2e, 0.95);
+      graphics.fillCircle(center, center, BALL_RADIUS - 3.2);
+      graphics.lineStyle(1.5, 0x9fd8ff, 0.9);
+      graphics.strokeCircle(center, center, BALL_RADIUS - 3.6);
+
+      // Two vertical bars with a soft blue halo, then a crisp white core.
+      graphics.fillStyle(0x63c9ff, 0.35);
+      graphics.fillRoundedRect(center - 8.3, center - 8, 6.6, 16, 3);
+      graphics.fillRoundedRect(center + 1.7, center - 8, 6.6, 16, 3);
+      graphics.fillStyle(0xeaf9ff, 1);
+      graphics.fillRoundedRect(center - 6.6, center - 6.4, 4.4, 12.8, 2);
+      graphics.fillRoundedRect(center + 2.2, center - 6.4, 4.4, 12.8, 2);
+
+      graphics.generateTexture(`zs-marble-pause-${index}`, size, size);
     });
 
     graphics.destroy();
   }
 
   updateChainMovement(step) {
+    // Pause marble: time is frozen, so the chain holds its exact position
+    // for the whole duration. No tail push, no magnetic catch-up, no
+    // momentum transfer and no combo can run; only the pause timer ticks.
+    if (this.pauseTimer > 0) {
+      this.pauseTimer = Math.max(0, this.pauseTimer - step);
+
+      for (const marble of this.marbles) {
+        marble.magnetApproaching = false;
+      }
+
+      const pausedFront = this.marbles[0];
+      this.chainHeadDistance = pausedFront
+        ? pausedFront.t * this.trackLength
+        : 0;
+      this.chainComplete = pausedFront
+        ? pausedFront.t >= 1
+        : this.spawnedMarblesCount >= this.getTotalMarbles();
+      return;
+    }
+
     const isSlowed = this.slowdownTimer > 0;
 
     if (isSlowed) {
@@ -2150,6 +2383,7 @@ export class GameScene extends Phaser.Scene {
     sprite.magnetApproaching = false;
     sprite.isBomb = false;
     sprite.isReverse = false;
+    sprite.isPause = false;
 
     this.shots.push({
       sprite,
@@ -2282,6 +2516,48 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    // Pause marble: the hit consumes the shot and the marble and freezes
+    // the whole chain for a few seconds. Like reverse it never inserts a
+    // marble or runs a match, and it cancels an in-flight reverse.
+    if (hitMarble.isPause) {
+      const shotIndex = this.shots.indexOf(shot);
+      if (shotIndex !== -1) {
+        this.shots.splice(shotIndex, 1);
+      }
+
+      shot.sprite.destroy();
+
+      const pauseX = hitMarble.x;
+      const pauseY = hitMarble.y;
+      const pauseColor = hitMarble.colorIndex;
+      hitMarble.magnetApproaching = false;
+      this.marbles.splice(hitIndex, 1);
+
+      this.tweens.add({
+        targets: hitMarble,
+        scale: 1.3,
+        alpha: 0,
+        angle: hitMarble.angle + 40,
+        duration: 240,
+        ease: 'Cubic.easeOut',
+        onComplete: () => hitMarble.destroy(),
+      });
+
+      this.updateMarbleCount();
+      const pauseFront = this.marbles[0];
+      this.chainHeadDistance = pauseFront
+        ? pauseFront.t * this.trackLength
+        : 0;
+      this.chainComplete = pauseFront ? pauseFront.t >= 1 : false;
+
+      this.reverseTimer = 0;
+      this.pauseTimer = PAUSE_DURATION;
+      this.createMatchBurst(pauseX, pauseY, pauseColor);
+      this.createFloatingText(pauseX, pauseY, '時間暫停！', '#bfe6ff', 20);
+      this.cameras.main.flash(160, 120, 200, 255);
+      return;
+    }
+
     const shotIndex = this.shots.indexOf(shot);
     if (shotIndex !== -1) {
       this.shots.splice(shotIndex, 1);
@@ -2325,6 +2601,7 @@ export class GameScene extends Phaser.Scene {
     insertedMarble.magnetApproaching = false;
     insertedMarble.isBomb = false;
     insertedMarble.isReverse = false;
+    insertedMarble.isPause = false;
 
     // Insert first, then propagate the pressure forwards through the chain.
     // A sufficiently large pre-existing gap absorbs the force completely.
@@ -2901,7 +3178,7 @@ export class GameScene extends Phaser.Scene {
     const y = item.y;
 
     this.addScore(points);
-    this.playMatchSound();
+    this.playBonusSound();
 
     this.tweens.add({
       targets: item,
