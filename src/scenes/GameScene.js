@@ -20,6 +20,14 @@ const SHOT_RADIUS = BALL_RADIUS;
 const SHOT_SPAWN_OFFSET = 56;
 const SHOT_CULL_MARGIN = 48;
 const MAX_FRAME_DELTA = 50;
+const BOMB_CHANCE = 0.1;
+const BOMB_BLAST_NEIGHBOURS = 2;
+const BOMB_SCORE = 300;
+const BONUS_COUNT = 3;
+const BONUS_RADIUS = 16;
+const BONUS_SCORE = 100;
+const GAP_SHOT_SCORE = 300;
+const TRACK_CLEARANCE = 44;
 
 // A wide, winding S that crosses the whole board. The middle pass sits below
 // the launch pad, leaving the center of the screen clear for the cannon.
@@ -60,12 +68,14 @@ const DEPTH = {
   motes: -5,
   track: 2,
   trackDebug: 3,
+  bonus: 4,
   balls: 5,
   shots: 6,
   launcherGlow: 7,
   launcherBase: 8,
   launcher: 9,
   effects: 12,
+  textFx: 15,
   hud: 30,
 };
 
@@ -85,20 +95,36 @@ export class GameScene extends Phaser.Scene {
     this.nextBulletColor = INITIAL_NEXT_COLOR;
     this.shooterIndicator = null;
     this.slowdownTimer = 0;
+    this.score = 0;
+    this.highScore = 0;
+
+    try {
+      this.highScore = Number(localStorage.getItem('zumaHighScore')) || 0;
+    } catch {
+      this.highScore = 0;
+    }
+
+    this.bonusItems = [];
+    this.scoreText = null;
+    this.highScoreText = null;
   }
 
   create() {
     this.slowdownTimer = 0;
+    this.score = 0;
+    this.bonusItems = [];
     this.createBackdrop();
 
     this.track = new Phaser.Curves.Spline(
       PATH_POINTS.map(([x, y]) => new Phaser.Math.Vector2(x, y)),
     );
     this.trackLength = this.track.getLength();
+    this.trackSamples = this.track.getSpacedPoints(240);
 
     this.createTrack();
     this.createMarbles();
     this.createLauncher();
+    this.createBonusItems();
     this.createAmbientMotes();
     this.createHud();
 
@@ -360,6 +386,31 @@ export class GameScene extends Phaser.Scene {
       ),
     );
 
+    // 10% bomb roll per initial marble. Always guarantee one bomb with a
+    // full two-neighbour blast radius so the mechanic is demonstrable.
+    const bombFlags = this.marbles.map(
+      () => Phaser.Math.FloatBetween(0, 1) < BOMB_CHANCE,
+    );
+    const centralStart = BOMB_BLAST_NEIGHBOURS;
+    const centralEnd =
+      this.marbles.length - 1 - BOMB_BLAST_NEIGHBOURS;
+
+    if (
+      !bombFlags
+        .slice(centralStart, centralEnd + 1)
+        .some(Boolean)
+    ) {
+      bombFlags[Phaser.Math.Between(centralStart, centralEnd)] = true;
+    }
+
+    this.marbles.forEach((marble, index) => {
+      marble.isBomb = bombFlags[index];
+
+      if (marble.isBomb) {
+        marble.setTexture(`zs-marble-bomb-${marble.colorIndex}`);
+      }
+    });
+
     this.chainHeadDistance = this.marbles[0].t * this.trackLength;
     this.updateChainPositions();
   }
@@ -375,6 +426,7 @@ export class GameScene extends Phaser.Scene {
     marble.t = Phaser.Math.Clamp(t, 0, 1);
     marble.pushOffset = 0;
     marble.magnetApproaching = false;
+    marble.isBomb = false;
 
     return marble;
   }
@@ -426,7 +478,10 @@ export class GameScene extends Phaser.Scene {
   }
 
   createMarbleTextures() {
-    if (this.textures.exists('zs-marble-0')) {
+    if (
+      this.textures.exists('zs-marble-0') &&
+      this.textures.exists('zs-marble-bomb-0')
+    ) {
       return;
     }
 
@@ -463,6 +518,40 @@ export class GameScene extends Phaser.Scene {
       graphics.strokeCircle(center, center, BALL_RADIUS - 2.6);
 
       graphics.generateTexture(`zs-marble-${index}`, size, size);
+
+      // Bomb variant: a dark core with a radioactive trefoil.
+      graphics.fillStyle(0x050b06, 0.96);
+      graphics.fillCircle(center, center, 11.5);
+      graphics.lineStyle(1.5, 0xd7ff69, 0.85);
+      graphics.strokeCircle(center, center, 11.5);
+      graphics.fillStyle(0xd7ff69, 0.95);
+
+      for (let blade = 0; blade < 3; blade += 1) {
+        const angle = -Math.PI / 2 + (blade * Math.PI * 2) / 3;
+
+        graphics.beginPath();
+        graphics.moveTo(
+          center + Math.cos(angle) * 3,
+          center + Math.sin(angle) * 3,
+        );
+        graphics.lineTo(
+          center + Math.cos(angle - 0.42) * 9.3,
+          center + Math.sin(angle - 0.42) * 9.3,
+        );
+        graphics.lineTo(
+          center + Math.cos(angle + 0.42) * 9.3,
+          center + Math.sin(angle + 0.42) * 9.3,
+        );
+        graphics.closePath();
+        graphics.fillPath();
+      }
+
+      graphics.fillStyle(0x071108, 1);
+      graphics.fillCircle(center, center, 2.8);
+      graphics.fillStyle(0xffffff, 0.8);
+      graphics.fillCircle(center - 2, center - 2, 1.2);
+
+      graphics.generateTexture(`zs-marble-bomb-${index}`, size, size);
     });
 
     graphics.destroy();
@@ -574,7 +663,7 @@ export class GameScene extends Phaser.Scene {
       const run = this.findMatchRun(comboMarble);
 
       if (run && run.length >= MIN_MATCH) {
-        this.resolveMatches(comboMarble);
+        this.resolveMatches(comboMarble, true);
         this.slowdownTimer = 1.5;
       }
     }
@@ -658,38 +747,146 @@ export class GameScene extends Phaser.Scene {
 
     const turret = this.add.graphics();
 
-    // Subtle aim guide, rotating with the triangle.
-    turret.lineStyle(1, 0xf7e7ab, 0.2);
-    turret.lineBetween(68, 0, 112, 0);
-    turret.fillStyle(0xf7e7ab, 0.28);
-    turret.fillCircle(112, 0, 2);
-
-    // Shadow and dark silhouette.
+    // Rear armour / counterweight.
     turret.fillStyle(0x000000, 0.35);
-    turret.fillTriangle(-17, -18, 41, 6, -17, 21);
-    turret.fillStyle(0x09170f, 1);
-    turret.fillTriangle(-22, -21, 48, 0, -22, 21);
+    turret.fillRoundedRect(-47, -17, 36, 34, 9);
+    turret.fillStyle(0x17261e, 1);
+    turret.fillRoundedRect(-44, -15, 34, 30, 8);
+    turret.lineStyle(1.5, 0x8fa695, 0.28);
+    turret.strokeRoundedRect(-44, -15, 34, 30, 8);
+    turret.fillStyle(0xb7c9b5, 0.18);
+    turret.fillRoundedRect(-40, -11, 24, 4, 2);
 
-    // The launcher itself is a clear, glowing triangle.
-    turret.fillStyle(0xe4c36d, 1);
-    turret.fillTriangle(-16, -16, 40, 0, -16, 16);
-    turret.fillStyle(0x7e5f23, 0.34);
-    turret.fillTriangle(-16, 0, 40, 0, -16, 16);
-    turret.lineStyle(1.5, 0xfff0b8, 0.65);
-    turret.strokeTriangle(-16, -16, 40, 0, -16, 16);
+    // Heavy tapered barrel.
+    turret.fillStyle(0x000000, 0.4);
+    turret.fillPoints(
+      [
+        { x: 20, y: -10 },
+        { x: 84, y: -7 },
+        { x: 84, y: 13 },
+        { x: 20, y: 15 },
+      ],
+      true,
+    );
+    turret.fillStyle(0x101b15, 1);
+    turret.fillPoints(
+      [
+        { x: 14, y: -14 },
+        { x: 78, y: -10 },
+        { x: 78, y: 10 },
+        { x: 14, y: 14 },
+      ],
+      true,
+    );
+    turret.fillStyle(0x3b4e44, 1);
+    turret.fillPoints(
+      [
+        { x: 17, y: -10 },
+        { x: 74, y: -7 },
+        { x: 74, y: 5 },
+        { x: 17, y: 8 },
+      ],
+      true,
+    );
+    turret.fillStyle(0x778c7f, 0.6);
+    turret.fillPoints(
+      [
+        { x: 17, y: -10 },
+        { x: 74, y: -7 },
+        { x: 74, y: -3 },
+        { x: 17, y: -2 },
+      ],
+      true,
+    );
+    turret.fillStyle(0x0d1712, 0.9);
+    turret.fillPoints(
+      [
+        { x: 17, y: 4 },
+        { x: 74, y: 2 },
+        { x: 74, y: 5 },
+        { x: 17, y: 8 },
+      ],
+      true,
+    );
 
-    // Pivot jewel.
-    turret.fillStyle(0x0a1a10, 1);
-    turret.fillCircle(-5, 0, 12);
-    turret.lineStyle(1.5, 0xefda94, 0.5);
-    turret.strokeCircle(-5, 0, 12);
-    turret.fillStyle(0xecd68d, 1);
-    turret.fillCircle(-5, 0, 4.5);
-    turret.fillStyle(0xffffff, 0.45);
-    turret.fillCircle(-6.5, -1.5, 1.6);
+    // Barrel bands and luminous coils.
+    for (const bandX of [34, 50, 64]) {
+      turret.lineStyle(1.5, 0x0a130e, 0.9);
+      turret.lineBetween(bandX, -10, bandX, 10);
+      turret.lineStyle(1, 0xe1c989, 0.22);
+      turret.lineBetween(bandX + 2, -9, bandX + 2, 8);
+    }
 
-    // The loaded marble sits at the muzzle and is a child of the cannon,
-    // so it rotates together with the launcher when aiming.
+    turret.lineStyle(2, 0xe5cd86, 0.28);
+    turret.lineBetween(56, -10, 56, 10);
+    turret.lineStyle(1, 0xffffff, 0.12);
+    turret.lineBetween(58, -9, 58, 9);
+
+    // Muzzle and hot bore.
+    turret.fillStyle(0x07100b, 1);
+    turret.fillCircle(78, 0, 13);
+    turret.lineStyle(2, 0xd8c07a, 0.55);
+    turret.strokeCircle(78, 0, 13);
+    turret.fillStyle(0x15271d, 1);
+    turret.fillCircle(78, 0, 7);
+    turret.fillStyle(0x9fffc6, 0.65);
+    turret.fillCircle(78, 0, 3.2);
+    turret.fillStyle(0xffffff, 0.5);
+    turret.fillCircle(77, -1, 1.2);
+
+    // Main rotary magazine / core housing.
+    turret.fillStyle(0x030a06, 1);
+    turret.fillCircle(0, 0, 35);
+    turret.lineStyle(2, 0x93a991, 0.28);
+    turret.strokeCircle(0, 0, 35);
+    turret.fillStyle(0x26382e, 1);
+    turret.fillCircle(0, 0, 31);
+    turret.fillStyle(0x18261e, 1);
+    turret.fillCircle(0, 0, 24.5);
+    turret.lineStyle(1.5, 0xdfc87f, 0.3);
+    turret.strokeCircle(0, 0, 25);
+
+    for (let i = 0; i < 8; i += 1) {
+      const angle = (i / 8) * Math.PI * 2;
+      const x = Math.cos(angle) * 30;
+      const y = Math.sin(angle) * 30;
+
+      turret.fillStyle(0xd8c17a, i % 2 === 0 ? 0.55 : 0.24);
+      turret.fillCircle(x, y, i % 2 === 0 ? 2.1 : 1.4);
+
+      turret.lineStyle(1, 0x8ea394, 0.18);
+      turret.lineBetween(
+        Math.cos(angle) * 26,
+        Math.sin(angle) * 26,
+        Math.cos(angle) * 33,
+        Math.sin(angle) * 33,
+      );
+    }
+
+    // Loaded-bullet socket: the colored core gem is added on top of this.
+    turret.fillStyle(0x050c07, 1);
+    turret.fillCircle(0, 0, 21);
+    turret.lineStyle(1.5, 0xf1db95, 0.42);
+    turret.strokeCircle(0, 0, 21);
+    turret.fillStyle(0xffffff, 0.08);
+    turret.fillCircle(-5, -6, 9);
+
+    // Top sight and small idling indicator light.
+    turret.fillStyle(0x273a30, 1);
+    turret.fillRoundedRect(-26, -32, 23, 9, 3);
+    turret.lineStyle(1, 0x94a994, 0.25);
+    turret.strokeRoundedRect(-26, -32, 23, 9, 3);
+    turret.fillStyle(0xf3db91, 0.8);
+    turret.fillCircle(-8, -27.5, 2);
+
+    // Subtle laser guide.
+    turret.lineStyle(1, 0xf7e7ab, 0.18);
+    turret.lineBetween(94, 0, 132, 0);
+    turret.fillStyle(0xf7e7ab, 0.3);
+    turret.fillCircle(132, 0, 2);
+
+    // The loaded marble sits in the central magazine core and rotates with
+    // the cannon as a single display object.
     this.shooterIndicator = this.add
       .image(0, 0, `zs-marble-${this.currentBulletColor}`)
       .setScale(SHOOTER_BALL_SCALE)
@@ -777,6 +974,7 @@ export class GameScene extends Phaser.Scene {
       .setData('colorIndex', colorIndex);
     sprite.pushOffset = 0;
     sprite.magnetApproaching = false;
+    sprite.isBomb = false;
 
     this.shots.push({
       sprite,
@@ -801,6 +999,12 @@ export class GameScene extends Phaser.Scene {
       const marble = this.findMarbleHit(shot);
       if (marble) {
         this.resolveHit(shot, marble);
+        continue;
+      }
+
+      const bonus = this.findBonusHit(shot);
+      if (bonus) {
+        this.collectBonus(bonus, shot);
         continue;
       }
 
@@ -850,6 +1054,11 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    if (hitMarble.isBomb) {
+      this.resolveBombHit(shot, hitMarble, hitIndex);
+      return;
+    }
+
     const shotIndex = this.shots.indexOf(shot);
     if (shotIndex !== -1) {
       this.shots.splice(shotIndex, 1);
@@ -891,6 +1100,7 @@ export class GameScene extends Phaser.Scene {
     insertedMarble.t = insertInFront ? hitT : hitT - this.deltaT;
     insertedMarble.pushOffset = 0;
     insertedMarble.magnetApproaching = false;
+    insertedMarble.isBomb = false;
 
     // Insert first, then propagate the pressure forwards through the chain.
     // A sufficiently large pre-existing gap absorbs the force completely.
@@ -929,6 +1139,59 @@ export class GameScene extends Phaser.Scene {
     this.resolveMatches(insertedMarble);
   }
 
+  resolveBombHit(shot, bombMarble, bombIndex) {
+    const shotIndex = this.shots.indexOf(shot);
+    if (shotIndex !== -1) {
+      this.shots.splice(shotIndex, 1);
+    }
+    shot.sprite.destroy();
+
+    const bombX = bombMarble.x;
+    const bombY = bombMarble.y;
+    const colorIndex = bombMarble.colorIndex;
+    const start = Math.max(0, bombIndex - BOMB_BLAST_NEIGHBOURS);
+    const end = Math.min(
+      this.marbles.length - 1,
+      bombIndex + BOMB_BLAST_NEIGHBOURS,
+    );
+
+    const destroyed = this.marbles.splice(start, end - start + 1);
+    destroyed.forEach((marble, index) => {
+      marble.magnetApproaching = false;
+
+      this.tweens.add({
+        targets: marble,
+        scale: 1.8,
+        alpha: 0,
+        angle: marble.angle + 60,
+        duration: 320,
+        delay: index * 22,
+        ease: 'Back.easeIn',
+        onComplete: () => marble.destroy(),
+      });
+    });
+
+    this.updateMarbleCount();
+
+    const front = this.marbles[0];
+    this.chainHeadDistance = front
+      ? front.t * this.trackLength
+      : this.trackLength;
+    this.chainComplete = front ? front.t >= 1 : true;
+
+    this.addScore(BOMB_SCORE);
+    this.slowdownTimer = 1.5;
+    this.createMatchBurst(bombX, bombY, colorIndex);
+    this.createFloatingText(
+      bombX,
+      bombY,
+      `BOMB! +${BOMB_SCORE}`,
+      '#fff1b9',
+      20,
+    );
+    this.cameras.main.shake(200, 0.01);
+  }
+
   findMatchRun(marble) {
     const insertedIndex = this.marbles.indexOf(marble);
 
@@ -961,7 +1224,7 @@ export class GameScene extends Phaser.Scene {
     };
   }
 
-  resolveMatches(insertedMarble) {
+  resolveMatches(insertedMarble, isCombo = false) {
     const run = this.findMatchRun(insertedMarble);
 
     if (!run || run.length < MIN_MATCH) {
@@ -971,6 +1234,12 @@ export class GameScene extends Phaser.Scene {
     const { start, end } = run;
     const matchLength = run.length;
     const colorIndex = insertedMarble.colorIndex;
+
+    const basePoints = 30 + Math.max(0, matchLength - 3) * 20;
+    const earnedPoints = isCombo
+      ? Math.round(basePoints * 1.5)
+      : basePoints;
+    this.addScore(earnedPoints);
 
     // The marble directly after the removed run receives an elastic kickback.
     const pushbackMarble = this.marbles[end + 1] ?? null;
@@ -1014,6 +1283,40 @@ export class GameScene extends Phaser.Scene {
 
     this.createMatchBurst(centerX, centerY, colorIndex);
     return matchLength;
+  }
+
+  addScore(points) {
+    if (!Number.isFinite(points) || points <= 0) {
+      return;
+    }
+
+    this.score += Math.round(points);
+
+    if (this.score > this.highScore) {
+      this.highScore = this.score;
+
+      try {
+        localStorage.setItem('zumaHighScore', String(this.highScore));
+      } catch {
+        // Storage can be unavailable in private or embedded contexts.
+      }
+    }
+
+    this.updateScoreHud();
+  }
+
+  formatScore(value) {
+    return String(Math.max(0, Math.floor(value))).padStart(6, '0');
+  }
+
+  updateScoreHud() {
+    if (this.scoreText) {
+      this.scoreText.setText(this.formatScore(this.score));
+    }
+
+    if (this.highScoreText) {
+      this.highScoreText.setText(`HIGH ${this.formatScore(this.highScore)}`);
+    }
   }
 
   createMuzzleFlash(x, y) {
@@ -1109,6 +1412,336 @@ export class GameScene extends Phaser.Scene {
   }
 
   /* ------------------------------------------------------------------ */
+  /* Bonus items                                                         */
+  /* ------------------------------------------------------------------ */
+
+  createBonusItems() {
+    this.createBonusTexture();
+    this.bonusItems = [];
+
+    const positions = [];
+    const anchors = Phaser.Utils.Array.Shuffle([
+      { x: 240, y: 220 },
+      { x: 560, y: 220 },
+      { x: 200, y: 300 },
+      { x: 600, y: 300 },
+      { x: 240, y: 260 },
+      { x: 560, y: 260 },
+    ]);
+
+    // Two regular 100-point pickups must be directly reachable; otherwise
+    // every star would accidentally become a 300-point gap shot.
+    for (const anchor of anchors) {
+      if (positions.length >= BONUS_COUNT - 1) {
+        break;
+      }
+
+      const x = Phaser.Math.Clamp(
+        anchor.x + Phaser.Math.Between(-10, 10),
+        70,
+        VIEW_WIDTH - 70,
+      );
+      const y = Phaser.Math.Clamp(
+        anchor.y + Phaser.Math.Between(-10, 10),
+        80,
+        VIEW_HEIGHT - 70,
+      );
+
+      if (
+        this.isBonusPositionClear(x, y, positions, 48) &&
+        !this.shotPathCrossesTrack(x, y)
+      ) {
+        positions.push({ x, y, clearance: 48 });
+      }
+    }
+
+    // One star sits above the top track: reaching it requires firing through
+    // a gap in the chain, so it is worth the 300-point Gap Shot bonus.
+    let gapX = Phaser.Math.Between(480, 600);
+    let gapY = Phaser.Math.Between(24, 34);
+
+    if (
+      this.distanceToTrack(gapX, gapY) < TRACK_CLEARANCE ||
+      !this.isBonusPositionClear(
+        gapX,
+        gapY,
+        positions,
+        TRACK_CLEARANCE,
+      ) ||
+      !this.shotPathCrossesTrack(gapX, gapY)
+    ) {
+      gapX = 540;
+      gapY = 28;
+    }
+
+    positions.push({
+      x: gapX,
+      y: gapY,
+      clearance: TRACK_CLEARANCE,
+    });
+
+    for (const position of positions) {
+      this.spawnBonusItem(position.x, position.y);
+    }
+  }
+
+  createBonusTexture() {
+    if (this.textures.exists('zs-bonus-star')) {
+      return;
+    }
+
+    const size = 44;
+    const center = size / 2;
+    const graphics = this.make.graphics({ x: 0, y: 0, add: false });
+
+    graphics.fillStyle(0x000000, 0.35);
+    graphics.fillCircle(center + 1, center + 3, 18);
+
+    const points = [];
+    for (let i = 0; i < 10; i += 1) {
+      const radius = i % 2 === 0 ? 16 : 7;
+      const angle = -Math.PI / 2 + (i * Math.PI) / 5;
+      points.push(
+        new Phaser.Math.Vector2(
+          center + Math.cos(angle) * radius,
+          center + Math.sin(angle) * radius,
+        ),
+      );
+    }
+
+    graphics.fillStyle(0x3a2508, 1);
+    graphics.beginPath();
+    graphics.moveTo(center, center - 19);
+    for (let i = 0; i < points.length; i += 1) {
+      const point = points[i];
+      const next = points[(i + 1) % points.length];
+      graphics.lineTo(point.x, point.y);
+      graphics.lineTo(next.x, next.y);
+    }
+    graphics.closePath();
+    graphics.fillPath();
+
+    graphics.fillStyle(0xffd15c, 1);
+    graphics.beginPath();
+    graphics.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i += 1) {
+      graphics.lineTo(points[i].x, points[i].y);
+    }
+    graphics.closePath();
+    graphics.fillPath();
+
+    graphics.lineStyle(1.5, 0xfff3c0, 0.9);
+    graphics.strokePath();
+    graphics.fillStyle(0xffffff, 0.75);
+    graphics.fillCircle(center - 3, center - 4, 2.2);
+
+    graphics.generateTexture('zs-bonus-star', size, size);
+    graphics.destroy();
+  }
+
+  isBonusPositionClear(x, y, positions, clearance) {
+    if (Phaser.Math.Distance.Between(CENTER_X, CENTER_Y, x, y) < 115) {
+      return false;
+    }
+
+    if (this.distanceToTrack(x, y) < clearance) {
+      return false;
+    }
+
+    return positions.every(
+      (position) =>
+        Phaser.Math.Distance.Between(x, y, position.x, position.y) > 85,
+    );
+  }
+
+  distanceToTrack(x, y) {
+    let nearest = Infinity;
+
+    for (const point of this.trackSamples) {
+      const distance = Phaser.Math.Distance.Between(x, y, point.x, point.y);
+      if (distance < nearest) {
+        nearest = distance;
+      }
+    }
+
+    return nearest;
+  }
+
+  shotPathCrossesTrack(targetX, targetY) {
+    const steps = 60;
+
+    for (let step = 6; step <= steps - 4; step += 1) {
+      const ratio = step / steps;
+      const x = CENTER_X + (targetX - CENTER_X) * ratio;
+      const y = CENTER_Y + (targetY - CENTER_Y) * ratio;
+
+      if (this.distanceToTrack(x, y) < 14) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  spawnBonusItem(x, y) {
+    const glow = this.add
+      .circle(0, 0, 25, 0xffd76a, 0.17)
+      .setBlendMode(Phaser.BlendModes.ADD);
+    const star = this.add.image(0, 0, 'zs-bonus-star');
+    const item = this.add
+      .container(x, y, [glow, star])
+      .setDepth(DEPTH.bonus);
+
+    const requiresGap = this.shotPathCrossesTrack(x, y);
+    item.setData('type', 'bonus');
+    item.setData('requiresGap', requiresGap);
+    item.setData('points', requiresGap ? GAP_SHOT_SCORE : BONUS_SCORE);
+    item.setName('bonus-item');
+    item.bonusRequiresGap = requiresGap;
+
+    this.tweens.add({
+      targets: star,
+      scale: { from: 0.94, to: 1.16 },
+      angle: { from: -8, to: 8 },
+      duration: 620,
+      ease: 'Sine.easeInOut',
+      yoyo: true,
+      repeat: -1,
+    });
+
+    this.tweens.add({
+      targets: glow,
+      scale: { from: 0.85, to: 1.3 },
+      alpha: { from: 0.25, to: 0.04 },
+      duration: 980,
+      ease: 'Sine.easeInOut',
+      yoyo: true,
+      repeat: -1,
+    });
+
+    this.bonusItems.push(item);
+  }
+
+  findBonusHit(shot) {
+    const hitDistanceSq = (SHOT_RADIUS + BONUS_RADIUS) ** 2;
+
+    for (const item of this.bonusItems) {
+      if (!item.active) {
+        continue;
+      }
+
+      const dx = item.x - shot.sprite.x;
+      const dy = item.y - shot.sprite.y;
+
+      if (dx * dx + dy * dy <= hitDistanceSq) {
+        return item;
+      }
+    }
+
+    return null;
+  }
+
+  collectBonus(item, shot) {
+    const bonusIndex = this.bonusItems.indexOf(item);
+    if (bonusIndex !== -1) {
+      this.bonusItems.splice(bonusIndex, 1);
+    }
+
+    const shotIndex = this.shots.indexOf(shot);
+    if (shotIndex !== -1) {
+      this.shots.splice(shotIndex, 1);
+    }
+
+    shot.sprite.destroy();
+
+    const requiresGap = item.getData('requiresGap') === true;
+    const points = requiresGap ? GAP_SHOT_SCORE : BONUS_SCORE;
+    const x = item.x;
+    const y = item.y;
+
+    this.addScore(points);
+
+    this.tweens.add({
+      targets: item,
+      scale: 1.7,
+      alpha: 0,
+      duration: 260,
+      ease: 'Cubic.easeOut',
+      onComplete: () => item.destroy(),
+    });
+
+    this.createBonusBurst(x, y, requiresGap);
+    this.createFloatingText(
+      x,
+      y,
+      requiresGap ? `Gap Shot! +${points}` : `+${points}`,
+      requiresGap ? '#fff2bb' : '#ffd76a',
+      requiresGap ? 18 : 15,
+    );
+  }
+
+  createBonusBurst(x, y, isGapShot) {
+    const color = isGapShot ? 0xffffff : 0xffd15c;
+    const ring = this.add
+      .circle(x, y, 18, color, 0.15)
+      .setStrokeStyle(2, color, 0.75)
+      .setDepth(DEPTH.effects)
+      .setBlendMode(Phaser.BlendModes.ADD);
+
+    this.tweens.add({
+      targets: ring,
+      scale: 2.6,
+      alpha: 0,
+      duration: 380,
+      ease: 'Cubic.easeOut',
+      onComplete: () => ring.destroy(),
+    });
+
+    for (let i = 0; i < 12; i += 1) {
+      const angle =
+        (i / 12) * Math.PI * 2 + Phaser.Math.FloatBetween(-0.25, 0.25);
+      const spread = Phaser.Math.FloatBetween(28, 68);
+      const spark = this.add
+        .circle(x, y, Phaser.Math.FloatBetween(1.5, 3), color, 0.9)
+        .setDepth(DEPTH.effects)
+        .setBlendMode(Phaser.BlendModes.ADD);
+
+      this.tweens.add({
+        targets: spark,
+        x: x + Math.cos(angle) * spread,
+        y: y + Math.sin(angle) * spread,
+        alpha: 0,
+        scale: 0.2,
+        duration: Phaser.Math.Between(330, 520),
+        ease: 'Cubic.easeOut',
+        onComplete: () => spark.destroy(),
+      });
+    }
+  }
+
+  createFloatingText(x, y, message, color, size = 16) {
+    const label = this.add
+      .text(x, y - 18, message, {
+        fontFamily: 'Georgia, "Times New Roman", serif',
+        fontSize: `${size}px`,
+        color,
+        fontStyle: 'bold',
+      })
+      .setOrigin(0.5)
+      .setDepth(DEPTH.textFx)
+      .setShadow(0, 2, '#000000', 8, false, true);
+
+    this.tweens.add({
+      targets: label,
+      y: y - 54,
+      alpha: 0,
+      duration: 850,
+      ease: 'Cubic.easeOut',
+      onComplete: () => label.destroy(),
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Atmosphere and HUD                                                  */
   /* ------------------------------------------------------------------ */
 
@@ -1152,7 +1785,7 @@ export class GameScene extends Phaser.Scene {
     title.setShadow(0, 2, '#000000', 8, false, true);
 
     this.add
-      .text(30, 51, 'PHASE 03 / INSERT / PUSH / MATCH', {
+      .text(30, 51, 'PHASE 04 / SCORE / BONUS / BOMB', {
         fontFamily: '"Courier New", monospace',
         fontSize: '9px',
         color: '#b4c79d',
@@ -1161,17 +1794,48 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     this.add
-      .text(770, 27, 'AIM + CLICK TO SHOOT', {
+      .text(770, 20, 'SCORE', {
+        fontFamily: '"Courier New", monospace',
+        fontSize: '9px',
+        color: '#d8c387',
+      })
+      .setOrigin(1, 0)
+      .setAlpha(0.72)
+      .setDepth(DEPTH.hud);
+
+    this.scoreText = this.add
+      .text(770, 30, this.formatScore(this.score), {
+        fontFamily: 'Georgia, "Times New Roman", serif',
+        fontSize: '24px',
+        color: '#ffe39a',
+      })
+      .setOrigin(1, 0)
+      .setDepth(DEPTH.hud);
+
+    this.scoreText.setShadow(0, 2, '#000000', 8, false, true);
+
+    this.highScoreText = this.add
+      .text(770, 59, `HIGH ${this.formatScore(this.highScore)}`, {
         fontFamily: '"Courier New", monospace',
         fontSize: '9px',
         color: '#c8d8b2',
       })
       .setOrigin(1, 0)
-      .setAlpha(0.62)
+      .setAlpha(0.54)
+      .setDepth(DEPTH.hud);
+
+    this.add
+      .text(770, 73, 'AIM + CLICK TO SHOOT', {
+        fontFamily: '"Courier New", monospace',
+        fontSize: '9px',
+        color: '#c8d8b2',
+      })
+      .setOrigin(1, 0)
+      .setAlpha(0.42)
       .setDepth(DEPTH.hud);
 
     this.marbleCountText = this.add
-      .text(770, 44, `${this.marbles.length} MARBLES / 01 PATH`, {
+      .text(770, 87, `${this.marbles.length} MARBLES / 01 PATH`, {
         fontFamily: '"Courier New", monospace',
         fontSize: '9px',
         color: '#c8d8b2',
@@ -1179,6 +1843,8 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(1, 0)
       .setAlpha(0.38)
       .setDepth(DEPTH.hud);
+
+    this.updateScoreHud();
   }
 
   updateMarbleCount() {
