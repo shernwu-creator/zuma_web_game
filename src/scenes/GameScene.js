@@ -135,6 +135,7 @@ export class GameScene extends Phaser.Scene {
     this.shooterIndicator = null;
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
+    this.audioCtx = null;
     this.score = 0;
     this.highScore = 0;
 
@@ -415,9 +416,133 @@ export class GameScene extends Phaser.Scene {
     updateArrow(this.menuArrowRight, this.selectedLevel < maxLevel);
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Procedural retro audio (Web Audio API, no external files)           */
+  /* ------------------------------------------------------------------ */
+
+  initAudio() {
+    if (!this.audioCtx) {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+
+      if (AudioContext) {
+        try {
+          this.audioCtx = new AudioContext();
+        } catch {
+          this.audioCtx = null;
+        }
+      }
+    }
+
+    // Browsers suspend audio until the first user gesture; resume whenever a
+    // click reaches the game so the synth is unlocked immediately.
+    if (this.audioCtx && this.audioCtx.state === 'suspended') {
+      try {
+        const resume = this.audioCtx.resume();
+        if (resume && typeof resume.catch === 'function') {
+          resume.catch(() => {});
+        }
+      } catch {
+        // Audio is a progressive enhancement; never break gameplay for it.
+      }
+    }
+  }
+
+  playShootSound() {
+    if (!this.audioCtx) {
+      return;
+    }
+
+    const now = this.audioCtx.currentTime;
+    const osc = this.audioCtx.createOscillator();
+    const gain = this.audioCtx.createGain();
+
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(600, now);
+    osc.frequency.exponentialRampToValueAtTime(100, now + 0.1);
+
+    gain.gain.setValueAtTime(0.16, now);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.1);
+
+    osc.connect(gain);
+    gain.connect(this.audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.11);
+  }
+
+  playClickSound() {
+    if (!this.audioCtx) {
+      return;
+    }
+
+    const now = this.audioCtx.currentTime;
+    const osc = this.audioCtx.createOscillator();
+    const gain = this.audioCtx.createGain();
+
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(150, now);
+
+    gain.gain.setValueAtTime(0.1, now);
+    gain.gain.linearRampToValueAtTime(0, now + 0.05);
+
+    osc.connect(gain);
+    gain.connect(this.audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.055);
+  }
+
+  playMatchSound() {
+    if (!this.audioCtx) {
+      return;
+    }
+
+    const now = this.audioCtx.currentTime;
+    const notes = [523, 659, 783];
+
+    notes.forEach((frequency, index) => {
+      const start = now + index * 0.08;
+      const osc = this.audioCtx.createOscillator();
+      const gain = this.audioCtx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(frequency, start);
+
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(0.12, start + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.08);
+
+      osc.connect(gain);
+      gain.connect(this.audioCtx.destination);
+      osc.start(start);
+      osc.stop(start + 0.085);
+    });
+  }
+
+  playExplosionSound() {
+    if (!this.audioCtx) {
+      return;
+    }
+
+    const now = this.audioCtx.currentTime;
+    const osc = this.audioCtx.createOscillator();
+    const gain = this.audioCtx.createGain();
+
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(40, now);
+
+    gain.gain.setValueAtTime(0.5, now);
+    gain.gain.linearRampToValueAtTime(0, now + 0.5);
+
+    osc.connect(gain);
+    gain.connect(this.audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.52);
+  }
+
   // Fresh run from the home menu or after a loss: start the selected level
   // with a zeroed run score. `startLevel` handles the rest of the setup.
   startGame(level = this.selectedLevel) {
+    this.initAudio();
+
     const requested = Number.isFinite(level) ? level : this.selectedLevel;
 
     this.currentLevel = Phaser.Math.Clamp(
@@ -1937,6 +2062,7 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    this.initAudio();
     this.pointerSeen = true;
     this.shootAt(pointer.worldX, pointer.worldY);
   }
@@ -2034,6 +2160,7 @@ export class GameScene extends Phaser.Scene {
     });
 
     this.createMuzzleFlash(muzzleX, muzzleY);
+    this.playShootSound();
   }
 
   updateShots(step) {
@@ -2233,10 +2360,16 @@ export class GameScene extends Phaser.Scene {
     this.createInsertPulse(hitX, hitY, shot.colorIndex);
     console.log('Hit!');
 
-    this.resolveMatches(insertedMarble);
+    const matchLength = this.resolveMatches(insertedMarble);
+
+    if (matchLength === 0) {
+      this.playClickSound();
+    }
   }
 
   resolveBombHit(shot, bombMarble, bombIndex) {
+    this.playExplosionSound();
+
     const shotIndex = this.shots.indexOf(shot);
     if (shotIndex !== -1) {
       this.shots.splice(shotIndex, 1);
@@ -2389,6 +2522,7 @@ export class GameScene extends Phaser.Scene {
     });
 
     this.createMatchBurst(centerX, centerY, colorIndex);
+    this.playMatchSound();
     return matchLength;
   }
 
@@ -2767,6 +2901,7 @@ export class GameScene extends Phaser.Scene {
     const y = item.y;
 
     this.addScore(points);
+    this.playMatchSound();
 
     this.tweens.add({
       targets: item,
