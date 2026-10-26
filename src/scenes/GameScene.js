@@ -125,6 +125,8 @@ export class GameScene extends Phaser.Scene {
     this.gameOverOverlay = null;
     this.menuButton = null;
     this.restartButton = null;
+    this.homeButton = null;
+    this.exitButtonDownTime = null;
     this.hudObjects = [];
     this.launcherHalo = null;
     this.launcherBase = null;
@@ -139,6 +141,7 @@ export class GameScene extends Phaser.Scene {
     this.levelWon = false;
     this.gameState = 'MENU';
     this.bonusItems = [];
+    this.exitButtonDownTime = null;
     this.createBackdrop();
 
     this.track = new Phaser.Curves.Spline(
@@ -499,6 +502,34 @@ export class GameScene extends Phaser.Scene {
       repeat: -1,
       ease: 'Sine.easeInOut',
     });
+  }
+
+  // Leave the current run and go back to the start screen. Called directly by
+  // the HUD exit button, so every round object has to be torn down: nothing
+  // from the abandoned run may keep moving, shooting or showing behind home.
+  returnToMenu() {
+    if (this.gameState === 'MENU') {
+      return;
+    }
+
+    this.gameState = 'MENU';
+    this.clearRoundObjects();
+    this.setHudVisible(false);
+    this.setLauncherVisible(false);
+
+    // Reset the round-only state so a game started later begins from a clean
+    // slate even if the player sits on the menu for a while.
+    this.slowdownTimer = 0;
+    this.bonusTimer = 0;
+    this.chainComplete = false;
+    this.levelWon = false;
+
+    // Drop any residual camera shake/flash from the last impact so the home
+    // screen is presented cleanly.
+    this.cameras.main.resetFX();
+
+    this.destroyOverlays();
+    this.createMenu();
   }
 
   showGameOverOverlay(isWin) {
@@ -1079,6 +1110,27 @@ export class GameScene extends Phaser.Scene {
         rear.speed = catchUpTravelT;
         rear.isMagnetic = true;
       }
+
+      // Momentum transfer: once a moving rear segment is within one frame of
+      // touching the tail of a stopped segment ahead, the rear's speed is
+      // handed to that segment. Without this the rear can never advance past
+      // the rigid-clamp limit (frontTail.t - deltaT), so a stopped front
+      // segment permanently deadlocks the whole chain. This loop walks from
+      // the back towards the front, so the inherited speed keeps propagating
+      // into the next stopped car in the same frame: the connected chain is
+      // pushed like a train instead of one car at a time.
+      const closingDistance = frontTail.t - rearHead.t - this.deltaT;
+
+      if (closingDistance <= rear.speed + 0.002) {
+        // The inherited speed is capped at the base chain speed. A magnetic
+        // same-colour rear moves at 4.5x to slam the gap shut, and handing
+        // that full overspeed to the car ahead would keep the gap constant
+        // forever, so the Step 3/4 magnetic combo could never fire.
+        front.speed = Math.max(
+          front.speed,
+          Math.min(rear.speed, standardTravelT),
+        );
+      }
     }
 
     // Step 3: apply movement from front to rear, rigidly clamping each rear
@@ -1411,6 +1463,17 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    // The HUD exit button has its own object-level handler. Depending on the
+    // Phaser dispatch order the scene-wide 'pointerdown' can still arrive for
+    // the same press, so both orders are guarded here: a click inside the
+    // visible button is ignored, and a scene event that arrives after the
+    // button already ran for this press is swallowed as well. Without this,
+    // the exit click could fire a shot or instantly start a new game from the
+    // menu that was just opened.
+    if (this.consumeExitButtonClick(pointer)) {
+      return;
+    }
+
     if (this.gameState === 'MENU') {
       this.startGame();
       return;
@@ -1428,6 +1491,35 @@ export class GameScene extends Phaser.Scene {
 
     this.pointerSeen = true;
     this.shootAt(pointer.worldX, pointer.worldY);
+  }
+
+  // True when this scene-level pointerdown belongs to a click on the HUD exit
+  // button and must not shoot, start or restart anything. Also clears the
+  // one-shot marker so it can never leak into a later, unrelated click.
+  consumeExitButtonClick(pointer) {
+    if (this.exitButtonDownTime !== null) {
+      const isSamePress = pointer.downTime === this.exitButtonDownTime;
+      this.exitButtonDownTime = null;
+
+      if (isSamePress) {
+        return true;
+      }
+    }
+
+    if (
+      this.gameState === 'PLAYING' &&
+      this.homeButton &&
+      this.homeButton.visible &&
+      this.homeButton.active
+    ) {
+      return Phaser.Geom.Rectangle.Contains(
+        this.homeButton.getBounds(),
+        pointer.worldX,
+        pointer.worldY,
+      );
+    }
+
+    return false;
   }
 
   shootAt(targetX, targetY) {
@@ -2284,6 +2376,30 @@ export class GameScene extends Phaser.Scene {
       })
       .setAlpha(0.7)
       .setDepth(DEPTH.hud);
+
+    // Exit-to-home control. It is created at DEPTH.hud so the depth-filtered
+    // hudObjects list picks it up automatically and setHudVisible() toggles it
+    // together with the rest of the HUD (visible while PLAYING, hidden on the
+    // menu and on the game-over/win panels).
+    this.homeButton = this.add
+      .text(30, 75, '[ 退出回首頁 ]', {
+        fontFamily: UI_FONT,
+        fontSize: '13px',
+        color: '#ff7777',
+      })
+      .setOrigin(0, 0)
+      .setInteractive({ useHandCursor: true })
+      .setDepth(DEPTH.hud);
+
+    this.homeButton.on('pointerdown', (pointer, localX, localY, event) => {
+      event.stopPropagation();
+
+      // Mark this exact press so a scene-level 'pointerdown' dispatched for
+      // the same click (before or after this handler) is ignored instead of
+      // shooting or restarting the game from the menu.
+      this.exitButtonDownTime = pointer.downTime;
+      this.returnToMenu();
+    });
 
     this.add
       .text(770, 18, '目前分數', {
