@@ -41,23 +41,97 @@ const TRACK_CLEARANCE = 44;
 const BONUS_SPAWN_INTERVAL = 8;
 const WIN_BONUS = 500;
 
-// A wide, winding S that crosses the whole board. The middle pass sits below
-// the launch pad, leaving the center of the screen clear for the cannon.
-const PATH_POINTS = [
-  [46, 128],
-  [190, 72],
-  [410, 66],
-  [646, 116],
-  [758, 214],
-  [712, 318],
-  [544, 372],
-  [352, 364],
-  [198, 396],
-  [134, 480],
-  [200, 552],
-  [396, 574],
-  [614, 554],
-  [760, 482],
+// One track per level, cycled with `(currentLevel - 1) % TRACK_LAYOUTS.length`.
+// Every layout lives inside the 800x600 board and follows the same convention as
+// the original S: the entrance (t = 0) is on the left / upper-left edge so the
+// tail feeds in from outside the play area, while the exit (t = 1) ends away
+// from the cannon.
+//
+//   layout 1 - the original wide S crossing the whole board.
+//   layout 2 - two staggered S-bands (upper serpentine -> right descent ->
+//              lower serpentine) with more, tighter bends than layout 1. The
+//              middle band stays clear so the cannon keeps a free firing lane.
+//   layout 3 - a wavy loop that encircles the launcher and opens on the left,
+//              giving the level a "loop" silhouette instead of an S.
+const TRACK_LAYOUTS = [
+  // Layout 1: original S.
+  [
+    [46, 128],
+    [190, 72],
+    [410, 66],
+    [646, 116],
+    [758, 214],
+    [712, 318],
+    [544, 372],
+    [352, 364],
+    [198, 396],
+    [134, 480],
+    [200, 552],
+    [396, 574],
+    [614, 554],
+    [760, 482],
+  ],
+  // Layout 2: double S-band serpentine with extra bends.
+  [
+    [46, 140],
+    [112, 96],
+    [178, 76],
+    [244, 104],
+    [312, 68],
+    [380, 98],
+    [448, 70],
+    [516, 104],
+    [584, 76],
+    [652, 120],
+    [712, 104],
+    [770, 152],
+    [776, 212],
+    [744, 264],
+    [774, 322],
+    [742, 378],
+    [700, 440],
+    [644, 486],
+    [580, 460],
+    [518, 506],
+    [452, 470],
+    [388, 518],
+    [322, 480],
+    [256, 524],
+    [190, 486],
+    [126, 526],
+    [74, 472],
+    [52, 416],
+  ],
+  // Layout 3: wavy loop around the launcher, open on the left.
+  [
+    [52, 184],
+    [104, 114],
+    [190, 72],
+    [286, 54],
+    [384, 76],
+    [486, 52],
+    [590, 78],
+    [676, 54],
+    [754, 98],
+    [782, 172],
+    [736, 232],
+    [778, 300],
+    [732, 360],
+    [780, 430],
+    [752, 490],
+    [688, 540],
+    [592, 568],
+    [502, 536],
+    [414, 575],
+    [326, 538],
+    [238, 573],
+    [152, 538],
+    [90, 488],
+    [58, 412],
+    [96, 340],
+    [52, 282],
+    [96, 238],
+  ],
 ];
 
 const MARBLE_COLORS = [
@@ -91,7 +165,16 @@ export class GameScene extends Phaser.Scene {
   constructor() {
     super({ key: 'GameScene' });
 
+    // The track is level-dependent and does NOT exist on the start menu.
+    // It is (re)built in startLevel() from TRACK_LAYOUTS; the visual objects
+    // are owned by clearTrackVisuals()/createTrack().
+    this.track = null;
     this.trackLength = 0;
+    this.trackSamples = [];
+    this.trackGraphics = null;
+    this.trackDebugGraphics = null;
+    this.startGlow = null;
+    this.startRing = null;
     this.chainHeadDistance = 0;
     this.initialGapT = 0;
     this.deltaT = 0;
@@ -111,6 +194,18 @@ export class GameScene extends Phaser.Scene {
     } catch {
       this.highScore = 0;
     }
+
+    // Level-selector state. `zumaMaxLevel` remembers the highest level the
+    // player has unlocked across reloads; the home menu may only pick a level
+    // inside that range.
+    this.maxUnlockedLevel = 1;
+    this.selectedLevel = 1;
+    this.menuLevelText = null;
+    this.menuArrowLeft = null;
+    this.menuArrowRight = null;
+    this.menuStartHitArea = null;
+    this.menuControlDownTime = null;
+    this.loadMaxUnlockedLevel();
 
     this.bonusItems = [];
     this.scoreText = null;
@@ -142,16 +237,13 @@ export class GameScene extends Phaser.Scene {
     this.gameState = 'MENU';
     this.bonusItems = [];
     this.exitButtonDownTime = null;
+    this.menuControlDownTime = null;
     this.createBackdrop();
 
-    this.track = new Phaser.Curves.Spline(
-      PATH_POINTS.map(([x, y]) => new Phaser.Math.Vector2(x, y)),
-    );
-    this.trackLength = this.track.getLength();
-    this.trackSamples = this.track.getSpacedPoints(240);
-
-    this.createTrack();
-    this.createMarbles();
+    // No track and no marble chain on the start menu: they are built per level
+    // in startLevel(). The launcher still needs the marble textures, so they
+    // are created here before createLauncher() bakes the colour socket.
+    this.createMarbleTextures();
     this.createLauncher();
     this.createAmbientMotes();
     this.createHud();
@@ -242,6 +334,10 @@ export class GameScene extends Phaser.Scene {
 
     this.menuButton = null;
     this.restartButton = null;
+    this.menuLevelText = null;
+    this.menuArrowLeft = null;
+    this.menuArrowRight = null;
+    this.menuStartHitArea = null;
   }
 
   clearRoundObjects() {
@@ -275,9 +371,90 @@ export class GameScene extends Phaser.Scene {
     return LEVEL_BASE_SPEED + this.currentLevel * LEVEL_SPEED_STEP;
   }
 
-  // Fresh run from the start menu or after a loss: back to level 1, score 0.
-  startGame() {
-    this.currentLevel = 1;
+  // Highest level unlocked so far, persisted in localStorage under
+  // `zumaMaxLevel`. Missing or corrupt values fall back to level 1 so the
+  // home selector is never empty or out of range.
+  loadMaxUnlockedLevel() {
+    let stored = 1;
+
+    try {
+      stored = Number(localStorage.getItem('zumaMaxLevel'));
+    } catch {
+      stored = 1;
+    }
+
+    this.maxUnlockedLevel =
+      Number.isFinite(stored) && stored >= 1 ? Math.floor(stored) : 1;
+  }
+
+  saveMaxUnlockedLevel() {
+    try {
+      localStorage.setItem('zumaMaxLevel', String(this.maxUnlockedLevel));
+    } catch {
+      // Storage can be unavailable in private or embedded contexts.
+    }
+  }
+
+  // Move the home selector, clamped to the unlocked range. Called by the < >
+  // arrows; it never starts a run or fires the cannon.
+  changeSelectedLevel(delta) {
+    const maxLevel = Math.max(1, this.maxUnlockedLevel);
+    const next = Phaser.Math.Clamp(
+      Math.round(this.selectedLevel) + delta,
+      1,
+      maxLevel,
+    );
+
+    if (next === this.selectedLevel) {
+      return;
+    }
+
+    this.selectedLevel = next;
+    this.refreshLevelSelector();
+  }
+
+  // Redraw the level label and dim arrows that cannot move any further.
+  refreshLevelSelector() {
+    const maxLevel = Math.max(1, this.maxUnlockedLevel);
+
+    this.selectedLevel = Phaser.Math.Clamp(
+      Math.round(this.selectedLevel) || 1,
+      1,
+      maxLevel,
+    );
+
+    if (this.menuLevelText) {
+      this.menuLevelText.setText(`第 ${this.selectedLevel} 關`);
+    }
+
+    const updateArrow = (arrow, enabled) => {
+      if (!arrow) {
+        return;
+      }
+
+      arrow.setAlpha(enabled ? 1 : 0.22);
+      arrow.setColor(enabled ? '#ffd98a' : '#8f7f5c');
+
+      if (arrow.input) {
+        arrow.input.enabled = enabled;
+      }
+    };
+
+    updateArrow(this.menuArrowLeft, this.selectedLevel > 1);
+    updateArrow(this.menuArrowRight, this.selectedLevel < maxLevel);
+  }
+
+  // Fresh run from the home menu or after a loss: start the selected level
+  // with a zeroed run score. `startLevel` handles the rest of the setup.
+  startGame(level = this.selectedLevel) {
+    const requested = Number.isFinite(level) ? level : this.selectedLevel;
+
+    this.currentLevel = Phaser.Math.Clamp(
+      Math.round(requested),
+      1,
+      Math.max(1, this.maxUnlockedLevel),
+    );
+    this.selectedLevel = this.currentLevel;
     this.score = 0;
     this.startLevel();
   }
@@ -287,6 +464,13 @@ export class GameScene extends Phaser.Scene {
   startLevel() {
     this.destroyOverlays();
     this.clearRoundObjects();
+
+    // Build the level's track before anything else can reference it. The
+    // selection happens here (not in create()) so the start menu has no track
+    // and every level gets its own spline + freshly drawn visuals.
+    this.buildLevelTrack();
+    this.createMarbles();
+    this.createTrack();
 
     this.gameState = 'PLAYING';
     this.spawnedMarblesCount = 0;
@@ -318,6 +502,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.currentLevel += 1;
+    this.selectedLevel = this.currentLevel;
     this.startLevel();
   }
 
@@ -332,6 +517,15 @@ export class GameScene extends Phaser.Scene {
 
     if (isWin) {
       this.addScore(WIN_BONUS);
+
+      // Clearing a level unlocks the next one on the home selector; persist
+      // immediately so a reload cannot lose the unlocked progress.
+      this.maxUnlockedLevel = Math.max(
+        this.maxUnlockedLevel,
+        this.currentLevel + 1,
+      );
+      this.saveMaxUnlockedLevel();
+      this.selectedLevel = this.currentLevel;
     }
 
     this.setHudVisible(false);
@@ -464,7 +658,7 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.8);
 
     const hint = this.add
-      .text(CENTER_X, 326, '同色三消 · 引爆炸彈 · 收集星星', {
+      .text(CENTER_X, 346, '同色三消 · 引爆炸彈 · 收集星星', {
         fontFamily: UI_FONT,
         fontSize: '13px',
         color: '#a9bd96',
@@ -472,8 +666,79 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(0.5)
       .setAlpha(0.52);
 
+    // Level selector row: < 第 X 關 >, bounded by the unlocked range.
+    const selectorY = 312;
+
+    const selectorPill = this.add.graphics();
+    selectorPill.fillStyle(0x000000, 0.26);
+    selectorPill.fillRoundedRect(CENTER_X - 112, selectorY - 19, 224, 38, 12);
+    selectorPill.lineStyle(1, 0xd7c17d, 0.26);
+    selectorPill.strokeRoundedRect(
+      CENTER_X - 111.5,
+      selectorY - 18.5,
+      223,
+      37,
+      12,
+    );
+
+    this.menuLevelText = this.add
+      .text(CENTER_X, selectorY, '', {
+        fontFamily: UI_FONT,
+        fontSize: '18px',
+        color: '#ffe39a',
+      })
+      .setOrigin(0.5)
+      .setShadow(0, 2, '#000000', 6, false, true);
+
+    const makeLevelArrow = (x, glyph, delta) => {
+      const arrow = this.add
+        .text(x, selectorY, glyph, {
+          fontFamily: UI_FONT,
+          fontSize: '24px',
+          color: '#ffd98a',
+        })
+        .setOrigin(0.5)
+        .setShadow(0, 2, '#000000', 6, false, true);
+
+      arrow.setInteractive({
+        hitArea: new Phaser.Geom.Rectangle(
+          -18,
+          -12,
+          arrow.width + 36,
+          arrow.height + 24,
+        ),
+        hitAreaCallback: Phaser.Geom.Rectangle.Contains,
+        useHandCursor: true,
+      });
+
+      arrow.on('pointerover', () => {
+        if (arrow.input && arrow.input.enabled) {
+          arrow.setColor('#fff4c9');
+        }
+      });
+
+      arrow.on('pointerout', () => {
+        arrow.setColor(
+          arrow.input && arrow.input.enabled === false ? '#8f7f5c' : '#ffd98a',
+        );
+      });
+
+      arrow.on('pointerdown', (pointer, _localX, _localY, event) => {
+        // This press belongs to the selector: stop it from reaching the
+        // scene-level handler so it cannot start a run or fire a marble.
+        event.stopPropagation();
+        this.menuControlDownTime = pointer.downTime;
+        this.changeSelectedLevel(delta);
+      });
+
+      return arrow;
+    };
+
+    this.menuArrowLeft = makeLevelArrow(CENTER_X - 82, '<', -1);
+    this.menuArrowRight = makeLevelArrow(CENTER_X + 82, '>', 1);
+
     const startButton = this.add
-      .text(CENTER_X, 392, '點擊開始遊戲', {
+      .text(CENTER_X, 398, '點擊開始遊戲', {
         fontFamily: UI_FONT,
         fontSize: '22px',
         color: '#ffe39a',
@@ -481,18 +746,50 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(0.5)
       .setShadow(0, 2, '#000000', 8, false, true);
 
+    // Explicit start target. The selector arrows sit well outside this zone
+    // and scene-level menu clicks are otherwise inert, so an arrow click (or
+    // any stray click on the title/high score) can never launch a run.
+    this.menuStartHitArea = this.add
+      .zone(CENTER_X, 398, 292, 54)
+      .setOrigin(0.5)
+      .setInteractive({ useHandCursor: true });
+
+    this.menuStartHitArea.on('pointerover', () => {
+      startButton.setColor('#fff4c9');
+    });
+
+    this.menuStartHitArea.on('pointerout', () => {
+      startButton.setColor('#ffe39a');
+    });
+
+    this.menuStartHitArea.on(
+      'pointerdown',
+      (pointer, _localX, _localY, event) => {
+        event.stopPropagation();
+        this.menuControlDownTime = pointer.downTime;
+        this.startGame();
+      },
+    );
+
     overlay.add([
       backdrop,
       kicker,
       title,
       rule,
       highScore,
+      selectorPill,
       hint,
+      this.menuLevelText,
+      this.menuArrowLeft,
+      this.menuArrowRight,
       startButton,
+      this.menuStartHitArea,
     ]);
 
     this.menuOverlay = overlay;
     this.menuButton = startButton;
+
+    this.refreshLevelSelector();
 
     this.tweens.add({
       targets: startButton,
@@ -514,6 +811,15 @@ export class GameScene extends Phaser.Scene {
 
     this.gameState = 'MENU';
     this.clearRoundObjects();
+
+    // The home screen must not show any part of the abandoned run's track:
+    // wipe the drawn spline, its dashes, the start glow and the start ring.
+    // The spline itself is rebuilt by the next startLevel().
+    this.clearTrackVisuals();
+    this.track = null;
+    this.trackSamples = [];
+    this.trackLength = 0;
+
     this.setHudVisible(false);
     this.setLauncherVisible(false);
 
@@ -527,6 +833,14 @@ export class GameScene extends Phaser.Scene {
     // Drop any residual camera shake/flash from the last impact so the home
     // screen is presented cleanly.
     this.cameras.main.resetFX();
+
+    // The home selector picks up the level the player was just on, clamped
+    // to the unlocked range, so returning home never shows a locked level.
+    this.selectedLevel = Phaser.Math.Clamp(
+      Math.round(this.currentLevel) || 1,
+      1,
+      Math.max(1, this.maxUnlockedLevel),
+    );
 
     this.destroyOverlays();
     this.createMenu();
@@ -788,13 +1102,61 @@ export class GameScene extends Phaser.Scene {
   /* Track                                                               */
   /* ------------------------------------------------------------------ */
 
+  // Pick the layout for the current level and rebuild the arc-length cache.
+  // Called from startLevel() every time a level begins.
+  buildLevelTrack() {
+    const layout =
+      TRACK_LAYOUTS[(Math.max(1, this.currentLevel) - 1) % TRACK_LAYOUTS.length];
+
+    this.track = new Phaser.Curves.Spline(
+      layout.map(([x, y]) => new Phaser.Math.Vector2(x, y)),
+    );
+    this.trackLength = this.track.getLength();
+    this.trackSamples = this.track.getSpacedPoints(240);
+
+    return this.track;
+  }
+
+  // Remove every display object that belongs to the current track (drawn
+  // spline + debug dashes + start glow/ring and their tweens). Safe to call
+  // when no track exists, which is the case on the start menu.
+  clearTrackVisuals() {
+    if (this.startRing) {
+      this.tweens.killTweensOf(this.startRing);
+      this.startRing.destroy();
+      this.startRing = null;
+    }
+
+    if (this.startGlow) {
+      this.tweens.killTweensOf(this.startGlow);
+      this.startGlow.destroy();
+      this.startGlow = null;
+    }
+
+    if (this.trackGraphics) {
+      this.trackGraphics.destroy();
+      this.trackGraphics = null;
+    }
+
+    if (this.trackDebugGraphics) {
+      this.trackDebugGraphics.destroy();
+      this.trackDebugGraphics = null;
+    }
+  }
+
   createTrack() {
+    // Never draw over a previous layout: drop any stale graphics/glow/ring
+    // before rebuilding for the (possibly new) spline.
+    this.clearTrackVisuals();
+
     const samples = this.track.getSpacedPoints(280);
     const shadowSamples = samples.map(
       (point) => new Phaser.Math.Vector2(point.x + 5, point.y + 8),
     );
 
-    const track = this.add.graphics().setDepth(DEPTH.track);
+    const track = (this.trackGraphics = this.add
+      .graphics()
+      .setDepth(DEPTH.track));
 
     track.lineStyle(28, 0x000000, 0.26);
     track.strokePoints(shadowSamples, false, false);
@@ -810,7 +1172,9 @@ export class GameScene extends Phaser.Scene {
 
     // The dashed line is the visual debug overlay asked for in phase 01.
     // It follows the exact same arc-length curve used by the marbles.
-    const debugLine = this.add.graphics().setDepth(DEPTH.trackDebug);
+    const debugLine = (this.trackDebugGraphics = this.add
+      .graphics()
+      .setDepth(DEPTH.trackDebug));
     debugLine.lineStyle(1.5, 0xe7efc4, 0.52);
 
     const dashLength = 10;
@@ -825,16 +1189,16 @@ export class GameScene extends Phaser.Scene {
 
     const start = this.track.getPointAt(0);
 
-    const startGlow = this.add
+    this.startGlow = this.add
       .circle(start.x, start.y, 19, 0xe8cf82, 0.08)
       .setDepth(DEPTH.trackDebug);
-    const startRing = this.add
+    this.startRing = this.add
       .circle(start.x, start.y, 10)
       .setStrokeStyle(1.5, 0xe8cf82, 0.52)
       .setDepth(DEPTH.trackDebug);
 
     this.tweens.add({
-      targets: startRing,
+      targets: this.startRing,
       scale: 2.4,
       alpha: 0,
       duration: 2400,
@@ -843,7 +1207,7 @@ export class GameScene extends Phaser.Scene {
     });
 
     this.tweens.add({
-      targets: startGlow,
+      targets: this.startGlow,
       alpha: { from: 0.08, to: 0.015 },
       duration: 1500,
       ease: 'Sine.easeInOut',
@@ -1474,8 +1838,16 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    // The home-menu arrows and start button own their pointerdown handlers;
+    // swallow the scene-level event dispatched for the same press so changing
+    // a level can never launch a run or fire a marble.
+    if (this.consumeMenuControlClick(pointer)) {
+      return;
+    }
+
     if (this.gameState === 'MENU') {
-      this.startGame();
+      // Only the explicit start target below the level selector launches a
+      // run; clicks on the title, arrows or empty space stay side-effect free.
       return;
     }
 
@@ -1483,8 +1855,9 @@ export class GameScene extends Phaser.Scene {
       if (this.levelWon) {
         this.startNextLevel();
       } else {
-        // A lost run restarts completely: level 1, score 0.
-        this.startGame();
+        // A lost run restarts a fresh run at level 1 with a zeroed score.
+        // Unlocked levels and the high score are preserved.
+        this.startGame(1);
       }
       return;
     }
@@ -1520,6 +1893,19 @@ export class GameScene extends Phaser.Scene {
     }
 
     return false;
+  }
+
+  // True when this scene-level pointerdown belongs to a home-menu control
+  // (level arrow or start button) and must not start the game or fire a shot.
+  // The marker is cleared on every call so it cannot leak into a later click.
+  consumeMenuControlClick(pointer) {
+    if (this.menuControlDownTime === null) {
+      return false;
+    }
+
+    const isSamePress = pointer.downTime === this.menuControlDownTime;
+    this.menuControlDownTime = null;
+    return isSamePress;
   }
 
   shootAt(targetX, targetY) {
@@ -1825,8 +2211,17 @@ export class GameScene extends Phaser.Scene {
       : basePoints;
     this.addScore(earnedPoints);
 
-    // The marble directly after the removed run receives an elastic kickback.
+    // The marble directly after the removed run receives an elastic kickback,
+    // but ONLY when it is physically touching that run. The gap is measured
+    // before the splice, while both marbles still exist. A rear marble that
+    // sits across an existing hole must not be yanked backwards across it
+    // (that telekinetic pull was the old pushback bug).
     const pushbackMarble = this.marbles[end + 1] ?? null;
+    const pushbackGap = pushbackMarble
+      ? this.marbles[end].t - pushbackMarble.t
+      : 0;
+    const pushbackTouching = pushbackGap <= this.deltaT + 0.005;
+
     const matched = this.marbles.splice(start, matchLength);
     let centerX = 0;
     let centerY = 0;
@@ -1840,11 +2235,14 @@ export class GameScene extends Phaser.Scene {
     this.slowdownTimer = 1.5;
 
     if (pushbackMarble) {
-      pushbackMarble.pushOffset = this.deltaT * 1.5;
-      pushbackMarble.t = Math.max(
-        0,
-        pushbackMarble.t - this.deltaT * 1.5,
-      );
+      if (pushbackTouching) {
+        pushbackMarble.pushOffset = this.deltaT * 1.5;
+        pushbackMarble.t = Math.max(
+          0,
+          pushbackMarble.t - this.deltaT * 1.5,
+        );
+      }
+
       pushbackMarble.magnetApproaching = false;
     }
 
@@ -2377,21 +2775,69 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.7)
       .setDepth(DEPTH.hud);
 
-    // Exit-to-home control. It is created at DEPTH.hud so the depth-filtered
-    // hudObjects list picks it up automatically and setHudVisible() toggles it
-    // together with the rest of the HUD (visible while PLAYING, hidden on the
-    // menu and on the game-over/win panels).
-    this.homeButton = this.add
-      .text(30, 75, '[ 退出回首頁 ]', {
+    // Exit-to-home control. The button is a Container drawn at DEPTH.hud so
+    // the depth-filtered hudObjects list captures it and setHudVisible()
+    // toggles the background, label and hit zone together with the rest of the
+    // HUD (visible while PLAYING, hidden on the menu and on the end panels).
+    const homeWidth = 124;
+    const homeHeight = 30;
+    const homeBg = this.add.graphics();
+    const homeLabel = this.add
+      .text(homeWidth / 2, homeHeight / 2, '退出回首頁', {
         fontFamily: UI_FONT,
         fontSize: '13px',
-        color: '#ff7777',
+        color: '#ffffff',
       })
-      .setOrigin(0, 0)
-      .setInteractive({ useHandCursor: true })
-      .setDepth(DEPTH.hud);
+      .setOrigin(0.5);
+    const homeHitArea = this.add
+      .zone(0, 0, homeWidth, homeHeight)
+      .setOrigin(0)
+      .setInteractive({ useHandCursor: true });
 
-    this.homeButton.on('pointerdown', (pointer, localX, localY, event) => {
+    const paintHomeButton = (hover) => {
+      homeBg.clear();
+
+      // Soft drop shadow.
+      homeBg.fillStyle(0x000000, 0.32);
+      homeBg.fillRoundedRect(0, 3, homeWidth, homeHeight, 9);
+
+      // Dark red plate that brightens while the pointer is over the button.
+      homeBg.fillStyle(hover ? 0x8f2634 : 0x651823, 1);
+      homeBg.fillRoundedRect(0, 0, homeWidth, homeHeight, 9);
+
+      // Thin top gloss, tucked inside the rounded top corners.
+      homeBg.fillStyle(0xffffff, hover ? 0.14 : 0.08);
+      homeBg.fillRoundedRect(2, 2, homeWidth - 4, 12, {
+        tl: 8,
+        tr: 8,
+        bl: 0,
+        br: 0,
+      });
+
+      homeBg.lineStyle(1.5, hover ? 0xffb4b4 : 0xc85f6b, hover ? 0.95 : 0.72);
+      homeBg.strokeRoundedRect(
+        0.75,
+        0.75,
+        homeWidth - 1.5,
+        homeHeight - 1.5,
+        9,
+      );
+    };
+
+    paintHomeButton(false);
+    homeLabel.setShadow(0, 1, '#000000', 4, false, true);
+
+    homeHitArea.on('pointerover', () => {
+      paintHomeButton(true);
+      homeLabel.setColor('#fff6f6');
+    });
+
+    homeHitArea.on('pointerout', () => {
+      paintHomeButton(false);
+      homeLabel.setColor('#ffffff');
+    });
+
+    homeHitArea.on('pointerdown', (pointer, _localX, _localY, event) => {
       event.stopPropagation();
 
       // Mark this exact press so a scene-level 'pointerdown' dispatched for
@@ -2400,6 +2846,10 @@ export class GameScene extends Phaser.Scene {
       this.exitButtonDownTime = pointer.downTime;
       this.returnToMenu();
     });
+
+    this.homeButton = this.add
+      .container(30, 75, [homeBg, homeLabel, homeHitArea])
+      .setDepth(DEPTH.hud);
 
     this.add
       .text(770, 18, '目前分數', {
