@@ -14,7 +14,7 @@ const SHOOTER_BALL_SCALE = 0.75;
 const INITIAL_CURRENT_COLOR = 0;
 const INITIAL_NEXT_COLOR = 1;
 const CHAIN_SPEED = 48; // pixels per second
-const CATCH_UP_SPEED = CHAIN_SPEED * 1.8;
+const CATCH_UP_SPEED = CHAIN_SPEED * 4.5;
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
 const SHOT_SPAWN_OFFSET = 56;
@@ -475,9 +475,7 @@ export class GameScene extends Phaser.Scene {
       this.slowdownTimer = Math.max(0, this.slowdownTimer - step);
     }
 
-    const first = this.marbles[0];
-
-    if (!first) {
+    if (this.marbles.length === 0) {
       this.chainHeadDistance = this.trackLength;
       this.chainComplete = true;
       return;
@@ -487,60 +485,97 @@ export class GameScene extends Phaser.Scene {
       (CHAIN_SPEED * (isSlowed ? 0.3 : 1) * step) / this.trackLength;
     const catchUpTravelT = (CATCH_UP_SPEED * step) / this.trackLength;
 
-    // Segment 1 locomotive: it always moves at standard speed until the end.
-    if (!this.chainComplete) {
-      first.t = Math.min(first.t + standardTravelT, 1);
-    }
+    // Step 1: split the array wherever a real physical gap exists.
+    const segments = [];
+    let segment = [this.marbles[0]];
 
     for (let index = 1; index < this.marbles.length; index += 1) {
       const ahead = this.marbles[index - 1];
       const marble = this.marbles[index];
-      const gap = ahead.t - marble.t;
 
-      if (gap <= this.deltaT + 0.002) {
-        // Cart rule: no independent speed, hard-link to the car ahead.
-        marble.t = Math.max(0, ahead.t - this.deltaT);
-        marble.magnetApproaching = false;
-        continue;
+      if (ahead.t - marble.t > this.deltaT + 0.002) {
+        segments.push(segment);
+        segment = [marble];
+      } else {
+        segment.push(marble);
       }
+    }
+    segments.push(segment);
 
-      // This marble is the locomotive of a new, disconnected segment.
-      const sameColor = marble.colorIndex === ahead.colorIndex;
+    // Step 2: only the rearmost segment is pushed by the entrance. Earlier
+    // detached segments are stationary unless same-colour magnetism moves
+    // them toward the segment in front.
+    for (const current of segments) {
+      current.speed = 0;
+      current.isMagnetic = false;
+    }
 
-      if (!sameColor) {
-        // Different colours at the break: this segment waits in place.
-        marble.magnetApproaching = false;
-        continue;
+    const rearMost = segments[segments.length - 1];
+    rearMost.speed = standardTravelT;
+
+    for (let index = segments.length - 1; index >= 1; index -= 1) {
+      const rear = segments[index];
+      const front = segments[index - 1];
+      const rearHead = rear[0];
+      const frontTail = front[front.length - 1];
+
+      if (rearHead.colorIndex === frontTail.colorIndex) {
+        rear.speed = catchUpTravelT;
+        rear.isMagnetic = true;
       }
+    }
 
-      // Same-colour magnetic traction for this independent segment head.
-      marble.magnetApproaching = true;
-      marble.t = Math.min(
-        marble.t + catchUpTravelT,
-        ahead.t - this.deltaT,
-      );
-      marble.t = Math.max(0, marble.t);
+    // Step 3: apply movement from front to rear, rigidly clamping each rear
+    // segment against the tail of the segment ahead of it.
+    let comboMarble = null;
 
-      const newGap = ahead.t - marble.t;
-      if (newGap <= this.deltaT + 0.002) {
-        marble.magnetApproaching = false;
+    for (let index = 0; index < segments.length; index += 1) {
+      const current = segments[index];
+      const head = current[0];
+      let nextT = head.t + current.speed;
 
-        // Confirm the entire contiguous colour run includes at least three
-        // marbles before mutating anything or firing the chain reaction.
-        const run = this.findMatchRun(marble);
-        if (run && run.length >= MIN_MATCH) {
-          this.resolveMatches(marble);
-          this.slowdownTimer = 1.5;
+      if (index > 0) {
+        const frontRearMarble = segments[index - 1];
+        const frontTail = frontRearMarble[frontRearMarble.length - 1];
+        const maxT = frontTail.t - this.deltaT;
+        const newGap = frontTail.t - nextT;
 
-          const front = this.marbles[0];
-          this.chainHeadDistance = front
-            ? front.t * this.trackLength
-            : this.trackLength;
-          this.chainComplete = front ? front.t >= 1 : true;
+        // The +0.002 grouping tolerance would merge these two segments on
+        // the next frame. Treat entering that band as contact now, snap to
+        // the rigid spacing, and allow the magnetic combo check to fire.
+        if (nextT >= maxT || newGap <= this.deltaT + 0.002) {
+          nextT = maxT;
 
-          // Do not process any further segments in the same frame.
-          return;
+          if (
+            current.isMagnetic &&
+            head.colorIndex === frontTail.colorIndex &&
+            !comboMarble
+          ) {
+            comboMarble = head;
+          }
         }
+      }
+
+      head.t = Math.max(0, Math.min(nextT, 1));
+      head.magnetApproaching = current.isMagnetic;
+
+      for (let cart = 1; cart < current.length; cart += 1) {
+        current[cart].t = Math.max(
+          0,
+          current[cart - 1].t - this.deltaT,
+        );
+        current[cart].magnetApproaching = false;
+      }
+    }
+
+    // Step 4: a magnetic collision only detonates when the connected run is
+    // genuinely three or more marbles long.
+    if (comboMarble) {
+      const run = this.findMatchRun(comboMarble);
+
+      if (run && run.length >= MIN_MATCH) {
+        this.resolveMatches(comboMarble);
+        this.slowdownTimer = 1.5;
       }
     }
 
