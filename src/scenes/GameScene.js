@@ -5,7 +5,10 @@ const VIEW_HEIGHT = 600;
 const CENTER_X = VIEW_WIDTH / 2;
 const CENTER_Y = VIEW_HEIGHT / 2;
 
-const TOTAL_LEVEL_MARBLES = 40;
+// Traditional Chinese (Taiwan) sans-serif stack for every Phaser text style.
+const UI_FONT =
+  '"Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif';
+
 const BALL_RADIUS = 18;
 const BALL_DIAMETER = BALL_RADIUS * 2;
 const MIN_MATCH = 3;
@@ -13,8 +16,15 @@ const MATCH_FADE_DURATION = 260;
 const SHOOTER_BALL_SCALE = 0.75;
 const INITIAL_CURRENT_COLOR = 0;
 const INITIAL_NEXT_COLOR = 1;
-const CHAIN_SPEED = 48; // pixels per second
-const CATCH_UP_SPEED = CHAIN_SPEED * 4.5;
+
+// Level progression:
+//   total marbles = 30 + level * 10   (L1 = 40, L2 = 50, ...)
+//   chain speed   = 40 + level * 5    (L1 = 45, L2 = 50, ...)
+const LEVEL_BASE_MARBLES = 30;
+const LEVEL_MARBLES_STEP = 10;
+const LEVEL_BASE_SPEED = 40; // pixels per second
+const LEVEL_SPEED_STEP = 5;
+const CATCH_UP_MULTIPLIER = 4.5;
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
 const SHOT_SPAWN_OFFSET = 56;
@@ -105,10 +115,11 @@ export class GameScene extends Phaser.Scene {
     this.bonusItems = [];
     this.scoreText = null;
     this.highScoreText = null;
+    this.levelText = null;
     this.gameState = 'MENU';
+    this.currentLevel = 1;
     this.spawnedMarblesCount = 0;
     this.bonusTimer = 0;
-    this.tailPushActive = true;
     this.levelWon = false;
     this.menuOverlay = null;
     this.gameOverOverlay = null;
@@ -122,9 +133,9 @@ export class GameScene extends Phaser.Scene {
   create() {
     this.slowdownTimer = 0;
     this.score = 0;
+    this.currentLevel = 1;
     this.spawnedMarblesCount = 0;
     this.bonusTimer = 0;
-    this.tailPushActive = true;
     this.levelWon = false;
     this.gameState = 'MENU';
     this.bonusItems = [];
@@ -157,7 +168,7 @@ export class GameScene extends Phaser.Scene {
 
     this.game.canvas.setAttribute(
       'aria-label',
-      'Serpentine: insert fired marbles into the S-shaped chain and match three or more colours to clear them.',
+      '祖瑪：叢林探險——將發射的彈珠插入 S 形球串，連成三顆以上同色即可消除。',
     );
 
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
@@ -238,11 +249,14 @@ export class GameScene extends Phaser.Scene {
     this.marbles = [];
 
     for (const shot of this.shots) {
+      this.tweens.killTweensOf(shot.sprite);
       shot.sprite.destroy();
     }
     this.shots = [];
 
     for (const item of this.bonusItems) {
+      item.each((child) => this.tweens.killTweensOf(child));
+      this.tweens.killTweensOf(item);
       item.destroy();
     }
     this.bonusItems = [];
@@ -250,15 +264,30 @@ export class GameScene extends Phaser.Scene {
     this.updateMarbleCount();
   }
 
+  getTotalMarbles() {
+    return LEVEL_BASE_MARBLES + this.currentLevel * LEVEL_MARBLES_STEP;
+  }
+
+  getChainSpeed() {
+    return LEVEL_BASE_SPEED + this.currentLevel * LEVEL_SPEED_STEP;
+  }
+
+  // Fresh run from the start menu or after a loss: back to level 1, score 0.
   startGame() {
+    this.currentLevel = 1;
+    this.score = 0;
+    this.startLevel();
+  }
+
+  // Begin (or continue into) the current level. Score and currentLevel are
+  // intentionally NOT reset here so clearing a level preserves the run score.
+  startLevel() {
     this.destroyOverlays();
     this.clearRoundObjects();
 
     this.gameState = 'PLAYING';
-    this.score = 0;
     this.spawnedMarblesCount = 0;
     this.bonusTimer = 0;
-    this.tailPushActive = true;
     this.slowdownTimer = 0;
     this.chainComplete = false;
     this.chainHeadDistance = 0;
@@ -267,6 +296,7 @@ export class GameScene extends Phaser.Scene {
     this.nextBulletColor = INITIAL_NEXT_COLOR;
     this.updateShooterIndicator();
     this.updateScoreHud();
+    this.updateLevelHud();
     this.updateMarbleCount();
     this.setHudVisible(true);
     this.setLauncherVisible(true);
@@ -275,6 +305,17 @@ export class GameScene extends Phaser.Scene {
     this.pointerSeen = true;
     this.aimAtPointer();
     this.cameras.main.resetFX();
+  }
+
+  // Called by the win overlay ("NEXT LEVEL"): advance the level while keeping
+  // the cumulative score, then rebuild the board for the new level total/speed.
+  startNextLevel() {
+    if (this.gameState !== 'GAMEOVER' || !this.levelWon) {
+      return;
+    }
+
+    this.currentLevel += 1;
+    this.startLevel();
   }
 
   endGame(isWin) {
@@ -301,7 +342,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     if (
-      this.spawnedMarblesCount >= TOTAL_LEVEL_MARBLES &&
+      this.spawnedMarblesCount >= this.getTotalMarbles() &&
       this.marbles.length === 0
     ) {
       this.endGame(true);
@@ -379,18 +420,18 @@ export class GameScene extends Phaser.Scene {
     );
 
     const kicker = this.add
-      .text(CENTER_X, 126, 'JUNGLE ARCADE', {
-        fontFamily: '"Courier New", monospace',
-        fontSize: '12px',
+      .text(CENTER_X, 126, '叢林探險', {
+        fontFamily: UI_FONT,
+        fontSize: '13px',
         color: '#c6d5ad',
       })
       .setOrigin(0.5)
       .setAlpha(0.72);
 
     const title = this.add
-      .text(CENTER_X, 190, 'SERPENTINE', {
-        fontFamily: 'Georgia, "Times New Roman", serif',
-        fontSize: '58px',
+      .text(CENTER_X, 190, '祖瑪：叢林探險', {
+        fontFamily: UI_FONT,
+        fontSize: '54px',
         color: '#f7e9c2',
       })
       .setOrigin(0.5)
@@ -409,10 +450,10 @@ export class GameScene extends Phaser.Scene {
       .text(
         CENTER_X,
         278,
-        `HIGH SCORE  ${this.formatScore(this.highScore)}`,
+        `最高分  ${this.formatScore(this.highScore)}`,
         {
-          fontFamily: '"Courier New", monospace',
-          fontSize: '12px',
+          fontFamily: UI_FONT,
+          fontSize: '13px',
           color: '#d9c68c',
         },
       )
@@ -420,18 +461,18 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.8);
 
     const hint = this.add
-      .text(CENTER_X, 326, 'MATCH 3  ·  SHOOT BOMBS  ·  CHASE STARS', {
-        fontFamily: '"Courier New", monospace',
-        fontSize: '9px',
+      .text(CENTER_X, 326, '同色三消 · 引爆炸彈 · 收集星星', {
+        fontFamily: UI_FONT,
+        fontSize: '13px',
         color: '#a9bd96',
       })
       .setOrigin(0.5)
       .setAlpha(0.52);
 
     const startButton = this.add
-      .text(CENTER_X, 392, 'CLICK TO START', {
-        fontFamily: 'Georgia, "Times New Roman", serif',
-        fontSize: '20px',
+      .text(CENTER_X, 392, '點擊開始遊戲', {
+        fontFamily: UI_FONT,
+        fontSize: '22px',
         color: '#ffe39a',
       })
       .setOrigin(0.5)
@@ -480,10 +521,10 @@ export class GameScene extends Phaser.Scene {
       .text(
         CENTER_X,
         172,
-        isWin ? 'YOU WIN!' : 'GAME OVER',
+        isWin ? '關卡完成！' : '遊戲結束',
         {
-          fontFamily: 'Georgia, "Times New Roman", serif',
-          fontSize: '52px',
+          fontFamily: UI_FONT,
+          fontSize: '46px',
           color: isWin ? '#ffe39a' : '#ff7777',
         },
       )
@@ -492,26 +533,26 @@ export class GameScene extends Phaser.Scene {
 
     const bonusLine = isWin
       ? this.add
-          .text(CENTER_X, 228, `LEVEL CLEAR  +${WIN_BONUS}`, {
-            fontFamily: '"Courier New", monospace',
-            fontSize: '11px',
+          .text(CENTER_X, 228, `過關獎勵  +${WIN_BONUS}`, {
+            fontFamily: UI_FONT,
+            fontSize: '13px',
             color: '#d9ee9f',
           })
           .setOrigin(0.5)
           .setAlpha(0.78)
       : this.add
-          .text(CENTER_X, 228, 'THE CHAIN REACHED THE HOLE', {
-            fontFamily: '"Courier New", monospace',
-            fontSize: '11px',
+          .text(CENTER_X, 228, '球串已抵達終點', {
+            fontFamily: UI_FONT,
+            fontSize: '13px',
             color: '#d3b2a2',
           })
           .setOrigin(0.5)
           .setAlpha(0.68);
 
     const finalLabel = this.add
-      .text(CENTER_X, 278, 'FINAL SCORE', {
-        fontFamily: '"Courier New", monospace',
-        fontSize: '10px',
+      .text(CENTER_X, 278, '最終分數', {
+        fontFamily: UI_FONT,
+        fontSize: '12px',
         color: '#c4d3b0',
       })
       .setOrigin(0.5)
@@ -519,7 +560,7 @@ export class GameScene extends Phaser.Scene {
 
     const finalScore = this.add
       .text(CENTER_X, 306, this.formatScore(this.score), {
-        fontFamily: 'Georgia, "Times New Roman", serif',
+        fontFamily: UI_FONT,
         fontSize: '32px',
         color: '#ffe39a',
       })
@@ -530,10 +571,10 @@ export class GameScene extends Phaser.Scene {
       .text(
         CENTER_X,
         348,
-        `HIGH SCORE  ${this.formatScore(this.highScore)}`,
+        `最高分  ${this.formatScore(this.highScore)}`,
         {
-          fontFamily: '"Courier New", monospace',
-          fontSize: '10px',
+          fontFamily: UI_FONT,
+          fontSize: '12px',
           color: '#b8c7a4',
         },
       )
@@ -541,9 +582,9 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.6);
 
     const restartButton = this.add
-      .text(CENTER_X, 420, 'CLICK TO RESTART', {
-        fontFamily: 'Georgia, "Times New Roman", serif',
-        fontSize: '18px',
+      .text(CENTER_X, 420, isWin ? '進入下一關' : '點擊重新開始', {
+        fontFamily: UI_FONT,
+        fontSize: '20px',
         color: '#ffe39a',
       })
       .setOrigin(0.5)
@@ -800,7 +841,7 @@ export class GameScene extends Phaser.Scene {
       return false;
     }
 
-    if (this.spawnedMarblesCount >= TOTAL_LEVEL_MARBLES) {
+    if (this.spawnedMarblesCount >= this.getTotalMarbles()) {
       return false;
     }
 
@@ -985,13 +1026,15 @@ export class GameScene extends Phaser.Scene {
     if (this.marbles.length === 0) {
       this.chainHeadDistance = 0;
       this.chainComplete =
-        this.spawnedMarblesCount >= TOTAL_LEVEL_MARBLES;
+        this.spawnedMarblesCount >= this.getTotalMarbles();
       return;
     }
 
+    const chainSpeed = this.getChainSpeed();
     const standardTravelT =
-      (CHAIN_SPEED * (isSlowed ? 0.3 : 1) * step) / this.trackLength;
-    const catchUpTravelT = (CATCH_UP_SPEED * step) / this.trackLength;
+      (chainSpeed * (isSlowed ? 0.3 : 1) * step) / this.trackLength;
+    const catchUpTravelT =
+      (chainSpeed * CATCH_UP_MULTIPLIER * step) / this.trackLength;
 
     // Step 1: split the array wherever a real physical gap exists.
     const segments = [];
@@ -1010,20 +1053,21 @@ export class GameScene extends Phaser.Scene {
     }
     segments.push(segment);
 
-    // Step 2: only the rearmost segment is pushed by the entrance. Earlier
-    // detached segments are stationary unless same-colour magnetism moves
-    // them toward the segment in front.
+    // Step 2: only the rearmost segment (the one still feeding in from the
+    // start of the track) is pushed by the entrance. Earlier detached segments
+    // are stationary unless same-colour magnetism moves them toward the
+    // segment in front.
     for (const current of segments) {
       current.speed = 0;
       current.isMagnetic = false;
     }
 
+    // The rear segment must advance unconditionally. Previously this was gated
+    // by spawnedMarblesCount/tailPushActive, so once the last marble spawned
+    // the chain froze forever. Removing that gate lets a broken chain keep
+    // closing its gaps and lets the head reach t = 1 for a natural Game Over.
     const rearMost = segments[segments.length - 1];
-    rearMost.speed =
-      this.spawnedMarblesCount < TOTAL_LEVEL_MARBLES ||
-      this.tailPushActive
-        ? standardTravelT
-        : 0;
+    rearMost.speed = standardTravelT;
 
     for (let index = segments.length - 1; index >= 1; index -= 1) {
       const rear = segments[index];
@@ -1089,14 +1133,6 @@ export class GameScene extends Phaser.Scene {
         this.resolveMatches(comboMarble, true);
         this.slowdownTimer = 1.5;
       }
-    }
-
-    if (
-      this.spawnedMarblesCount >= TOTAL_LEVEL_MARBLES &&
-      this.tailPushActive &&
-      segments.length === 1
-    ) {
-      this.tailPushActive = false;
     }
 
     const currentFront = this.marbles[0];
@@ -1381,7 +1417,12 @@ export class GameScene extends Phaser.Scene {
     }
 
     if (this.gameState === 'GAMEOVER') {
-      this.startGame();
+      if (this.levelWon) {
+        this.startNextLevel();
+      } else {
+        // A lost run restarts completely: level 1, score 0.
+        this.startGame();
+      }
       return;
     }
 
@@ -1636,7 +1677,7 @@ export class GameScene extends Phaser.Scene {
     this.createFloatingText(
       bombX,
       bombY,
-      `BOMB! +${BOMB_SCORE}`,
+      `炸彈！+${BOMB_SCORE}`,
       '#fff1b9',
       20,
     );
@@ -1766,7 +1807,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     if (this.highScoreText) {
-      this.highScoreText.setText(`HIGH ${this.formatScore(this.highScore)}`);
+      this.highScoreText.setText(`最高分 ${this.formatScore(this.highScore)}`);
     }
   }
 
@@ -2125,7 +2166,7 @@ export class GameScene extends Phaser.Scene {
     this.createFloatingText(
       x,
       y,
-      requiresGap ? `Gap Shot! +${points}` : `+${points}`,
+      requiresGap ? `穿越射擊！+${points}` : `+${points}`,
       requiresGap ? '#fff2bb' : '#ffd76a',
       requiresGap ? 18 : 15,
     );
@@ -2173,7 +2214,7 @@ export class GameScene extends Phaser.Scene {
   createFloatingText(x, y, message, color, size = 16) {
     const label = this.add
       .text(x, y - 18, message, {
-        fontFamily: 'Georgia, "Times New Roman", serif',
+        fontFamily: UI_FONT,
         fontSize: `${size}px`,
         color,
         fontStyle: 'bold',
@@ -2226,28 +2267,28 @@ export class GameScene extends Phaser.Scene {
 
   createHud() {
     const title = this.add
-      .text(30, 24, 'SERPENTINE', {
-        fontFamily: 'Georgia, "Times New Roman", serif',
-        fontSize: '22px',
+      .text(30, 24, '祖瑪：叢林探險', {
+        fontFamily: UI_FONT,
+        fontSize: '20px',
         color: '#f3ebd2',
       })
       .setDepth(DEPTH.hud);
 
     title.setShadow(0, 2, '#000000', 8, false, true);
 
-    this.add
-      .text(30, 51, 'PHASE 05 / 40-MARBLE RUN', {
-        fontFamily: '"Courier New", monospace',
-        fontSize: '9px',
+    this.levelText = this.add
+      .text(30, 51, '', {
+        fontFamily: UI_FONT,
+        fontSize: '11px',
         color: '#b4c79d',
       })
       .setAlpha(0.7)
       .setDepth(DEPTH.hud);
 
     this.add
-      .text(770, 20, 'SCORE', {
-        fontFamily: '"Courier New", monospace',
-        fontSize: '9px',
+      .text(770, 18, '目前分數', {
+        fontFamily: UI_FONT,
+        fontSize: '11px',
         color: '#d8c387',
       })
       .setOrigin(1, 0)
@@ -2255,8 +2296,8 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     this.scoreText = this.add
-      .text(770, 30, this.formatScore(this.score), {
-        fontFamily: 'Georgia, "Times New Roman", serif',
+      .text(770, 31, this.formatScore(this.score), {
+        fontFamily: UI_FONT,
         fontSize: '24px',
         color: '#ffe39a',
       })
@@ -2266,9 +2307,9 @@ export class GameScene extends Phaser.Scene {
     this.scoreText.setShadow(0, 2, '#000000', 8, false, true);
 
     this.highScoreText = this.add
-      .text(770, 59, `HIGH ${this.formatScore(this.highScore)}`, {
-        fontFamily: '"Courier New", monospace',
-        fontSize: '9px',
+      .text(770, 62, `最高分 ${this.formatScore(this.highScore)}`, {
+        fontFamily: UI_FONT,
+        fontSize: '11px',
         color: '#c8d8b2',
       })
       .setOrigin(1, 0)
@@ -2276,9 +2317,9 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     this.add
-      .text(770, 73, 'AIM + CLICK TO SHOOT', {
-        fontFamily: '"Courier New", monospace',
-        fontSize: '9px',
+      .text(770, 77, '移動滑鼠瞄準，點擊發射', {
+        fontFamily: UI_FONT,
+        fontSize: '11px',
         color: '#c8d8b2',
       })
       .setOrigin(1, 0)
@@ -2286,21 +2327,30 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     this.marbleCountText = this.add
-      .text(
-        770,
-        87,
-        `0 ON TRACK · 0/${TOTAL_LEVEL_MARBLES} SPAWNED`,
-        {
-        fontFamily: '"Courier New", monospace',
-          fontSize: '9px',
-          color: '#c8d8b2',
-        },
-      )
+      .text(770, 92, '', {
+        fontFamily: UI_FONT,
+        fontSize: '11px',
+        color: '#c8d8b2',
+      })
       .setOrigin(1, 0)
       .setAlpha(0.38)
       .setDepth(DEPTH.hud);
 
+    this.updateLevelHud();
+    this.updateMarbleCount();
     this.updateScoreHud();
+  }
+
+  // Level-aware HUD labels. Kept as their own methods so the localisation
+  // pass can replace only the text templates below.
+  updateLevelHud() {
+    if (!this.levelText) {
+      return;
+    }
+
+    this.levelText.setText(
+      `第 ${this.currentLevel} 關 / 共 ${this.getTotalMarbles()} 顆球`,
+    );
   }
 
   updateMarbleCount() {
@@ -2310,7 +2360,7 @@ export class GameScene extends Phaser.Scene {
 
     const count = this.marbles.length;
     this.marbleCountText.setText(
-      `${count} ON TRACK · ${this.spawnedMarblesCount}/${TOTAL_LEVEL_MARBLES} SPAWNED`,
+      `軌道上 ${count} 顆 · 已生成 ${this.spawnedMarblesCount}/${this.getTotalMarbles()}`,
     );
   }
 }
