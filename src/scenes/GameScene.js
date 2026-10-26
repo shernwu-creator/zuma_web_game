@@ -31,6 +31,8 @@ const SHOT_SPAWN_OFFSET = 56;
 const SHOT_CULL_MARGIN = 48;
 const MAX_FRAME_DELTA = 50;
 const BOMB_CHANCE = 0.1;
+const REVERSE_CHANCE = 0.08;
+const REVERSE_DURATION = 2.0;
 const BOMB_BLAST_NEIGHBOURS = 2;
 const BOMB_SCORE = 300;
 const BONUS_COUNT = 3;
@@ -42,95 +44,41 @@ const BONUS_SPAWN_INTERVAL = 8;
 const WIN_BONUS = 500;
 
 // One track per level, cycled with `(currentLevel - 1) % TRACK_LAYOUTS.length`.
-// Every layout lives inside the 800x600 board and follows the same convention as
-// the original S: the entrance (t = 0) is on the left / upper-left edge so the
-// tail feeds in from outside the play area, while the exit (t = 1) ends away
-// from the cannon.
-//
-//   layout 1 - the original wide S crossing the whole board.
+// Every layout lives inside the 800x600 board and keeps the sampled track
+// centerline clear (>= 22px, plus a little margin) of the on-screen UI:
+//   - top-left HUD title/level area  (about 15..300 x 15..110)
+//   - top-right score HUD            (about 610..800 x 10..110)
+//   - bottom-right home capsule      (about 646..770 x 536..570 + margin)
+// The entrance (t = 0) is always on the left/upper-left edge, and each layout
+// keeps a distinct silhouette:
+//   layout 1 - wide S crossing the board (original S shape, re-routed around UI)
 //   layout 2 - two staggered S-bands (upper serpentine -> right descent ->
-//              lower serpentine) with more, tighter bends than layout 1. The
-//              middle band stays clear so the cannon keeps a free firing lane.
-//   layout 3 - a wavy loop that encircles the launcher and opens on the left,
-//              giving the level a "loop" silhouette instead of an S.
+//              lower serpentine) with more, tighter bends than layout 1
+//   layout 3 - a wavy loop that encircles the launcher and opens on the left
 const TRACK_LAYOUTS = [
-  // Layout 1: original S.
+  // Layout 1: wide S, re-routed around the UI corners.
   [
-    [46, 128],
-    [190, 72],
-    [410, 66],
-    [646, 116],
-    [758, 214],
-    [712, 318],
-    [544, 372],
-    [352, 364],
-    [198, 396],
-    [134, 480],
-    [200, 552],
-    [396, 574],
-    [614, 554],
-    [760, 482],
+    [44, 162], [140, 146], [248, 140], [322, 134], [396, 96], [478, 68],
+    [560, 80], [588, 132], [600, 190], [660, 238], [738, 300], [712, 356],
+    [600, 398], [470, 384], [360, 402], [240, 384], [152, 424], [118, 496],
+    [160, 552], [270, 576], [390, 580], [500, 560], [562, 516], [612, 468],
+    [690, 452],
   ],
   // Layout 2: double S-band serpentine with extra bends.
   [
-    [46, 140],
-    [112, 96],
-    [178, 76],
-    [244, 104],
-    [312, 68],
-    [380, 98],
-    [448, 70],
-    [516, 104],
-    [584, 76],
-    [652, 120],
-    [712, 104],
-    [770, 152],
-    [776, 212],
-    [744, 264],
-    [774, 322],
-    [742, 378],
-    [700, 440],
-    [644, 486],
-    [580, 460],
-    [518, 506],
-    [452, 470],
-    [388, 518],
-    [322, 480],
-    [256, 524],
-    [190, 486],
-    [126, 526],
-    [74, 472],
-    [52, 416],
+    [46, 150], [170, 144], [250, 146], [315, 140], [370, 116], [430, 80],
+    [490, 64], [540, 86], [570, 120], [592, 164], [636, 190], [684, 222],
+    [728, 256], [748, 302], [742, 352], [712, 398], [676, 436], [620, 470],
+    [540, 446], [460, 478], [380, 450], [300, 482], [220, 454], [140, 486],
+    [100, 446], [68, 400],
   ],
   // Layout 3: wavy loop around the launcher, open on the left.
   [
-    [52, 184],
-    [104, 114],
-    [190, 72],
-    [286, 54],
-    [384, 76],
-    [486, 52],
-    [590, 78],
-    [676, 54],
-    [754, 98],
-    [782, 172],
-    [736, 232],
-    [778, 300],
-    [732, 360],
-    [780, 430],
-    [752, 490],
-    [688, 540],
-    [592, 568],
-    [502, 536],
-    [414, 575],
-    [326, 538],
-    [238, 573],
-    [152, 538],
-    [90, 488],
-    [58, 412],
-    [96, 340],
-    [52, 282],
-    [96, 238],
+    [58, 204], [150, 176], [250, 154], [340, 134], [410, 88], [475, 58],
+    [535, 76], [572, 112], [600, 164], [650, 214], [712, 250], [754, 300],
+    [734, 356], [750, 412], [716, 456], [680, 470], [594, 500], [490, 492],
+    [386, 524], [282, 496], [178, 532], [72, 544], [50, 486], [58, 418],
+    [56, 360], [82, 306], [126, 268], [162, 246],
   ],
 ];
 
@@ -186,6 +134,7 @@ export class GameScene extends Phaser.Scene {
     this.nextBulletColor = INITIAL_NEXT_COLOR;
     this.shooterIndicator = null;
     this.slowdownTimer = 0;
+    this.reverseTimer = 0;
     this.score = 0;
     this.highScore = 0;
 
@@ -221,6 +170,7 @@ export class GameScene extends Phaser.Scene {
     this.menuButton = null;
     this.restartButton = null;
     this.homeButton = null;
+    this.homeHover = null;
     this.exitButtonDownTime = null;
     this.hudObjects = [];
     this.launcherHalo = null;
@@ -229,6 +179,7 @@ export class GameScene extends Phaser.Scene {
 
   create() {
     this.slowdownTimer = 0;
+    this.reverseTimer = 0;
     this.score = 0;
     this.currentLevel = 1;
     this.spawnedMarblesCount = 0;
@@ -296,6 +247,13 @@ export class GameScene extends Phaser.Scene {
   setHudVisible(visible) {
     for (const object of this.hudObjects) {
       object.setVisible(visible);
+    }
+
+    // The exit button's hover highlight is tweened, so make sure a hidden HUD
+    // cannot leave it mid-tween when the round ends or the player returns home.
+    if (!visible && this.homeHover) {
+      this.tweens.killTweensOf(this.homeHover);
+      this.homeHover.setAlpha(0);
     }
   }
 
@@ -369,6 +327,19 @@ export class GameScene extends Phaser.Scene {
 
   getChainSpeed() {
     return LEVEL_BASE_SPEED + this.currentLevel * LEVEL_SPEED_STEP;
+  }
+
+  // Progressive palette: levels 1-2 use 3 colours, levels 3-4 use 4, and
+  // level 5+ use the full palette. Only indices below this limit may ever be
+  // placed on the chain or queued in the launcher, so no "locked" colour can
+  // appear before the player can shoot it.
+  getActiveColorCount() {
+    const level = Math.max(1, this.currentLevel);
+
+    return Math.min(
+      MARBLE_COLORS.length,
+      3 + Math.floor((level - 1) / 2),
+    );
   }
 
   // Highest level unlocked so far, persisted in localStorage under
@@ -476,11 +447,15 @@ export class GameScene extends Phaser.Scene {
     this.spawnedMarblesCount = 0;
     this.bonusTimer = 0;
     this.slowdownTimer = 0;
+    this.reverseTimer = 0;
     this.chainComplete = false;
     this.chainHeadDistance = 0;
     this.levelWon = false;
-    this.currentBulletColor = INITIAL_CURRENT_COLOR;
-    this.nextBulletColor = INITIAL_NEXT_COLOR;
+    // Reset the launcher queue inside the palette that is active for this
+    // level (also covers jumping levels through the home selector).
+    const activeColorCount = this.getActiveColorCount();
+    this.currentBulletColor = INITIAL_CURRENT_COLOR % activeColorCount;
+    this.nextBulletColor = INITIAL_NEXT_COLOR % activeColorCount;
     this.updateShooterIndicator();
     this.updateScoreHud();
     this.updateLevelHud();
@@ -826,6 +801,7 @@ export class GameScene extends Phaser.Scene {
     // Reset the round-only state so a game started later begins from a clean
     // slate even if the player sits on the menu for a while.
     this.slowdownTimer = 0;
+    this.reverseTimer = 0;
     this.bonusTimer = 0;
     this.chainComplete = false;
     this.levelWon = false;
@@ -1247,13 +1223,21 @@ export class GameScene extends Phaser.Scene {
       return false;
     }
 
-    const colorIndex = Phaser.Math.Between(0, MARBLE_COLORS.length - 1);
+    // Only the palette unlocked for this level may spawn on the chain.
+    const colorIndex = Phaser.Math.Between(0, this.getActiveColorCount() - 1);
     const marble = this.createPathMarble(colorIndex, 0);
 
-    marble.isBomb = Phaser.Math.FloatBetween(0, 1) < BOMB_CHANCE;
+    // One roll, two mutually exclusive power-ups: 10% bomb then 8%
+    // reverse-time marble, everything else is a normal chain marble.
+    const specialRoll = Phaser.Math.FloatBetween(0, 1);
+    marble.isBomb = specialRoll < BOMB_CHANCE;
+    marble.isReverse =
+      !marble.isBomb && specialRoll < BOMB_CHANCE + REVERSE_CHANCE;
 
     if (marble.isBomb) {
       marble.setTexture(`zs-marble-bomb-${colorIndex}`);
+    } else if (marble.isReverse) {
+      marble.setTexture(`zs-marble-reverse-${colorIndex}`);
     }
 
     this.marbles.push(marble);
@@ -1281,6 +1265,7 @@ export class GameScene extends Phaser.Scene {
     marble.pushOffset = 0;
     marble.magnetApproaching = false;
     marble.isBomb = false;
+    marble.isReverse = false;
 
     return marble;
   }
@@ -1334,7 +1319,8 @@ export class GameScene extends Phaser.Scene {
   createMarbleTextures() {
     if (
       this.textures.exists('zs-marble-0') &&
-      this.textures.exists('zs-marble-bomb-0')
+      this.textures.exists('zs-marble-bomb-0') &&
+      this.textures.exists('zs-marble-reverse-0')
     ) {
       return;
     }
@@ -1406,6 +1392,49 @@ export class GameScene extends Phaser.Scene {
       graphics.fillCircle(center - 2, center - 2, 1.2);
 
       graphics.generateTexture(`zs-marble-bomb-${index}`, size, size);
+
+      // Reverse-time variant: the same coloured marble with a dark inset
+      // core and two bright left-pointing chevrons (<<), so a reverse
+      // marble reads instantly against every other chain marble.
+      graphics.clear();
+
+      graphics.fillStyle(0x000000, 0.3);
+      graphics.fillCircle(center + 2.5, center + 4.5, BALL_RADIUS + 1);
+      graphics.fillStyle(0x07130b, 1);
+      graphics.fillCircle(center, center, BALL_RADIUS + 2.5);
+      graphics.fillStyle(color, 1);
+      graphics.fillCircle(center, center, BALL_RADIUS);
+      graphics.fillStyle(0x000000, 0.13);
+      graphics.fillCircle(center + 4, center + 5, BALL_RADIUS - 3.5);
+      graphics.fillStyle(0xffffff, 0.16);
+      graphics.fillCircle(center - 6, center - 7, 7.5);
+      graphics.fillStyle(0xffffff, 0.56);
+      graphics.fillCircle(center - 7, center - 8, 3.5);
+      graphics.lineStyle(1.2, 0xffffff, 0.3);
+      graphics.strokeCircle(center, center, BALL_RADIUS - 2.6);
+
+      graphics.fillStyle(0x04141d, 0.94);
+      graphics.fillCircle(center, center, BALL_RADIUS - 3.2);
+      graphics.lineStyle(1.5, 0x9ef4ff, 0.85);
+      graphics.strokeCircle(center, center, BALL_RADIUS - 3.6);
+
+      const drawChevron = (apexX) => {
+        graphics.beginPath();
+        graphics.moveTo(apexX + 4.8, center - 6.2);
+        graphics.lineTo(apexX, center);
+        graphics.lineTo(apexX + 4.8, center + 6.2);
+        graphics.strokePath();
+      };
+
+      // Soft cyan halo first, then a crisp white core for contrast.
+      graphics.lineStyle(4.4, 0x63e6ff, 0.35);
+      drawChevron(center - 7.4);
+      drawChevron(center + 2.4);
+      graphics.lineStyle(2.4, 0xf2ffff, 1);
+      drawChevron(center - 7.4);
+      drawChevron(center + 2.4);
+
+      graphics.generateTexture(`zs-marble-reverse-${index}`, size, size);
     });
 
     graphics.destroy();
@@ -1416,6 +1445,16 @@ export class GameScene extends Phaser.Scene {
 
     if (isSlowed) {
       this.slowdownTimer = Math.max(0, this.slowdownTimer - step);
+    }
+
+    // Reverse-time marble: the timer is read once per frame so the frame
+    // that consumes the final chunk of time still reverses; the next frame
+    // falls back to normal forward movement. It also decrements with an
+    // empty chain so a hit can never leave the timer stuck on.
+    const isReversing = this.reverseTimer > 0;
+
+    if (isReversing) {
+      this.reverseTimer = Math.max(0, this.reverseTimer - step);
     }
 
     if (this.marbles.length === 0) {
@@ -1447,6 +1486,42 @@ export class GameScene extends Phaser.Scene {
       }
     }
     segments.push(segment);
+
+    // Reverse-time marble: while the timer runs every segment - including
+    // detached ones - is dragged backwards at double the chain speed. The
+    // rear-most speed is stated explicitly and then propagated forwards so
+    // the whole chain ("all balls") reverses. Forward-only behaviour must
+    // not run here: no magnetic catch-up, no momentum transfer and no combo
+    // detonation. Marbles stop at the entrance instead of leaving the track.
+    if (isReversing) {
+      const reverseTravelT = -standardTravelT * 2;
+      const reverseRear = segments[segments.length - 1];
+      reverseRear.speed = reverseTravelT;
+
+      for (let index = segments.length - 2; index >= 0; index -= 1) {
+        segments[index].speed = segments[index + 1].speed;
+      }
+
+      for (const current of segments) {
+        current.isMagnetic = false;
+
+        for (const marble of current) {
+          marble.magnetApproaching = false;
+          marble.t = Phaser.Math.Clamp(
+            marble.t + current.speed,
+            0,
+            1,
+          );
+        }
+      }
+
+      const reverseFront = this.marbles[0];
+      this.chainHeadDistance = reverseFront
+        ? reverseFront.t * this.trackLength
+        : 0;
+      this.chainComplete = reverseFront ? reverseFront.t >= 1 : false;
+      return;
+    }
 
     // Step 2: only the rearmost segment (the one still feeding in from the
     // start of the track) is pushed by the entrance. Earlier detached segments
@@ -1932,7 +2007,8 @@ export class GameScene extends Phaser.Scene {
 
     // Consume the loaded marble and immediately promote the queued colour.
     this.currentBulletColor = this.nextBulletColor;
-    this.nextBulletColor = (this.nextBulletColor + 1) % MARBLE_COLORS.length;
+    this.nextBulletColor =
+      (this.nextBulletColor + 1) % this.getActiveColorCount();
     this.updateShooterIndicator();
     this.cannon.setRotation(angle);
 
@@ -1947,6 +2023,7 @@ export class GameScene extends Phaser.Scene {
     sprite.pushOffset = 0;
     sprite.magnetApproaching = false;
     sprite.isBomb = false;
+    sprite.isReverse = false;
 
     this.shots.push({
       sprite,
@@ -2031,6 +2108,53 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    // Reverse-time marble: the hit consumes the shot and the marble and
+    // drags the whole chain backwards. It must not insert a marble or run
+    // any match; bomb and reverse are mutually exclusive by spawn roll.
+    if (hitMarble.isReverse) {
+      const shotIndex = this.shots.indexOf(shot);
+      if (shotIndex !== -1) {
+        this.shots.splice(shotIndex, 1);
+      }
+
+      shot.sprite.destroy();
+
+      const reverseX = hitMarble.x;
+      const reverseY = hitMarble.y;
+      const reverseColor = hitMarble.colorIndex;
+      hitMarble.magnetApproaching = false;
+      this.marbles.splice(hitIndex, 1);
+
+      this.tweens.add({
+        targets: hitMarble,
+        scale: 1.35,
+        alpha: 0,
+        angle: hitMarble.angle - 70,
+        duration: 220,
+        ease: 'Cubic.easeOut',
+        onComplete: () => hitMarble.destroy(),
+      });
+
+      this.updateMarbleCount();
+      const reverseFront = this.marbles[0];
+      this.chainHeadDistance = reverseFront
+        ? reverseFront.t * this.trackLength
+        : 0;
+      this.chainComplete = reverseFront ? reverseFront.t >= 1 : false;
+
+      this.reverseTimer = REVERSE_DURATION;
+      this.createMatchBurst(reverseX, reverseY, reverseColor);
+      this.createFloatingText(
+        reverseX,
+        reverseY,
+        '時間倒流！',
+        '#aef7ff',
+        20,
+      );
+      this.cameras.main.flash(140, 90, 200, 255);
+      return;
+    }
+
     const shotIndex = this.shots.indexOf(shot);
     if (shotIndex !== -1) {
       this.shots.splice(shotIndex, 1);
@@ -2073,6 +2197,7 @@ export class GameScene extends Phaser.Scene {
     insertedMarble.pushOffset = 0;
     insertedMarble.magnetApproaching = false;
     insertedMarble.isBomb = false;
+    insertedMarble.isReverse = false;
 
     // Insert first, then propagate the pressure forwards through the chain.
     // A sufficiently large pre-existing gap absorbs the force completely.
@@ -2775,66 +2900,95 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.7)
       .setDepth(DEPTH.hud);
 
-    // Exit-to-home control. The button is a Container drawn at DEPTH.hud so
-    // the depth-filtered hudObjects list captures it and setHudVisible()
-    // toggles the background, label and hit zone together with the rest of the
+    // Exit-to-home control: a bottom-right HUD capsule anchored at (770, 570).
+    // Every child is laid out in negative local space, so the Container itself
+    // carries the (right, bottom) anchor and the capsule + interactive Zone
+    // always span x 646..770, y 536..570 (124 x 34) as one moving unit.
+    // The Container keeps DEPTH.hud so the depth-filtered hudObjects list
+    // toggles the capsule, label and hit zone together with the rest of the
     // HUD (visible while PLAYING, hidden on the menu and on the end panels).
     const homeWidth = 124;
-    const homeHeight = 30;
-    const homeBg = this.add.graphics();
+    const homeHeight = 34;
+    const homeRadius = homeHeight / 2;
+    const homeLeft = -homeWidth;
+    const homeTop = -homeHeight;
+
+    const homeBg = this.add.graphics().setPosition(homeLeft, homeTop);
+
+    // Additive highlight layer. Its alpha is tweened on hover instead of
+    // repainting the capsule, which keeps the highlight transition smooth.
+    const homeHover = this.add
+      .graphics()
+      .setPosition(homeLeft, homeTop)
+      .setAlpha(0)
+      .setBlendMode(Phaser.BlendModes.ADD);
+
     const homeLabel = this.add
-      .text(homeWidth / 2, homeHeight / 2, '退出回首頁', {
+      .text(-homeWidth / 2, -homeHeight / 2, '退出回首頁', {
         fontFamily: UI_FONT,
         fontSize: '13px',
-        color: '#ffffff',
+        color: '#f7efd2',
       })
       .setOrigin(0.5);
+    homeLabel.setShadow(0, 1, '#000000', 4, false, true);
+
     const homeHitArea = this.add
-      .zone(0, 0, homeWidth, homeHeight)
+      .zone(homeLeft, homeTop, homeWidth, homeHeight)
       .setOrigin(0)
       .setInteractive({ useHandCursor: true });
 
-    const paintHomeButton = (hover) => {
+    const paintHomeButton = () => {
       homeBg.clear();
 
-      // Soft drop shadow.
-      homeBg.fillStyle(0x000000, 0.32);
-      homeBg.fillRoundedRect(0, 3, homeWidth, homeHeight, 9);
+      // Semi-transparent dark jungle capsule (radius = half height).
+      homeBg.fillStyle(0x06120c, 0.74);
+      homeBg.fillRoundedRect(0, 0, homeWidth, homeHeight, homeRadius);
 
-      // Dark red plate that brightens while the pointer is over the button.
-      homeBg.fillStyle(hover ? 0x8f2634 : 0x651823, 1);
-      homeBg.fillRoundedRect(0, 0, homeWidth, homeHeight, 9);
-
-      // Thin top gloss, tucked inside the rounded top corners.
-      homeBg.fillStyle(0xffffff, hover ? 0.14 : 0.08);
-      homeBg.fillRoundedRect(2, 2, homeWidth - 4, 12, {
-        tl: 8,
-        tr: 8,
+      // Subtle top gloss, tucked inside the rounded upper half.
+      homeBg.fillStyle(0xffffff, 0.06);
+      homeBg.fillRoundedRect(3, 2, homeWidth - 6, homeHeight / 2 - 2, {
+        tl: homeRadius - 2,
+        tr: homeRadius - 2,
         bl: 0,
         br: 0,
       });
 
-      homeBg.lineStyle(1.5, hover ? 0xffb4b4 : 0xc85f6b, hover ? 0.95 : 0.72);
+      // Thin light border.
+      homeBg.lineStyle(1, 0xd9e6b8, 0.36);
       homeBg.strokeRoundedRect(
-        0.75,
-        0.75,
-        homeWidth - 1.5,
-        homeHeight - 1.5,
-        9,
+        0.5,
+        0.5,
+        homeWidth - 1,
+        homeHeight - 1,
+        homeRadius - 0.5,
       );
+
+      // Fill for the additive highlight layer; its alpha is tweened.
+      homeHover.clear();
+      homeHover.fillStyle(0xf2ffd4, 1);
+      homeHover.fillRoundedRect(0, 0, homeWidth, homeHeight, homeRadius);
     };
 
-    paintHomeButton(false);
-    homeLabel.setShadow(0, 1, '#000000', 4, false, true);
+    const tweenHomeHover = (targetAlpha) => {
+      this.tweens.killTweensOf(homeHover);
+      this.tweens.add({
+        targets: homeHover,
+        alpha: targetAlpha,
+        duration: 150,
+        ease: 'Sine.easeOut',
+      });
+    };
+
+    paintHomeButton();
 
     homeHitArea.on('pointerover', () => {
-      paintHomeButton(true);
-      homeLabel.setColor('#fff6f6');
+      tweenHomeHover(0.3);
+      homeLabel.setColor('#fffbe8');
     });
 
     homeHitArea.on('pointerout', () => {
-      paintHomeButton(false);
-      homeLabel.setColor('#ffffff');
+      tweenHomeHover(0);
+      homeLabel.setColor('#f7efd2');
     });
 
     homeHitArea.on('pointerdown', (pointer, _localX, _localY, event) => {
@@ -2844,11 +2998,16 @@ export class GameScene extends Phaser.Scene {
       // the same click (before or after this handler) is ignored instead of
       // shooting or restarting the game from the menu.
       this.exitButtonDownTime = pointer.downTime;
+
+      // Clear any in-flight hover highlight before the HUD is hidden.
+      this.tweens.killTweensOf(homeHover);
+      homeHover.setAlpha(0);
       this.returnToMenu();
     });
 
+    this.homeHover = homeHover;
     this.homeButton = this.add
-      .container(30, 75, [homeBg, homeLabel, homeHitArea])
+      .container(770, 570, [homeBg, homeHover, homeLabel, homeHitArea])
       .setDepth(DEPTH.hud);
 
     this.add
