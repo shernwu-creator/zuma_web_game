@@ -1112,8 +1112,9 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
-    // A gesture can also unlock the Phaser sound manager; retry BGM then.
-    this.retryBgmAfterUnlock();
+    // A gesture must also unlock the Phaser SoundManager + its AudioContext
+    // and retry the intended BGM (mobile autoplay settles asynchronously).
+    this.unlockBgmAudio();
   }
 
   /* ------------------------------------------------------------------ */
@@ -1167,7 +1168,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     // Browser autoplay lock: remember the intent and retry on first gesture.
-    if (!this.sound || this.sound.locked) {
+    if (!this.sound || !this.isSoundUnlocked()) {
       this.stopBgm({ except: key });
       this.currentBgmKey = key;
       this.bindBgmUnlockRetry();
@@ -1253,13 +1254,82 @@ export class GameScene extends Phaser.Scene {
 
   // Retry the intended BGM after an autoplay unlock / user gesture.
   retryBgmAfterUnlock() {
-    if (!this.sound || this.sound.locked || !this.currentBgmKey) {
+    if (!this.sound || !this.currentBgmKey) {
+      return;
+    }
+
+    if (!this.isSoundUnlocked()) {
       return;
     }
 
     if (!this.isBgmPlaying(this.currentBgmKey)) {
       this.playBgm(this.currentBgmKey);
     }
+  }
+
+  // True when the Phaser sound manager is usable. iOS/Safari can keep
+  // locked=true for a tick after the AudioContext actually resumed, so a
+  // running context counts as unlocked (play() is safe then).
+  isSoundUnlocked() {
+    if (!this.sound) {
+      return false;
+    }
+
+    if (!this.sound.locked) {
+      return true;
+    }
+
+    const context = this.sound.context;
+    return !!(context && context.state === 'running');
+  }
+
+  // Mobile autoplay unlock: called from every real user gesture (start tap,
+  // pointerdown and initAudio). Every Phaser call is feature-guarded so an
+  // HTML5-only / older / no-audio manager can never throw; afterwards the
+  // intended BGM is retried, including once more after the unlock settles.
+  unlockBgmAudio() {
+    if (!this.sound) {
+      return false;
+    }
+
+    // Both Phaser backends expose unlock(); calling it resumes the context
+    // and flushes Phaser's locked-actions queue (queued BGM play included).
+    try {
+      if (typeof this.sound.unlock === 'function') {
+        this.sound.unlock();
+      }
+    } catch {
+      // Audio is a progressive enhancement; never break gameplay for it.
+    }
+
+    // Resume the underlying AudioContext directly as well: on iOS Safari the
+    // explicit resume inside the gesture is what actually starts playback.
+    const context = this.sound.context;
+
+    if (context && typeof context.resume === 'function') {
+      try {
+        const resume = context.resume();
+        if (resume && typeof resume.catch === 'function') {
+          resume.catch(() => {});
+        }
+      } catch {
+        // Ignore resume races; the retries below still cover the unlock.
+      }
+    }
+
+    this.retryBgmAfterUnlock();
+
+    // Last-chance retry once the async unlock promise has settled (Safari
+    // fires 'unlocked' late). playBgm never restarts a playing track.
+    if (this.currentBgmKey && !this.isBgmPlaying(this.currentBgmKey)) {
+      try {
+        this.time.delayedCall(80, () => this.retryBgmAfterUnlock());
+      } catch {
+        // Scene clock unavailable (shutdown) - ignore.
+      }
+    }
+
+    return this.isSoundUnlocked();
   }
 
   // Listen once for the Phaser sound unlock and retry the queued BGM.
@@ -1489,6 +1559,10 @@ export class GameScene extends Phaser.Scene {
     this.selectedLevel = this.worldStageToLevel(target.world, target.stage);
     this.score = 0;
     this.startLevel();
+
+    // The start tap IS the user gesture on mobile: force the unlock here so
+    // the gameplay theme starts even when the sound manager settles late.
+    this.unlockBgmAudio();
   }
 
   // Begin (or continue into) the current World/Stage. Score, currentWorld and
@@ -3801,8 +3875,9 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    // Any real gesture also retries a BGM track queued behind autoplay lock.
-    this.retryBgmAfterUnlock();
+    // Any real gesture unlocks/resumes the Phaser sound manager and retries
+    // the BGM queued behind the browser autoplay lock (iOS/Safari included).
+    this.unlockBgmAudio();
 
     // The HUD exit button has its own object-level handler. Depending on the
     // Phaser dispatch order the scene-wide 'pointerdown' can still arrive for
@@ -4700,6 +4775,7 @@ export class GameScene extends Phaser.Scene {
     centerY /= matched.length;
 
     this.slowdownTimer = 1.5;
+    let needsStartNormalize = false;
 
     if (pushbackMarble) {
       if (pushbackTouching) {
@@ -4708,9 +4784,57 @@ export class GameScene extends Phaser.Scene {
           0,
           pushbackMarble.t - chain.deltaT * 1.5,
         );
+
+        // The elastic kick opens a 1.5-diameter hole at the match site, but
+        // the marbles packed behind the kicked marble still hold the old
+        // spacing. Without propagating that overlap they are rigid-clamped
+        // against each other on the next movement frame, which teleports
+        // them backwards in one step (a visible snap). Walk the packed run
+        // towards the tail now and hand each overlapping pair its correct
+        // position; pushOffset keeps the rendered marble where it was so the
+        // recoil then slides out smoothly instead of jumping. The loop is
+        // bounded by the array length and stops at the first real gap.
+        const pushbackIndex = marbles.indexOf(pushbackMarble);
+
+        if (pushbackIndex !== -1) {
+          for (
+            let index = pushbackIndex;
+            index < marbles.length - 1;
+            index += 1
+          ) {
+            const current = marbles[index];
+            const behind = marbles[index + 1];
+            const gap = current.t - behind.t;
+
+            if (!Number.isFinite(gap) || gap >= chain.deltaT) {
+              break;
+            }
+
+            const overlap = chain.deltaT - gap;
+
+            if (!Number.isFinite(overlap) || overlap <= 0) {
+              break;
+            }
+
+            behind.t -= overlap;
+            behind.pushOffset = (behind.pushOffset ?? 0) + overlap;
+            behind.magnetApproaching = false;
+
+            if (behind.t < 0) {
+              needsStartNormalize = true;
+            }
+          }
+        }
       }
 
       pushbackMarble.magnetApproaching = false;
+    }
+
+    // Only when the cascade pushed the tail past the entrance: slide the
+    // whole chain forward by the deficit (bounded to [0, 1]) so no marble is
+    // stranded behind t = 0. Relative spacing is preserved.
+    if (needsStartNormalize) {
+      this.normalizePushedChain(chain);
     }
 
     this.refreshChainMetrics(chain);
