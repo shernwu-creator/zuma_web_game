@@ -63,18 +63,20 @@ const BONUS_SPAWN_INTERVAL = 8;
 const WIN_BONUS = 500;
 
 // Custom background-music tracks. The mp3 files live in public/ and are
-// served from the site root (/<name>.mp3). They MUST be part of the final
-// commit; a missing file only disables that track (the manager checks the
-// Phaser audio cache before every play).
+// referenced RELATIVE to the page ("./<name>.mp3"), never with a leading "/":
+// GitHub Pages serves this game from a subpath such as /zuma_web_game/, so a
+// root-absolute URL would 404 there. Vite's base:'./' keeps index.html itself
+// relative too. A missing file only disables that track (the manager checks
+// the Phaser audio cache before every play). They MUST be in the final commit.
 const BGM_KEYS = {
   menu: 'bgm-menu',
   gameplay: 'bgm-gameplay',
   victory: 'bgm-victory',
 };
 const BGM_TRACKS = [
-  { key: BGM_KEYS.menu, url: '/pixel_lounge.mp3' },
-  { key: BGM_KEYS.gameplay, url: '/whimsical_wander.mp3' },
-  { key: BGM_KEYS.victory, url: '/playful_path.mp3' },
+  { key: BGM_KEYS.menu, url: './pixel_lounge.mp3' },
+  { key: BGM_KEYS.gameplay, url: './whimsical_wander.mp3' },
+  { key: BGM_KEYS.victory, url: './playful_path.mp3' },
 ];
 const BGM_VOLUME = 0.42;
 
@@ -452,9 +454,12 @@ export class GameScene extends Phaser.Scene {
         return false;
       }
 
+      // Relative to the page (no leading "/"), so the clip also loads when the
+      // build is deployed under a GitHub Pages subpath. The H.264 gate above
+      // and the hasVictoryVideoTexture() fallback still guard playback.
       this.load.video(
         'zs-victory-video',
-        '/match-three_game_stage_clear_20261027.mp4',
+        './match-three_game_stage_clear_20261027.mp4',
         'loadeddata',
         true,
       );
