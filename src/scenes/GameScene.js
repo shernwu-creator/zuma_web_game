@@ -17,23 +17,28 @@ const SHOOTER_BALL_SCALE = 0.75;
 const INITIAL_CURRENT_COLOR = 0;
 const INITIAL_NEXT_COLOR = 1;
 
-// Level progression:
-//   total marbles = 30 + level * 10   (L1 = 40, L2 = 50, ...)
-//   chain speed   = 40 + level * 5    (L1 = 45, L2 = 50, ...)
+// World/Stage progression: 3 worlds x 10 stages. The absolute difficulty is
+//   D = (world - 1) * 10 + stage        (W1S1 = 1 ... W3S10 = 30)
+//   total marbles = 30 + D * 5          (W1S1 = 35 ... W3S10 = 180)
+//   chain speed   = 35 + D * 2.5        (W1S1 = 37.5 ... W3S10 = 110 px/s)
 const LEVEL_BASE_MARBLES = 30;
-const LEVEL_MARBLES_STEP = 10;
-const LEVEL_BASE_SPEED = 40; // pixels per second
-const LEVEL_SPEED_STEP = 5;
+const LEVEL_MARBLES_STEP = 5;
+const LEVEL_BASE_SPEED = 35; // pixels per second
+const LEVEL_SPEED_STEP = 2.5;
+const MAX_WORLD = 3;
+const MAX_STAGE = 10;
 const CATCH_UP_MULTIPLIER = 4.5;
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
 const SHOT_SPAWN_OFFSET = 56;
 const SHOT_CULL_MARGIN = 48;
 const MAX_FRAME_DELTA = 50;
-// Progressive special-marble chances. `difficulty` = min(level, 10) / 10:
-//   bomb    = 0.02 + 0.08 * difficulty  (L1 2.8% ... L10 10%)
-//   reverse = 0.00 + 0.08 * difficulty  (L1 0.8% ... L10 8%)
-//   pause   = 0.02 + 0.06 * difficulty  (L1 2.6% ... L10 8%)
+// Progressive special-marble chances. `difficulty` ramps 0.1..1.0 over World
+// 1 (matching the old L1..L10 curve) and continues smoothly across Worlds 2-3
+// up to 2.0 at W3S10:
+//   bomb    = 0.02 + 0.08 * difficulty  (W1S1 2.8% ... W3S10 18%)
+//   reverse = 0.00 + 0.08 * difficulty  (W1S1 0.8% ... W3S10 16%)
+//   pause   = 0.02 + 0.06 * difficulty  (W1S1 2.6% ... W3S10 14%)
 const BOMB_BASE_CHANCE = 0.02;
 const BOMB_LEVEL_CHANCE = 0.08;
 const REVERSE_LEVEL_CHANCE = 0.08;
@@ -41,6 +46,12 @@ const PAUSE_BASE_CHANCE = 0.02;
 const PAUSE_LEVEL_CHANCE = 0.06;
 const REVERSE_DURATION = 2.0;
 const PAUSE_DURATION = 3.0;
+// Sniper marble: documented ~5% special chance (mutually exclusive with
+// bomb/reverse/pause) that grants a short aiming laser + instant shots.
+const SNIPER_CHANCE = 0.05;
+const SNIPER_BUFF_DURATION = 3.0;
+const SNIPER_SHOT_SPEED = 10000; // instant-fire shot speed while buffed
+const SNIPER_LASER_DEPTH = 11; // above balls (5) and launcher (9)
 const BOMB_BLAST_NEIGHBOURS = 2;
 const BOMB_SCORE = 300;
 const BONUS_COUNT = 3;
@@ -51,7 +62,61 @@ const TRACK_CLEARANCE = 44;
 const BONUS_SPAWN_INTERVAL = 8;
 const WIN_BONUS = 500;
 
-// One track per level, cycled with `(currentLevel - 1) % TRACK_LAYOUTS.length`.
+// Distinct World palettes for the play board and the home-screen preview.
+// World 1 reuses the original jungle backdrop textures; the desert and volcano
+// variants are generated as canvases on first use.
+const WORLD_THEMES = [
+  {
+    id: 1,
+    name: '叢林',
+    sky: '#1a3320',
+    glow: [
+      'rgba(91, 137, 88, 0.30)',
+      'rgba(49, 89, 54, 0.18)',
+      'rgba(22, 48, 29, 0.08)',
+    ],
+    shaft: 'rgba(194, 216, 146, 0.028)',
+    speck: '190, 215, 154',
+    vignette: '2, 10, 5',
+    foliageTint: 0xffffff,
+    menuTint: '#041009',
+    accent: '#c6d5ad',
+  },
+  {
+    id: 2,
+    name: '沙漠',
+    sky: '#382c18',
+    glow: [
+      'rgba(198, 158, 94, 0.30)',
+      'rgba(120, 92, 50, 0.22)',
+      'rgba(58, 40, 20, 0.10)',
+    ],
+    shaft: 'rgba(240, 214, 156, 0.035)',
+    speck: '228, 201, 148',
+    vignette: '18, 11, 4',
+    foliageTint: 0xd8b57a,
+    menuTint: '#120c05',
+    accent: '#d8b57a',
+  },
+  {
+    id: 3,
+    name: '火山',
+    sky: '#2a1417',
+    glow: [
+      'rgba(184, 72, 54, 0.30)',
+      'rgba(112, 38, 32, 0.24)',
+      'rgba(40, 12, 12, 0.10)',
+    ],
+    shaft: 'rgba(236, 130, 92, 0.03)',
+    speck: '240, 150, 110',
+    vignette: '14, 3, 3',
+    foliageTint: 0xb9654d,
+    menuTint: '#0d0506',
+    accent: '#d99a7c',
+  },
+];
+
+// One outer track per stage, cycled with `(D - 1) % TRACK_LAYOUTS.length`.
 // Every layout lives inside the 800x600 board and keeps the sampled track
 // centerline clear (>= 22px, plus a little margin) of the on-screen UI:
 //   - top-left HUD title/level area  (about 15..300 x 15..110)
@@ -112,6 +177,52 @@ const TRACK_LAYOUTS = [
   ],
 ];
 
+// World 3 runs TWO independent chains. The outer chain uses one of the five
+// TRACK_LAYOUTS; the inner chain uses one of these compact rings so the two
+// splines have clearly different silhouettes and both stay clear of the
+// launcher (>= 115px from the centre), the HUD corners and the home capsule.
+const DUAL_INNER_LAYOUTS = [
+  // Inner 1: rounded central circuit, open on the left.
+  [
+    [210, 190], [320, 165], [440, 170], [545, 205], [600, 270], [595, 345],
+    [545, 410], [455, 445], [350, 440], [255, 410], [195, 350], [180, 270],
+  ],
+  // Inner 2: wide wavy oval (upper band -> right descent -> lower band).
+  [
+    [170, 190], [270, 170], [380, 185], [490, 170], [590, 195], [650, 245],
+    [650, 355], [590, 405], [490, 425], [380, 420], [270, 425], [170, 405],
+    [120, 350], [120, 250],
+  ],
+  // Inner 3: diagonal sweep with a hooked lower-left return.
+  [
+    [180, 220], [290, 185], [410, 180], [520, 200], [600, 245], [630, 310],
+    [600, 375], [530, 420], [440, 430], [360, 420], [300, 370], [250, 390],
+    [200, 430], [150, 440], [120, 390], [130, 320], [150, 260],
+  ],
+];
+
+const OUTER_TRACK_STYLE = {
+  shadow: 0x000000,
+  shadowAlpha: 0.26,
+  baseDark: 0x09190e,
+  base: 0x2b4b31,
+  highlight: 0xa4bb87,
+  debug: 0xe7efc4,
+  glow: 0xe8cf82,
+  ring: 0xe8cf82,
+};
+
+const INNER_TRACK_STYLE = {
+  shadow: 0x000000,
+  shadowAlpha: 0.3,
+  baseDark: 0x081420,
+  base: 0x274a5c,
+  highlight: 0x9cc7dd,
+  debug: 0xc2e8ff,
+  glow: 0x8fd4ff,
+  ring: 0x8fd4ff,
+};
+
 const MARBLE_COLORS = [
   '#FF3366',
   '#33CCFF',
@@ -143,9 +254,14 @@ export class GameScene extends Phaser.Scene {
   constructor() {
     super({ key: 'GameScene' });
 
-    // The track is level-dependent and does NOT exist on the start menu.
-    // It is (re)built in startLevel() from TRACK_LAYOUTS; the visual objects
-    // are owned by clearTrackVisuals()/createTrack().
+    // Tracks are level-dependent and do NOT exist on the start menu. They are
+    // (re)built in startLevel() from TRACK_LAYOUTS (plus DUAL_INNER_LAYOUTS for
+    // World 3) into independent chain contexts. `this.track*`, `this.deltaT`
+    // and `this.marbles` are kept as aliases of the primary (outer) chain for
+    // compatibility with older tooling and UI helpers.
+    this.chains = [];
+    this.primaryChain = null;
+    this.spawnChainCursor = 0;
     this.track = null;
     this.trackLength = 0;
     this.trackSamples = [];
@@ -167,6 +283,12 @@ export class GameScene extends Phaser.Scene {
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
     this.pauseTimer = 0;
+    this.sniperBuffActive = false;
+    this.sniperTimer = 0;
+    this.sniperLaser = null;
+    this.sniperLaserTarget = null;
+    this.sniperLaserEnd = null;
+    this.sniperLaserVisible = false;
     this.audioCtx = null;
     this.score = 0;
     this.highScore = 0;
@@ -177,9 +299,18 @@ export class GameScene extends Phaser.Scene {
       this.highScore = 0;
     }
 
-    // Level-selector state. `zumaMaxLevel` remembers the highest level the
-    // player has unlocked across reloads; the home menu may only pick a level
-    // inside that range.
+    // World/Stage progression. `currentWorld` 1..3 and `currentStage` 1..10;
+    // absolute difficulty D = (world - 1) * 10 + stage (1..30).
+    this.currentWorld = 1;
+    this.currentStage = 1;
+    // Selection exposed for the two-tier home menu.
+    this.selectedWorld = 1;
+    this.selectedStage = 1;
+    // Highest unlocked progress, persisted as zumaMaxWorld/zumaMaxStage.
+    this.maxUnlockedWorld = 1;
+    this.maxUnlockedStage = 1;
+    // Flat-level mirrors kept for the current single-row selector and for
+    // older callers/tests; they always mirror selectedWorld/currentWorld.
     this.maxUnlockedLevel = 1;
     this.selectedLevel = 1;
     this.menuLevelText = null;
@@ -187,14 +318,19 @@ export class GameScene extends Phaser.Scene {
     this.menuArrowRight = null;
     this.menuStartHitArea = null;
     this.menuControlDownTime = null;
-    this.loadMaxUnlockedLevel();
+    // Two-tier World/Stage selector records + World backdrop layers.
+    this.menuWorldButtons = [];
+    this.menuStageButtons = [];
+    this.backdropImage = null;
+    this.vignetteImage = null;
+    this.foliageSprites = [];
+    this.loadProgress();
 
     this.bonusItems = [];
     this.scoreText = null;
     this.highScoreText = null;
     this.levelText = null;
     this.gameState = 'MENU';
-    this.currentLevel = 1;
     this.spawnedMarblesCount = 0;
     this.bonusTimer = 0;
     this.levelWon = false;
@@ -214,8 +350,18 @@ export class GameScene extends Phaser.Scene {
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
     this.pauseTimer = 0;
+    this.sniperBuffActive = false;
+    this.sniperTimer = 0;
+    this.sniperLaser = null;
+    this.sniperLaserTarget = null;
+    this.sniperLaserEnd = null;
+    this.sniperLaserVisible = false;
     this.score = 0;
-    this.currentLevel = 1;
+    this.currentWorld = 1;
+    this.currentStage = 1;
+    this.chains = [];
+    this.primaryChain = null;
+    this.spawnChainCursor = 0;
     this.spawnedMarblesCount = 0;
     this.bonusTimer = 0;
     this.levelWon = false;
@@ -275,6 +421,7 @@ export class GameScene extends Phaser.Scene {
     this.updateSpawner();
     this.updateBonusSpawner(step);
     this.aimAtPointer();
+    this.updateSniper(step);
     this.checkWinCondition();
   }
 
@@ -333,9 +480,14 @@ export class GameScene extends Phaser.Scene {
   }
 
   clearRoundObjects() {
-    for (const marble of this.marbles) {
-      this.tweens.killTweensOf(marble);
-      marble.destroy();
+    for (const chain of this.chains) {
+      for (const marble of chain.marbles) {
+        this.tweens.killTweensOf(marble);
+        marble.destroy();
+      }
+      chain.marbles = [];
+      chain.headDistance = 0;
+      chain.chainComplete = false;
     }
     this.marbles = [];
 
@@ -355,64 +507,367 @@ export class GameScene extends Phaser.Scene {
     this.updateMarbleCount();
   }
 
+  // Absolute difficulty D = (world - 1) * MAX_STAGE + stage, 1..30.
+  getDifficulty() {
+    return (this.currentWorld - 1) * MAX_STAGE + this.currentStage;
+  }
+
+  // World 3 (D >= 21) runs two independent tracks/chains.
+  isDualTrack() {
+    return this.currentWorld >= MAX_WORLD;
+  }
+
   getTotalMarbles() {
-    return LEVEL_BASE_MARBLES + this.currentLevel * LEVEL_MARBLES_STEP;
+    return LEVEL_BASE_MARBLES + this.getDifficulty() * LEVEL_MARBLES_STEP;
   }
 
   getChainSpeed() {
-    return LEVEL_BASE_SPEED + this.currentLevel * LEVEL_SPEED_STEP;
+    return LEVEL_BASE_SPEED + this.getDifficulty() * LEVEL_SPEED_STEP;
   }
 
-  // Progressive palette: levels 1-2 use 3 colours, levels 3-4 use 4, and
-  // level 5+ use the full palette. Only indices below this limit may ever be
-  // placed on the chain or queued in the launcher, so no "locked" colour can
-  // appear before the player can shoot it.
+  // 0.1..1.0 across World 1 (matching the old W1/L1..L10 ramp exactly), then
+  // a smooth continuation across Worlds 2 and 3 up to 2.0 at D = 30.
+  getDifficultyRatio() {
+    const difficulty = this.getDifficulty();
+
+    return difficulty <= MAX_STAGE
+      ? difficulty / MAX_STAGE
+      : 1 + (difficulty - MAX_STAGE) / 20;
+  }
+
+  // Progressive palette: D 1-2 use 3 colours, D 3-4 use 4, D 5+ use all 5.
+  // Only indices below this limit may ever be placed on a chain or queued in
+  // the launcher, so no "locked" colour can appear before it is shootable.
   getActiveColorCount() {
-    const level = Math.max(1, this.currentLevel);
+    const difficulty = Math.max(1, this.getDifficulty());
 
     return Math.min(
       MARBLE_COLORS.length,
-      3 + Math.floor((level - 1) / 2),
+      3 + Math.floor((difficulty - 1) / 2),
     );
   }
 
-  // Special-marble odds ramp with difficulty from level 1 to level 10.
+  // Special-marble odds ramp smoothly with absolute difficulty D. World 1
+  // keeps the previously verified L1 (2.8/0.8/2.6%) .. L10 (10/8/8%) curve;
+  // Worlds 2-3 continue ramping to roughly 18/16/14% at W3S10.
   getSpecialChances() {
-    const difficulty = Math.min(this.currentLevel, 10) / 10;
+    const difficulty = this.getDifficultyRatio();
 
     return {
       bomb: BOMB_BASE_CHANCE + BOMB_LEVEL_CHANCE * difficulty,
       reverse: REVERSE_LEVEL_CHANCE * difficulty,
       pause: PAUSE_BASE_CHANCE + PAUSE_LEVEL_CHANCE * difficulty,
+      // Fixed ~5% documented chance: an instant-fire sniper marble.
+      sniper: SNIPER_CHANCE,
     };
   }
 
-  // Highest level unlocked so far, persisted in localStorage under
-  // `zumaMaxLevel`. Missing or corrupt values fall back to level 1 so the
-  // home selector is never empty or out of range.
-  loadMaxUnlockedLevel() {
-    let stored = 1;
-
-    try {
-      stored = Number(localStorage.getItem('zumaMaxLevel'));
-    } catch {
-      stored = 1;
+  getNextWorldStage(world = this.currentWorld, stage = this.currentStage) {
+    if (stage < MAX_STAGE) {
+      return { world, stage: stage + 1 };
     }
 
-    this.maxUnlockedLevel =
-      Number.isFinite(stored) && stored >= 1 ? Math.floor(stored) : 1;
+    if (world < MAX_WORLD) {
+      return { world: world + 1, stage: 1 };
+    }
+
+    // W3S10 is the final stage: the "next level" action replays it.
+    return { world: MAX_WORLD, stage: MAX_STAGE };
   }
 
-  saveMaxUnlockedLevel() {
+  worldStageToLevel(world, stage) {
+    return (world - 1) * MAX_STAGE + stage;
+  }
+
+  levelToWorldStage(level) {
+    const flat = Phaser.Math.Clamp(
+      Math.round(level) || 1,
+      1,
+      MAX_WORLD * MAX_STAGE,
+    );
+
+    return {
+      world: Math.floor((flat - 1) / MAX_STAGE) + 1,
+      stage: ((flat - 1) % MAX_STAGE) + 1,
+    };
+  }
+
+  // Highest stage available in `world`: every stage of an earlier world, the
+  // stored unlock in the newest world, and none for a still-locked world.
+  getMaxStageForWorld(world) {
+    if (world < this.maxUnlockedWorld) {
+      return MAX_STAGE;
+    }
+
+    if (world === this.maxUnlockedWorld) {
+      return this.maxUnlockedStage;
+    }
+
+    return 0;
+  }
+
+  getWorldTheme(world = this.selectedWorld) {
+    const index = Phaser.Math.Clamp(Math.round(world) || 1, 1, MAX_WORLD) - 1;
+    return WORLD_THEMES[index];
+  }
+
+  isWorldLocked(world) {
+    return world > Math.max(1, this.maxUnlockedWorld);
+  }
+
+  // Progressive pickup cap: W1 stays readable with 1-2 stars and later worlds
+  // grow to four. D1-8 = 1, D9-16 = 2, D17-24 = 3, D25-30 = 4.
+  getBonusCap() {
+    const difficulty = Math.max(1, this.getDifficulty());
+    return Math.min(4, 1 + Math.floor((difficulty - 1) / 8));
+  }
+
+  // Paint one World/Stage choice pill in its locked / selected / normal state.
+  paintMenuChoice(record) {
+    const { bg, label, x, y, width, height, locked, selected } = record;
+    const radius = Math.min(10, height / 2);
+    const left = x - width / 2;
+    const top = y - height / 2;
+
+    bg.clear();
+
+    if (locked) {
+      bg.fillStyle(0x000000, 0.18);
+      bg.fillRoundedRect(left, top, width, height, radius);
+      bg.lineStyle(1, 0x6f6a5e, 0.14);
+      bg.strokeRoundedRect(left + 0.5, top + 0.5, width - 1, height - 1, radius);
+      label.setColor('#6f6a5e');
+      label.setAlpha(0.5);
+      return;
+    }
+
+    if (selected) {
+      bg.fillStyle(0x3f3218, 0.86);
+      bg.fillRoundedRect(left, top, width, height, radius);
+      bg.lineStyle(2, 0xffd98a, 0.9);
+      bg.strokeRoundedRect(left + 1, top + 1, width - 2, height - 2, radius - 1);
+      label.setColor('#ffe9a8');
+      label.setAlpha(1);
+      return;
+    }
+
+    bg.fillStyle(0x000000, 0.32);
+    bg.fillRoundedRect(left, top, width, height, radius);
+    bg.lineStyle(1, 0xd7c17d, 0.24);
+    bg.strokeRoundedRect(left + 0.5, top + 0.5, width - 1, height - 1, radius);
+    label.setColor('#d9c68c');
+    label.setAlpha(0.92);
+  }
+
+  // Generate the desert/volcanic backdrop + vignette canvases once. World 1
+  // keeps the original jungle textures so its look stays untouched.
+  createWorldBackdropVariants() {
+    for (const theme of WORLD_THEMES) {
+      if (theme.id === 1) {
+        continue;
+      }
+
+      const backdropKey = `zs-backdrop-w${theme.id}`;
+
+      if (!this.textures.exists(backdropKey)) {
+        const canvas = document.createElement('canvas');
+        canvas.width = VIEW_WIDTH;
+        canvas.height = VIEW_HEIGHT;
+
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = theme.sky;
+        ctx.fillRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
+
+        const glow = ctx.createRadialGradient(
+          CENTER_X + 24,
+          250,
+          30,
+          CENTER_X,
+          300,
+          500,
+        );
+        glow.addColorStop(0, theme.glow[0]);
+        glow.addColorStop(0.42, theme.glow[1]);
+        glow.addColorStop(0.72, theme.glow[2]);
+        glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.fillStyle = glow;
+        ctx.fillRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
+
+        ctx.save();
+        ctx.globalCompositeOperation = 'screen';
+        ctx.fillStyle = theme.shaft;
+        ctx.beginPath();
+        ctx.moveTo(130, -40);
+        ctx.lineTo(244, -40);
+        ctx.lineTo(420, 640);
+        ctx.lineTo(248, 640);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.fillStyle = theme.shaft;
+        ctx.beginPath();
+        ctx.moveTo(560, -40);
+        ctx.lineTo(660, -40);
+        ctx.lineTo(790, 640);
+        ctx.lineTo(618, 640);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+
+        const rng = new Phaser.Math.RandomDataGenerator([
+          `serpentine-backdrop-${theme.id}`,
+        ]);
+        for (let i = 0; i < 220; i += 1) {
+          const x = rng.between(0, VIEW_WIDTH);
+          const y = rng.between(0, VIEW_HEIGHT);
+          const radius = rng.realInRange(0.35, 1.5);
+          ctx.beginPath();
+          ctx.arc(x, y, radius, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(${theme.speck}, ${rng.realInRange(0.015, 0.055)})`;
+          ctx.fill();
+        }
+
+        this.textures.addCanvas(backdropKey, canvas);
+      }
+
+      const vignetteKey = `zs-vignette-w${theme.id}`;
+
+      if (!this.textures.exists(vignetteKey)) {
+        const canvas = document.createElement('canvas');
+        canvas.width = VIEW_WIDTH;
+        canvas.height = VIEW_HEIGHT;
+
+        const ctx = canvas.getContext('2d');
+        const vignette = ctx.createRadialGradient(
+          CENTER_X,
+          CENTER_Y - 20,
+          190,
+          CENTER_X,
+          CENTER_Y,
+          510,
+        );
+        vignette.addColorStop(0, `rgba(${theme.vignette}, 0)`);
+        vignette.addColorStop(0.62, `rgba(${theme.vignette}, 0.14)`);
+        vignette.addColorStop(1, `rgba(${theme.vignette}, 0.66)`);
+        ctx.fillStyle = vignette;
+        ctx.fillRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
+
+        this.textures.addCanvas(vignetteKey, canvas);
+      }
+    }
+  }
+
+  // Swap the visible backdrop/vignette/foliage to a World's palette.
+  applyWorldBackdrop(world = this.selectedWorld) {
+    const theme = this.getWorldTheme(world);
+
+    if (this.backdropImage) {
+      this.backdropImage.setTexture(
+        theme.id === 1 ? 'zs-backdrop' : `zs-backdrop-w${theme.id}`,
+      );
+    }
+
+    if (this.vignetteImage) {
+      this.vignetteImage.setTexture(
+        theme.id === 1 ? 'zs-vignette' : `zs-vignette-w${theme.id}`,
+      );
+    }
+
+    if (this.foliageSprites) {
+      for (const leaf of this.foliageSprites) {
+        leaf.setTint(theme.foliageTint);
+      }
+    }
+
+    return theme;
+  }
+
+  clampSelectedProgress() {
+    this.selectedWorld = Phaser.Math.Clamp(
+      Math.round(this.selectedWorld) || 1,
+      1,
+      Math.max(1, this.maxUnlockedWorld),
+    );
+    this.selectedStage = Phaser.Math.Clamp(
+      Math.round(this.selectedStage) || 1,
+      1,
+      Math.max(1, this.getMaxStageForWorld(this.selectedWorld)),
+    );
+    this.selectedLevel = this.worldStageToLevel(
+      this.selectedWorld,
+      this.selectedStage,
+    );
+  }
+
+  // Load the highest unlocked World/Stage pair from localStorage. Legacy
+  // `zumaMaxLevel` (flat 1..30) is migrated when the new keys are absent;
+  // corrupt/missing values fall back to W1S1 and everything is clamped.
+  loadProgress() {
+    let maxWorld = 1;
+    let maxStage = 1;
+
     try {
+      const rawWorld = localStorage.getItem('zumaMaxWorld');
+      const rawStage = localStorage.getItem('zumaMaxStage');
+
+      if (rawWorld !== null || rawStage !== null) {
+        const world = Number(rawWorld);
+        const stage = Number(rawStage);
+
+        if (Number.isFinite(world)) {
+          maxWorld = Math.floor(world);
+        }
+
+        if (Number.isFinite(stage)) {
+          maxStage = Math.floor(stage);
+        }
+      } else {
+        const legacy = Number(localStorage.getItem('zumaMaxLevel'));
+
+        if (Number.isFinite(legacy) && legacy >= 1) {
+          const migrated = this.levelToWorldStage(legacy);
+          maxWorld = migrated.world;
+          maxStage = migrated.stage;
+        }
+      }
+    } catch {
+      maxWorld = 1;
+      maxStage = 1;
+    }
+
+    this.maxUnlockedWorld = Phaser.Math.Clamp(
+      Number.isFinite(maxWorld) ? maxWorld : 1,
+      1,
+      MAX_WORLD,
+    );
+    this.maxUnlockedStage = Phaser.Math.Clamp(
+      Number.isFinite(maxStage) ? maxStage : 1,
+      1,
+      MAX_STAGE,
+    );
+    this.maxUnlockedLevel = this.worldStageToLevel(
+      this.maxUnlockedWorld,
+      this.maxUnlockedStage,
+    );
+
+    this.selectedWorld = 1;
+    this.selectedStage = 1;
+    this.selectedLevel = 1;
+  }
+
+  saveProgress() {
+    try {
+      localStorage.setItem('zumaMaxWorld', String(this.maxUnlockedWorld));
+      localStorage.setItem('zumaMaxStage', String(this.maxUnlockedStage));
+      // Legacy mirror so older builds/tests can still read a flat cap.
       localStorage.setItem('zumaMaxLevel', String(this.maxUnlockedLevel));
     } catch {
       // Storage can be unavailable in private or embedded contexts.
     }
   }
 
-  // Move the home selector, clamped to the unlocked range. Called by the < >
-  // arrows; it never starts a run or fires the cannon.
+  // Legacy flat-level selector movement, used by the current single-row home
+  // menu. The two-tier menu agent should drive selectedWorld/selectedStage.
   changeSelectedLevel(delta) {
     const maxLevel = Math.max(1, this.maxUnlockedLevel);
     const next = Phaser.Math.Clamp(
@@ -426,21 +881,20 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.selectedLevel = next;
+    const target = this.levelToWorldStage(next);
+    this.selectedWorld = target.world;
+    this.selectedStage = target.stage;
     this.refreshLevelSelector();
   }
 
   // Redraw the level label and dim arrows that cannot move any further.
   refreshLevelSelector() {
-    const maxLevel = Math.max(1, this.maxUnlockedLevel);
-
-    this.selectedLevel = Phaser.Math.Clamp(
-      Math.round(this.selectedLevel) || 1,
-      1,
-      maxLevel,
-    );
+    this.clampSelectedProgress();
 
     if (this.menuLevelText) {
-      this.menuLevelText.setText(`第 ${this.selectedLevel} 關`);
+      this.menuLevelText.setText(
+        `第 ${this.selectedWorld} 世界 · 第 ${this.selectedStage} 關`,
+      );
     }
 
     const updateArrow = (arrow, enabled) => {
@@ -457,7 +911,10 @@ export class GameScene extends Phaser.Scene {
     };
 
     updateArrow(this.menuArrowLeft, this.selectedLevel > 1);
-    updateArrow(this.menuArrowRight, this.selectedLevel < maxLevel);
+    updateArrow(
+      this.menuArrowRight,
+      this.selectedLevel < Math.max(1, this.maxUnlockedLevel),
+    );
   }
 
   /* ------------------------------------------------------------------ */
@@ -647,45 +1104,87 @@ export class GameScene extends Phaser.Scene {
 
   // Fresh run from the home menu or after a loss: start the selected level
   // with a zeroed run score. `startLevel` handles the rest of the setup.
-  startGame(level = this.selectedLevel) {
+  startGame(world = this.selectedWorld, stage = this.selectedStage) {
     this.initAudio();
 
-    const requested = Number.isFinite(level) ? level : this.selectedLevel;
+    let target;
 
-    this.currentLevel = Phaser.Math.Clamp(
-      Math.round(requested),
-      1,
-      Math.max(1, this.maxUnlockedLevel),
-    );
-    this.selectedLevel = this.currentLevel;
+    if (arguments.length === 0) {
+      // Normal start from the home menu: use the selected World/Stage pair,
+      // clamped defensively in case the menu exposes a locked selection.
+      this.clampSelectedProgress();
+      target = { world: this.selectedWorld, stage: this.selectedStage };
+    } else if (arguments.length === 1) {
+      // Legacy flat-level signature startGame(1..30). Also used by the loss
+      // restart below via startGame(1, 1) instead.
+      const requested = Number.isFinite(world) ? world : this.selectedLevel;
+      target = this.levelToWorldStage(
+        Phaser.Math.Clamp(
+          Math.round(requested) || 1,
+          1,
+          Math.max(1, this.maxUnlockedLevel),
+        ),
+      );
+    } else {
+      const targetWorld = Phaser.Math.Clamp(
+        Math.round(world) || 1,
+        1,
+        Math.max(1, this.maxUnlockedWorld),
+      );
+      const maxStage = Math.max(1, this.getMaxStageForWorld(targetWorld));
+      target = {
+        world: targetWorld,
+        stage: Phaser.Math.Clamp(Math.round(stage) || 1, 1, maxStage),
+      };
+    }
+
+    this.currentWorld = target.world;
+    this.currentStage = target.stage;
+    this.selectedWorld = target.world;
+    this.selectedStage = target.stage;
+    this.selectedLevel = this.worldStageToLevel(target.world, target.stage);
     this.score = 0;
     this.startLevel();
   }
 
-  // Begin (or continue into) the current level. Score and currentLevel are
-  // intentionally NOT reset here so clearing a level preserves the run score.
+  // Begin (or continue into) the current World/Stage. Score, currentWorld and
+  // currentStage are intentionally NOT reset here so clearing a stage keeps
+  // the cumulative run score.
   startLevel() {
     this.destroyOverlays();
     this.clearRoundObjects();
 
-    // Build the level's track before anything else can reference it. The
+    this.applyWorldBackdrop(this.currentWorld);
+
+    // Build the stage's track(s) before anything else can reference them. The
     // selection happens here (not in create()) so the start menu has no track
-    // and every level gets its own spline + freshly drawn visuals.
-    this.buildLevelTrack();
+    // and every stage gets freshly built spline(s) + visuals. World 3 builds
+    // two independent chain contexts; Worlds 1-2 build a single one.
+    this.buildLevelTracks();
     this.createMarbles();
-    this.createTrack();
+    this.createTracks();
 
     this.gameState = 'PLAYING';
     this.spawnedMarblesCount = 0;
+    this.spawnChainCursor = 0;
     this.bonusTimer = 0;
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
     this.pauseTimer = 0;
+    this.sniperBuffActive = false;
+    this.sniperTimer = 0;
+    if (this.sniperLaser) {
+      this.sniperLaser.destroy();
+      this.sniperLaser = null;
+    }
+    this.sniperLaserTarget = null;
+    this.sniperLaserEnd = null;
+    this.sniperLaserVisible = false;
     this.chainComplete = false;
     this.chainHeadDistance = 0;
     this.levelWon = false;
-    // Reset the launcher queue inside the palette that is active for this
-    // level (also covers jumping levels through the home selector).
+    // Reset the launcher queue inside the palette active for this stage (also
+    // covers jumping stages/worlds through the home selector).
     const activeColorCount = this.getActiveColorCount();
     this.currentBulletColor = INITIAL_CURRENT_COLOR % activeColorCount;
     this.nextBulletColor = INITIAL_NEXT_COLOR % activeColorCount;
@@ -702,15 +1201,32 @@ export class GameScene extends Phaser.Scene {
     this.cameras.main.resetFX();
   }
 
-  // Called by the win overlay ("NEXT LEVEL"): advance the level while keeping
-  // the cumulative score, then rebuild the board for the new level total/speed.
+  // Called by the win overlay ("進入下一關"): advance Stage 1..10, rolling
+  // Stage 10 into the next World. At the W3S10 cap the same final stage is
+  // replayed. Cumulative score is preserved.
   startNextLevel() {
     if (this.gameState !== 'GAMEOVER' || !this.levelWon) {
       return;
     }
 
-    this.currentLevel += 1;
-    this.selectedLevel = this.currentLevel;
+    const next = this.getNextWorldStage();
+    const currentFlat = this.worldStageToLevel(
+      this.currentWorld,
+      this.currentStage,
+    );
+    const nextFlat = this.worldStageToLevel(next.world, next.stage);
+
+    if (nextFlat > currentFlat) {
+      this.currentWorld = next.world;
+      this.currentStage = next.stage;
+    }
+
+    this.selectedWorld = this.currentWorld;
+    this.selectedStage = this.currentStage;
+    this.selectedLevel = this.worldStageToLevel(
+      this.currentWorld,
+      this.currentStage,
+    );
     this.startLevel();
   }
 
@@ -722,23 +1238,57 @@ export class GameScene extends Phaser.Scene {
     this.gameState = 'GAMEOVER';
     this.levelWon = isWin;
     this.slowdownTimer = 0;
+    this.sniperBuffActive = false;
+    this.sniperTimer = 0;
+    this.hideSniperLaser();
 
     if (isWin) {
       this.addScore(WIN_BONUS);
 
-      // Clearing a level unlocks the next one on the home selector; persist
-      // immediately so a reload cannot lose the unlocked progress.
-      this.maxUnlockedLevel = Math.max(
-        this.maxUnlockedLevel,
-        this.currentLevel + 1,
+      // Clearing a stage unlocks the next one (Stage 10 -> next World Stage
+      // 1, capped at W3S10) and persists the highest unlock immediately.
+      const next = this.getNextWorldStage();
+      const nextLevel = this.worldStageToLevel(next.world, next.stage);
+
+      if (nextLevel > this.maxUnlockedLevel) {
+        if (next.world > this.maxUnlockedWorld) {
+          this.maxUnlockedWorld = next.world;
+          this.maxUnlockedStage = next.stage;
+        } else if (next.world === this.maxUnlockedWorld) {
+          this.maxUnlockedStage = Math.max(
+            this.maxUnlockedStage,
+            next.stage,
+          );
+        }
+
+        this.maxUnlockedLevel = this.worldStageToLevel(
+          this.maxUnlockedWorld,
+          this.maxUnlockedStage,
+        );
+        this.saveProgress();
+      }
+
+      this.selectedWorld = this.currentWorld;
+      this.selectedStage = this.currentStage;
+      this.selectedLevel = this.worldStageToLevel(
+        this.currentWorld,
+        this.currentStage,
       );
-      this.saveMaxUnlockedLevel();
-      this.selectedLevel = this.currentLevel;
     }
 
     this.setHudVisible(false);
     this.setLauncherVisible(false);
     this.showGameOverOverlay(isWin);
+  }
+
+  getTotalChainMarbles() {
+    let total = 0;
+
+    for (const chain of this.chains) {
+      total += chain.marbles.length;
+    }
+
+    return total;
   }
 
   checkWinCondition() {
@@ -748,7 +1298,7 @@ export class GameScene extends Phaser.Scene {
 
     if (
       this.spawnedMarblesCount >= this.getTotalMarbles() &&
-      this.marbles.length === 0
+      this.getTotalChainMarbles() === 0
     ) {
       this.endGame(true);
     }
@@ -767,49 +1317,34 @@ export class GameScene extends Phaser.Scene {
 
     this.bonusTimer = Math.max(0, this.bonusTimer - BONUS_SPAWN_INTERVAL);
 
-    if (this.bonusItems.length < BONUS_COUNT) {
+    if (this.bonusItems.length < this.getBonusCap()) {
       this.spawnRandomBonusItem();
     }
   }
 
   spawnRandomBonusItem() {
-    const anchors = Phaser.Utils.Array.Shuffle([
-      { x: 240, y: 220 },
-      { x: 560, y: 220 },
-      { x: 200, y: 300 },
-      { x: 600, y: 300 },
-      { x: 240, y: 260 },
-      { x: 560, y: 260 },
-    ]);
+    // Prefer a non-gap pickup; on the World 3 dual-track board most firing
+    // lanes cross a track, so fall back to any clear spot to respect the cap.
+    const spot =
+      this.findOpenBonusSpot(this.bonusItems, false) ||
+      this.findOpenBonusSpot(this.bonusItems, true);
 
-    for (const anchor of anchors) {
-      const x = Phaser.Math.Clamp(
-        anchor.x + Phaser.Math.Between(-15, 15),
-        70,
-        VIEW_WIDTH - 70,
-      );
-      const y = Phaser.Math.Clamp(
-        anchor.y + Phaser.Math.Between(-15, 15),
-        80,
-        VIEW_HEIGHT - 70,
-      );
-
-      if (
-        this.isBonusPositionClear(x, y, this.bonusItems, 48) &&
-        !this.shotPathCrossesTrack(x, y)
-      ) {
-        this.spawnBonusItem(x, y);
-        return true;
-      }
+    if (!spot) {
+      return false;
     }
 
-    return false;
+    this.spawnBonusItem(spot.x, spot.y);
+    return true;
   }
 
   createMenu() {
     this.destroyOverlays();
     this.setHudVisible(false);
     this.setLauncherVisible(false);
+
+    // The home screen previews the selected world's backdrop palette.
+    this.applyWorldBackdrop(this.selectedWorld);
+    const theme = this.getWorldTheme(this.selectedWorld);
 
     const overlay = this.add
       .container(0, 0)
@@ -820,21 +1355,21 @@ export class GameScene extends Phaser.Scene {
       CENTER_Y,
       VIEW_WIDTH,
       VIEW_HEIGHT,
-      0x041009,
-      0.8,
+      Phaser.Display.Color.HexStringToColor(theme.menuTint).color,
+      0.72,
     );
 
     const kicker = this.add
-      .text(CENTER_X, 126, '叢林探險', {
+      .text(CENTER_X, 104, `${theme.name}探險`, {
         fontFamily: UI_FONT,
         fontSize: '13px',
-        color: '#c6d5ad',
+        color: theme.accent,
       })
       .setOrigin(0.5)
       .setAlpha(0.72);
 
     const title = this.add
-      .text(CENTER_X, 190, '祖瑪：叢林探險', {
+      .text(CENTER_X, 166, '祖瑪：叢林探險', {
         fontFamily: UI_FONT,
         fontSize: '54px',
         color: '#f7e9c2',
@@ -844,7 +1379,7 @@ export class GameScene extends Phaser.Scene {
 
     const rule = this.add.rectangle(
       CENTER_X,
-      242,
+      214,
       260,
       1,
       0xd7c17d,
@@ -854,7 +1389,7 @@ export class GameScene extends Phaser.Scene {
     const highScore = this.add
       .text(
         CENTER_X,
-        278,
+        242,
         `最高分  ${this.formatScore(this.highScore)}`,
         {
           fontFamily: UI_FONT,
@@ -865,88 +1400,190 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(0.5)
       .setAlpha(0.8);
 
-    const hint = this.add
-      .text(CENTER_X, 346, '同色三消 · 引爆炸彈 · 收集星星', {
+    // Two-tier World / Stage selector. Every choice is a Graphics pill with a
+    // centred label and its own interactive Zone; locked choices stay grey and
+    // non-interactive so they can never start a run or fire a marble.
+    this.menuWorldButtons = [];
+    this.menuStageButtons = [];
+
+    const makeChoiceButton = ({
+      kind,
+      value,
+      x,
+      y,
+      width,
+      height,
+      label,
+      locked,
+      selected,
+      onPick,
+    }) => {
+      const record = {
+        kind,
+        value,
+        x,
+        y,
+        width,
+        height,
+        locked,
+        selected,
+        bg: null,
+        label: null,
+        zone: null,
+      };
+
+      record.bg = this.add.graphics();
+      record.label = this.add
+        .text(x, y, label, {
+          fontFamily: UI_FONT,
+          fontSize: '13px',
+          color: '#d9c68c',
+        })
+        .setOrigin(0.5);
+
+      record.zone = this.add.zone(x, y, width, height).setOrigin(0.5);
+
+      if (!locked) {
+        record.zone.setInteractive({ useHandCursor: true });
+
+        record.zone.on('pointerover', () => {
+          record.label.setColor('#fff4c9');
+        });
+
+        record.zone.on('pointerout', () => {
+          this.paintMenuChoice(record);
+        });
+
+        record.zone.on('pointerdown', (pointer, _localX, _localY, event) => {
+          // Selector presses must never fall through to the scene handler,
+          // which would otherwise launch a run or shoot a marble.
+          event.stopPropagation();
+          this.menuControlDownTime = pointer.downTime;
+          onPick();
+        });
+      }
+
+      this.paintMenuChoice(record);
+      return record;
+    };
+
+    const worldY = 286;
+    const worldWidth = 104;
+    const worldHeight = 32;
+    const worldGap = 12;
+    const worldStartX =
+      CENTER_X -
+      ((MAX_WORLD * worldWidth + (MAX_WORLD - 1) * worldGap) / 2);
+
+    const worldCaption = this.add
+      .text(worldStartX - 10, worldY, '世界', {
         fontFamily: UI_FONT,
-        fontSize: '13px',
+        fontSize: '11px',
+        color: theme.accent,
+      })
+      .setOrigin(1, 0.5)
+      .setAlpha(0.55);
+
+    for (let world = 1; world <= MAX_WORLD; world += 1) {
+      const worldTheme = this.getWorldTheme(world);
+      const x =
+        worldStartX + (world - 1) * (worldWidth + worldGap) + worldWidth / 2;
+
+      this.menuWorldButtons.push(
+        makeChoiceButton({
+          kind: 'world',
+          value: world,
+          x,
+          y: worldY,
+          width: worldWidth,
+          height: worldHeight,
+          label: `${world} · ${worldTheme.name}`,
+          locked: this.isWorldLocked(world),
+          selected: world === this.selectedWorld,
+          onPick: () => {
+            this.selectedWorld = world;
+            this.selectedStage = Phaser.Math.Clamp(
+              this.selectedStage,
+              1,
+              Math.max(1, this.getMaxStageForWorld(world)),
+            );
+            this.createMenu();
+          },
+        }),
+      );
+    }
+
+    const stageY = 334;
+    const stageWidth = 30;
+    const stageHeight = 30;
+    const stageGap = 6;
+    const stageStartX =
+      CENTER_X -
+      ((MAX_STAGE * stageWidth + (MAX_STAGE - 1) * stageGap) / 2);
+
+    const stageLimit = Math.max(
+      1,
+      this.getMaxStageForWorld(this.selectedWorld),
+    );
+
+    const stageCaption = this.add
+      .text(stageStartX - 10, stageY, '關卡', {
+        fontFamily: UI_FONT,
+        fontSize: '11px',
+        color: theme.accent,
+      })
+      .setOrigin(1, 0.5)
+      .setAlpha(0.55);
+
+    for (let stage = 1; stage <= MAX_STAGE; stage += 1) {
+      const x =
+        stageStartX + (stage - 1) * (stageWidth + stageGap) + stageWidth / 2;
+      const locked = stage > stageLimit;
+
+      this.menuStageButtons.push(
+        makeChoiceButton({
+          kind: 'stage',
+          value: stage,
+          x,
+          y: stageY,
+          width: stageWidth,
+          height: stageHeight,
+          label: String(stage),
+          locked,
+          selected: stage === this.selectedStage,
+          onPick: () => {
+            this.selectedStage = stage;
+            this.createMenu();
+          },
+        }),
+      );
+    }
+
+    const selection = this.add
+      .text(
+        CENTER_X,
+        374,
+        `第 ${this.selectedWorld} 世界 · 第 ${this.selectedStage} 關`,
+        {
+          fontFamily: UI_FONT,
+          fontSize: '13px',
+          color: '#ffe39a',
+        },
+      )
+      .setOrigin(0.5)
+      .setAlpha(0.88);
+
+    const hint = this.add
+      .text(CENTER_X, 402, '同色三消 · 引爆炸彈 · 收集星星', {
+        fontFamily: UI_FONT,
+        fontSize: '12px',
         color: '#a9bd96',
       })
       .setOrigin(0.5)
       .setAlpha(0.52);
 
-    // Level selector row: < 第 X 關 >, bounded by the unlocked range.
-    const selectorY = 312;
-
-    const selectorPill = this.add.graphics();
-    selectorPill.fillStyle(0x000000, 0.26);
-    selectorPill.fillRoundedRect(CENTER_X - 112, selectorY - 19, 224, 38, 12);
-    selectorPill.lineStyle(1, 0xd7c17d, 0.26);
-    selectorPill.strokeRoundedRect(
-      CENTER_X - 111.5,
-      selectorY - 18.5,
-      223,
-      37,
-      12,
-    );
-
-    this.menuLevelText = this.add
-      .text(CENTER_X, selectorY, '', {
-        fontFamily: UI_FONT,
-        fontSize: '18px',
-        color: '#ffe39a',
-      })
-      .setOrigin(0.5)
-      .setShadow(0, 2, '#000000', 6, false, true);
-
-    const makeLevelArrow = (x, glyph, delta) => {
-      const arrow = this.add
-        .text(x, selectorY, glyph, {
-          fontFamily: UI_FONT,
-          fontSize: '24px',
-          color: '#ffd98a',
-        })
-        .setOrigin(0.5)
-        .setShadow(0, 2, '#000000', 6, false, true);
-
-      arrow.setInteractive({
-        hitArea: new Phaser.Geom.Rectangle(
-          -18,
-          -12,
-          arrow.width + 36,
-          arrow.height + 24,
-        ),
-        hitAreaCallback: Phaser.Geom.Rectangle.Contains,
-        useHandCursor: true,
-      });
-
-      arrow.on('pointerover', () => {
-        if (arrow.input && arrow.input.enabled) {
-          arrow.setColor('#fff4c9');
-        }
-      });
-
-      arrow.on('pointerout', () => {
-        arrow.setColor(
-          arrow.input && arrow.input.enabled === false ? '#8f7f5c' : '#ffd98a',
-        );
-      });
-
-      arrow.on('pointerdown', (pointer, _localX, _localY, event) => {
-        // This press belongs to the selector: stop it from reaching the
-        // scene-level handler so it cannot start a run or fire a marble.
-        event.stopPropagation();
-        this.menuControlDownTime = pointer.downTime;
-        this.changeSelectedLevel(delta);
-      });
-
-      return arrow;
-    };
-
-    this.menuArrowLeft = makeLevelArrow(CENTER_X - 82, '<', -1);
-    this.menuArrowRight = makeLevelArrow(CENTER_X + 82, '>', 1);
-
     const startButton = this.add
-      .text(CENTER_X, 398, '點擊開始遊戲', {
+      .text(CENTER_X, 442, '點擊開始遊戲', {
         fontFamily: UI_FONT,
         fontSize: '22px',
         color: '#ffe39a',
@@ -954,11 +1591,11 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(0.5)
       .setShadow(0, 2, '#000000', 8, false, true);
 
-    // Explicit start target. The selector arrows sit well outside this zone
-    // and scene-level menu clicks are otherwise inert, so an arrow click (or
-    // any stray click on the title/high score) can never launch a run.
+    // Explicit start target. The selector pills sit well outside this zone and
+    // scene-level menu clicks are otherwise inert, so a selector click (or a
+    // stray click on the title / high score) can never launch a run.
     this.menuStartHitArea = this.add
-      .zone(CENTER_X, 398, 292, 54)
+      .zone(CENTER_X, 442, 292, 54)
       .setOrigin(0.5)
       .setInteractive({ useHandCursor: true });
 
@@ -979,25 +1616,36 @@ export class GameScene extends Phaser.Scene {
       },
     );
 
+    const choiceObjects = [
+      ...this.menuWorldButtons.flatMap((record) => [
+        record.bg,
+        record.label,
+        record.zone,
+      ]),
+      ...this.menuStageButtons.flatMap((record) => [
+        record.bg,
+        record.label,
+        record.zone,
+      ]),
+    ];
+
     overlay.add([
       backdrop,
       kicker,
       title,
       rule,
       highScore,
-      selectorPill,
+      worldCaption,
+      stageCaption,
+      ...choiceObjects,
+      selection,
       hint,
-      this.menuLevelText,
-      this.menuArrowLeft,
-      this.menuArrowRight,
       startButton,
       this.menuStartHitArea,
     ]);
 
     this.menuOverlay = overlay;
     this.menuButton = startButton;
-
-    this.refreshLevelSelector();
 
     this.tweens.add({
       targets: startButton,
@@ -1024,9 +1672,13 @@ export class GameScene extends Phaser.Scene {
     // wipe the drawn spline, its dashes, the start glow and the start ring.
     // The spline itself is rebuilt by the next startLevel().
     this.clearTrackVisuals();
+    this.chains = [];
+    this.primaryChain = null;
     this.track = null;
     this.trackSamples = [];
     this.trackLength = 0;
+    this.deltaT = 0;
+    this.marbles = [];
 
     this.setHudVisible(false);
     this.setLauncherVisible(false);
@@ -1036,6 +1688,15 @@ export class GameScene extends Phaser.Scene {
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
     this.pauseTimer = 0;
+    this.sniperBuffActive = false;
+    this.sniperTimer = 0;
+    if (this.sniperLaser) {
+      this.sniperLaser.destroy();
+      this.sniperLaser = null;
+    }
+    this.sniperLaserTarget = null;
+    this.sniperLaserEnd = null;
+    this.sniperLaserVisible = false;
     this.bonusTimer = 0;
     this.chainComplete = false;
     this.levelWon = false;
@@ -1044,12 +1705,22 @@ export class GameScene extends Phaser.Scene {
     // screen is presented cleanly.
     this.cameras.main.resetFX();
 
-    // The home selector picks up the level the player was just on, clamped
-    // to the unlocked range, so returning home never shows a locked level.
-    this.selectedLevel = Phaser.Math.Clamp(
-      Math.round(this.currentLevel) || 1,
+    // The home selector picks up the World/Stage the player was just on,
+    // clamped to the unlocked range, so returning home never shows a locked
+    // stage.
+    this.selectedWorld = Phaser.Math.Clamp(
+      Math.round(this.currentWorld) || 1,
       1,
-      Math.max(1, this.maxUnlockedLevel),
+      Math.max(1, this.maxUnlockedWorld),
+    );
+    this.selectedStage = Phaser.Math.Clamp(
+      Math.round(this.currentStage) || 1,
+      1,
+      Math.max(1, this.getMaxStageForWorld(this.selectedWorld)),
+    );
+    this.selectedLevel = this.worldStageToLevel(
+      this.selectedWorld,
+      this.selectedStage,
     );
 
     this.destroyOverlays();
@@ -1235,7 +1906,12 @@ export class GameScene extends Phaser.Scene {
       this.textures.addCanvas('zs-backdrop', canvas);
     }
 
-    this.add.image(0, 0, 'zs-backdrop').setOrigin(0).setDepth(DEPTH.backdrop);
+    this.createWorldBackdropVariants();
+
+    this.backdropImage = this.add
+      .image(0, 0, 'zs-backdrop')
+      .setOrigin(0)
+      .setDepth(DEPTH.backdrop);
 
     if (!this.textures.exists('zs-vignette')) {
       const canvas = document.createElement('canvas');
@@ -1260,8 +1936,12 @@ export class GameScene extends Phaser.Scene {
       this.textures.addCanvas('zs-vignette', canvas);
     }
 
-    this.add.image(0, 0, 'zs-vignette').setOrigin(0).setDepth(DEPTH.vignette);
+    this.vignetteImage = this.add
+      .image(0, 0, 'zs-vignette')
+      .setOrigin(0)
+      .setDepth(DEPTH.vignette);
     this.createFoliage();
+    this.applyWorldBackdrop(this.selectedWorld);
   }
 
   createFoliage() {
@@ -1297,15 +1977,15 @@ export class GameScene extends Phaser.Scene {
       { x: 164, y: -24, angle: 8, scale: 0.9, alpha: 0.3 },
     ];
 
-    placements.forEach(({ x, y, angle, scale, alpha }) => {
+    this.foliageSprites = placements.map(({ x, y, angle, scale, alpha }) =>
       this.add
         .image(x, y, 'zs-leaf')
         .setOrigin(0, 0.5)
         .setAngle(angle)
         .setScale(scale)
         .setAlpha(alpha)
-        .setDepth(DEPTH.foliage);
-    });
+        .setDepth(DEPTH.foliage),
+    );
   }
 
   /* ------------------------------------------------------------------ */
@@ -1314,112 +1994,224 @@ export class GameScene extends Phaser.Scene {
 
   // Pick the layout for the current level and rebuild the arc-length cache.
   // Called from startLevel() every time a level begins.
-  buildLevelTrack() {
-    const layout =
-      TRACK_LAYOUTS[(Math.max(1, this.currentLevel) - 1) % TRACK_LAYOUTS.length];
-
-    this.track = new Phaser.Curves.Spline(
+  // Build one independent chain context around a spline layout. Every value
+  // that used to be a single scene field (track, length, samples, deltaT,
+  // marbles, head metrics) lives here so Worlds 1-2 can run one chain and
+  // World 3 can run two without sharing any state.
+  createChainContext(layout, index) {
+    const track = new Phaser.Curves.Spline(
       layout.map(([x, y]) => new Phaser.Math.Vector2(x, y)),
     );
-    this.trackLength = this.track.getLength();
-    this.trackSamples = this.track.getSpacedPoints(240);
+    const trackLength = track.getLength();
+
+    return {
+      index,
+      isInner: index > 0,
+      track,
+      trackLength,
+      trackSamples: track.getSpacedPoints(240),
+      deltaT: trackLength > 0 ? BALL_DIAMETER / trackLength : 0,
+      marbles: [],
+      headDistance: 0,
+      chainComplete: false,
+      trackGraphics: null,
+      trackDebugGraphics: null,
+      startGlow: null,
+      startRing: null,
+      tunnelEntrance: null,
+    };
+  }
+
+  buildLevelTracks() {
+    // Drop the previous stage's drawn splines/glow/ring/tunnels BEFORE the
+    // chain contexts are replaced, otherwise their visual references would be
+    // orphaned and old track traces would survive the level change.
+    this.clearTrackVisuals();
+
+    const difficulty = Math.max(1, this.getDifficulty());
+    const layoutIndex = (difficulty - 1) % TRACK_LAYOUTS.length;
+    const layouts = [TRACK_LAYOUTS[layoutIndex]];
+
+    // World 3 (D >= 21) gets a second, independent inner spline.
+    if (this.isDualTrack()) {
+      const innerIndex =
+        (Math.max(21, difficulty) - 21) % DUAL_INNER_LAYOUTS.length;
+      layouts.push(DUAL_INNER_LAYOUTS[innerIndex]);
+    }
+
+    this.chains = layouts.map((layout, index) =>
+      this.createChainContext(layout, index),
+    );
+    this.syncPrimaryAliases();
 
     return this.track;
   }
 
-  // Remove every display object that belongs to the current track (drawn
-  // spline + debug dashes + start glow/ring and their tweens). Safe to call
-  // when no track exists, which is the case on the start menu.
+  // Compatibility alias for tooling that still calls the old single-track
+  // builder name.
+  buildLevelTrack() {
+    return this.buildLevelTracks();
+  }
+
+  // Keep the historic single-track fields pointing at chain 0. Gameplay code
+  // uses chain contexts directly; older UI/tooling can keep reading these.
+  syncPrimaryAliases() {
+    const primary = this.chains[0] ?? null;
+    this.primaryChain = primary;
+    this.track = primary ? primary.track : null;
+    this.trackLength = primary ? primary.trackLength : 0;
+    this.trackSamples = primary ? primary.trackSamples : [];
+    this.deltaT = primary ? primary.deltaT : 0;
+    this.marbles = primary ? primary.marbles : [];
+    this.chainHeadDistance = primary ? primary.headDistance : 0;
+    this.chainComplete = primary ? primary.chainComplete : false;
+    this.trackGraphics = primary ? primary.trackGraphics : null;
+    this.trackDebugGraphics = primary ? primary.trackDebugGraphics : null;
+    this.startGlow = primary ? primary.startGlow : null;
+    this.startRing = primary ? primary.startRing : null;
+    this.tunnelEntrance = primary ? primary.tunnelEntrance : null;
+  }
+
+  refreshChainMetrics(chain) {
+    const front = chain.marbles[0];
+    chain.headDistance = front ? front.t * chain.trackLength : 0;
+    chain.chainComplete = front
+      ? front.t >= 1
+      : this.spawnedMarblesCount >= this.getTotalMarbles();
+  }
+
+  // Remove every display object that belongs to the active tracks (drawn
+  // splines + debug dashes + start glow/ring/tunnels and their tweens). Safe
+  // to call when no track exists, which is the case on the start menu.
   clearTrackVisuals() {
-    if (this.startRing) {
-      this.tweens.killTweensOf(this.startRing);
-      this.startRing.destroy();
-      this.startRing = null;
+    const destroyWithTweens = (ref) => {
+      if (!ref) {
+        return;
+      }
+
+      this.tweens.killTweensOf(ref);
+      ref.destroy();
+    };
+
+    const cleared = new Set();
+
+    for (const chain of this.chains) {
+      for (const key of [
+        'startRing',
+        'startGlow',
+        'tunnelEntrance',
+        'trackGraphics',
+        'trackDebugGraphics',
+      ]) {
+        const ref = chain[key];
+
+        if (ref) {
+          cleared.add(ref);
+          destroyWithTweens(ref);
+          chain[key] = null;
+        }
+      }
     }
 
-    if (this.startGlow) {
-      this.tweens.killTweensOf(this.startGlow);
-      this.startGlow.destroy();
-      this.startGlow = null;
-    }
+    // Defensive cleanup for legacy single-track references that are not part
+    // of a chain context (for example a leftover from old tooling).
+    for (const key of [
+      'startRing',
+      'startGlow',
+      'tunnelEntrance',
+      'trackGraphics',
+      'trackDebugGraphics',
+    ]) {
+      const ref = this[key];
 
-    if (this.tunnelEntrance) {
-      this.tunnelEntrance.destroy();
-      this.tunnelEntrance = null;
-    }
+      if (ref && !cleared.has(ref)) {
+        destroyWithTweens(ref);
+      }
 
-    if (this.trackGraphics) {
-      this.trackGraphics.destroy();
-      this.trackGraphics = null;
-    }
-
-    if (this.trackDebugGraphics) {
-      this.trackDebugGraphics.destroy();
-      this.trackDebugGraphics = null;
+      this[key] = null;
     }
   }
 
-  createTrack() {
-    // Never draw over a previous layout: drop any stale graphics/glow/ring
-    // before rebuilding for the (possibly new) spline.
+  // Redraw every active chain's spline, debug dashes, start glow/ring and
+  // tunnel entrance. Called once per stage after all chain contexts exist.
+  createTracks() {
     this.clearTrackVisuals();
 
-    const samples = this.track.getSpacedPoints(280);
+    for (const chain of this.chains) {
+      this.createTrackForChain(chain);
+    }
+
+    this.syncPrimaryAliases();
+  }
+
+  // Compatibility alias for tooling that calls createTrack() directly.
+  createTrack() {
+    this.createTracks();
+  }
+
+  createTrackForChain(chain) {
+    const style = chain.isInner ? INNER_TRACK_STYLE : OUTER_TRACK_STYLE;
+    const samples = chain.track.getSpacedPoints(280);
     const shadowSamples = samples.map(
       (point) => new Phaser.Math.Vector2(point.x + 5, point.y + 8),
     );
 
-    const track = (this.trackGraphics = this.add
+    const track = (chain.trackGraphics = this.add
       .graphics()
       .setDepth(DEPTH.track));
 
-    track.lineStyle(28, 0x000000, 0.26);
+    track.lineStyle(28, style.shadow, style.shadowAlpha);
     track.strokePoints(shadowSamples, false, false);
 
-    track.lineStyle(22, 0x09190e, 0.95);
+    track.lineStyle(22, style.baseDark, 0.95);
     track.strokePoints(samples, false, false);
 
-    track.lineStyle(14, 0x2b4b31, 1);
+    track.lineStyle(14, style.base, 1);
     track.strokePoints(samples, false, false);
 
-    track.lineStyle(1, 0xa4bb87, 0.2);
+    track.lineStyle(1, style.highlight, 0.2);
     track.strokePoints(samples, false, false);
 
     // The dashed line is the visual debug overlay asked for in phase 01.
-    // It follows the exact same arc-length curve used by the marbles.
-    const debugLine = (this.trackDebugGraphics = this.add
+    // It follows the exact same arc-length curve used by the chain.
+    const debugLine = (chain.trackDebugGraphics = this.add
       .graphics()
       .setDepth(DEPTH.trackDebug));
-    debugLine.lineStyle(1.5, 0xe7efc4, 0.52);
+    debugLine.lineStyle(1.5, style.debug, 0.52);
 
     const dashLength = 10;
     const dashGap = 12;
-    for (let distance = 0; distance < this.trackLength; distance += dashLength + dashGap) {
-      const from = this.track.getPointAt(distance / this.trackLength);
-      const to = this.track.getPointAt(
-        Math.min(distance + dashLength, this.trackLength) / this.trackLength,
+    for (
+      let distance = 0;
+      distance < chain.trackLength;
+      distance += dashLength + dashGap
+    ) {
+      const from = chain.track.getPointAt(distance / chain.trackLength);
+      const to = chain.track.getPointAt(
+        Math.min(distance + dashLength, chain.trackLength) /
+          chain.trackLength,
       );
       debugLine.lineBetween(from.x, from.y, to.x, to.y);
     }
 
-    const start = this.track.getPointAt(0);
+    const start = chain.track.getPointAt(0);
 
-    this.startGlow = this.add
-      .circle(start.x, start.y, 19, 0xe8cf82, 0.08)
+    chain.startGlow = this.add
+      .circle(start.x, start.y, 19, style.glow, 0.08)
       .setDepth(DEPTH.trackDebug);
-    this.startRing = this.add
+    chain.startRing = this.add
       .circle(start.x, start.y, 10)
-      .setStrokeStyle(1.5, 0xe8cf82, 0.52)
+      .setStrokeStyle(1.5, style.ring, 0.52)
       .setDepth(DEPTH.trackDebug);
 
     // Dark jungle cave mouth at the track start, rebuilt for every layout.
     // It sits ABOVE the marble layer (DEPTH.balls + 1) so a freshly spawned
     // ball at t = 0 is hidden under the tunnel and only becomes visible as it
     // rolls out of the mouth.
-    const startTangent = this.track.getTangentAt(0).normalize();
+    const startTangent = chain.track.getTangentAt(0).normalize();
     const startAngle = Math.atan2(startTangent.y, startTangent.x);
     const tunnelRadius = 30;
-    const tunnel = (this.tunnelEntrance = this.add
+    const tunnel = (chain.tunnelEntrance = this.add
       .graphics()
       .setPosition(start.x, start.y)
       .setRotation(startAngle)
@@ -1464,7 +2256,7 @@ export class GameScene extends Phaser.Scene {
     tunnel.fillCircle(-tunnelRadius + 7, -tunnelRadius + 5, 2.5);
 
     this.tweens.add({
-      targets: this.startRing,
+      targets: chain.startRing,
       scale: 2.4,
       alpha: 0,
       duration: 2400,
@@ -1473,7 +2265,7 @@ export class GameScene extends Phaser.Scene {
     });
 
     this.tweens.add({
-      targets: this.startGlow,
+      targets: chain.startGlow,
       alpha: { from: 0.08, to: 0.015 },
       duration: 1500,
       ease: 'Sine.easeInOut',
@@ -1489,12 +2281,18 @@ export class GameScene extends Phaser.Scene {
   createMarbles() {
     this.createMarbleTextures();
 
-    this.deltaT = BALL_DIAMETER / this.trackLength;
+    for (const chain of this.chains) {
+      chain.marbles = [];
+      chain.headDistance = 0;
+      chain.chainComplete = false;
+    }
+
+    this.syncPrimaryAliases();
     this.initialGapT = this.deltaT;
     this.chainComplete = false;
     this.chainHeadDistance = 0;
     this.spawnedMarblesCount = 0;
-    this.marbles = [];
+    this.spawnChainCursor = 0;
   }
 
   trySpawnMarble() {
@@ -1506,28 +2304,49 @@ export class GameScene extends Phaser.Scene {
       return false;
     }
 
-    if (
-      this.marbles.length > 0 &&
-      this.marbles[this.marbles.length - 1].t <= this.deltaT
-    ) {
+    // A chain can accept a marble once its tail has cleared the tunnel mouth.
+    // In World 3 both chains are eligible independently; the round-robin
+    // cursor spreads the global level total across both tracks.
+    const eligible = this.chains.filter((chain) => {
+      if (chain.marbles.length === 0) {
+        return true;
+      }
+
+      return (
+        chain.marbles[chain.marbles.length - 1].t > chain.deltaT
+      );
+    });
+
+    if (eligible.length === 0) {
       return false;
     }
 
-    // Only the palette unlocked for this level may spawn on the chain.
-    const colorIndex = Phaser.Math.Between(0, this.getActiveColorCount() - 1);
-    const marble = this.createPathMarble(colorIndex, 0);
+    const chain = eligible[this.spawnChainCursor % eligible.length];
+    this.spawnChainCursor =
+      (this.spawnChainCursor + 1) % Math.max(1, this.chains.length);
 
-    // One mutually exclusive special roll (bomb, then reverse, then pause);
-    // the odds grow with the level difficulty.
+    // Only the palette unlocked for this difficulty may spawn on the chain.
+    const colorIndex = Phaser.Math.Between(0, this.getActiveColorCount() - 1);
+    const marble = this.createPathMarble(chain, colorIndex, 0);
+
+    // One mutually exclusive special roll (bomb -> reverse -> pause ->
+    // sniper); the first three grow with absolute difficulty (World/Stage),
+    // sniper is a fixed documented ~5% chance.
     const chances = this.getSpecialChances();
     const specialRoll = Phaser.Math.FloatBetween(0, 1);
     const reverseThreshold = chances.bomb + chances.reverse;
     const pauseThreshold = reverseThreshold + chances.pause;
+    const sniperThreshold = pauseThreshold + chances.sniper;
 
     marble.isBomb = specialRoll < chances.bomb;
     marble.isReverse = !marble.isBomb && specialRoll < reverseThreshold;
     marble.isPause =
       !marble.isBomb && !marble.isReverse && specialRoll < pauseThreshold;
+    marble.isSniper =
+      !marble.isBomb &&
+      !marble.isReverse &&
+      !marble.isPause &&
+      specialRoll < sniperThreshold;
 
     if (marble.isBomb) {
       marble.setTexture(`zs-marble-bomb-${colorIndex}`);
@@ -1535,11 +2354,15 @@ export class GameScene extends Phaser.Scene {
       marble.setTexture(`zs-marble-reverse-${colorIndex}`);
     } else if (marble.isPause) {
       marble.setTexture(`zs-marble-pause-${colorIndex}`);
+    } else if (marble.isSniper) {
+      marble.setTexture(`zs-marble-sniper-${colorIndex}`);
     }
 
-    this.marbles.push(marble);
+    chain.marbles.push(marble);
     this.spawnedMarblesCount += 1;
-    this.chainComplete = false;
+    chain.chainComplete = false;
+    this.refreshChainMetrics(chain);
+    this.syncPrimaryAliases();
     this.updateChainPositions();
     this.updateMarbleCount();
 
@@ -1555,13 +2378,34 @@ export class GameScene extends Phaser.Scene {
     this.trySpawnMarble();
   }
 
-  createPathMarble(colorIndex, t, x = 0, y = 0) {
+  // Attach a marble to a specific chain. New code passes
+  // (chain, colorIndex, t, x, y); the old (colorIndex, t, x, y) signature is
+  // still accepted and targets the primary chain for older tooling.
+  createPathMarble(...args) {
+    let chain;
+    let colorIndex;
+    let t;
+    let x = 0;
+    let y = 0;
+
+    if (typeof args[0] === 'number') {
+      chain = this.chains[0] ?? null;
+      [colorIndex, t, x = 0, y = 0] = args;
+    } else {
+      [chain, colorIndex, t, x = 0, y = 0] = args;
+    }
+
+    if (!chain) {
+      return null;
+    }
+
     const marble = this.add
-      .follower(this.track, x, y, `zs-marble-${colorIndex}`)
+      .follower(chain.track, x, y, `zs-marble-${colorIndex}`)
       .setDepth(DEPTH.balls)
       .setData('type', 'marble')
       .setData('colorIndex', colorIndex);
 
+    marble.chain = chain;
     marble.colorIndex = colorIndex;
     marble.t = Phaser.Math.Clamp(t, 0, 1);
     marble.pushOffset = 0;
@@ -1569,14 +2413,18 @@ export class GameScene extends Phaser.Scene {
     marble.isBomb = false;
     marble.isReverse = false;
     marble.isPause = false;
+    marble.isSniper = false;
 
     return marble;
   }
 
-  normalizePushedChain() {
-    if (this.marbles.length === 0) {
+  normalizePushedChain(chain = this.chains[0]) {
+    if (!chain || chain.marbles.length === 0) {
       return;
     }
+
+    const marbles = chain.marbles;
+    const deltaT = chain.deltaT;
 
     // If pushing a marble past the entrance would put it below t = 0, slide
     // the whole chain forward by the deficit. The spacing relative to the
@@ -1584,14 +2432,14 @@ export class GameScene extends Phaser.Scene {
     let minT = Infinity;
     let maxT = -Infinity;
 
-    for (const marble of this.marbles) {
+    for (const marble of marbles) {
       minT = Math.min(minT, marble.t);
       maxT = Math.max(maxT, marble.t);
     }
 
     if (minT < 0) {
       const forwardShift = -minT;
-      for (const marble of this.marbles) {
+      for (const marble of marbles) {
         marble.t += forwardShift;
       }
       maxT += forwardShift;
@@ -1599,22 +2447,22 @@ export class GameScene extends Phaser.Scene {
 
     if (maxT > 1) {
       const backwardShift = 1 - maxT;
-      for (const marble of this.marbles) {
+      for (const marble of marbles) {
         marble.t += backwardShift;
       }
     }
 
     // Safety net: no pair may be closer than one physical diameter, even
     // after boundary shifts or floating-point drift.
-    for (let index = 1; index < this.marbles.length; index += 1) {
-      const maxTrailingT = this.marbles[index - 1].t - this.deltaT;
+    for (let index = 1; index < marbles.length; index += 1) {
+      const maxTrailingT = marbles[index - 1].t - deltaT;
 
-      if (this.marbles[index].t > maxTrailingT) {
-        this.marbles[index].t = Math.max(0, maxTrailingT);
+      if (marbles[index].t > maxTrailingT) {
+        marbles[index].t = Math.max(0, maxTrailingT);
       }
     }
 
-    for (const marble of this.marbles) {
+    for (const marble of marbles) {
       marble.t = Phaser.Math.Clamp(marble.t, 0, 1);
     }
   }
@@ -1624,7 +2472,8 @@ export class GameScene extends Phaser.Scene {
       this.textures.exists('zs-marble-0') &&
       this.textures.exists('zs-marble-bomb-0') &&
       this.textures.exists('zs-marble-reverse-0') &&
-      this.textures.exists('zs-marble-pause-0')
+      this.textures.exists('zs-marble-pause-0') &&
+      this.textures.exists('zs-marble-sniper-0')
     ) {
       return;
     }
@@ -1773,29 +2622,72 @@ export class GameScene extends Phaser.Scene {
       graphics.fillRoundedRect(center + 2.2, center - 6.4, 4.4, 12.8, 2);
 
       graphics.generateTexture(`zs-marble-pause-${index}`, size, size);
+
+      // Sniper variant: a dark ruby core with a glowing red crosshair and
+      // a small target arrow, so the instant-fire power-up reads instantly.
+      graphics.clear();
+
+      graphics.fillStyle(0x000000, 0.3);
+      graphics.fillCircle(center + 2.5, center + 4.5, BALL_RADIUS + 1);
+      graphics.fillStyle(0x07130b, 1);
+      graphics.fillCircle(center, center, BALL_RADIUS + 2.5);
+      graphics.fillStyle(color, 1);
+      graphics.fillCircle(center, center, BALL_RADIUS);
+      graphics.fillStyle(0x000000, 0.13);
+      graphics.fillCircle(center + 4, center + 5, BALL_RADIUS - 3.5);
+      graphics.fillStyle(0xffffff, 0.16);
+      graphics.fillCircle(center - 6, center - 7, 7.5);
+      graphics.fillStyle(0xffffff, 0.56);
+      graphics.fillCircle(center - 7, center - 8, 3.5);
+      graphics.lineStyle(1.2, 0xffffff, 0.3);
+      graphics.strokeCircle(center, center, BALL_RADIUS - 2.6);
+
+      graphics.fillStyle(0x1c0306, 0.94);
+      graphics.fillCircle(center, center, BALL_RADIUS - 3.2);
+      graphics.lineStyle(3.6, 0xff2d2d, 0.28);
+      graphics.strokeCircle(center, center, BALL_RADIUS - 4.2);
+      graphics.lineStyle(1.8, 0xff4d4d, 0.95);
+      graphics.strokeCircle(center, center, BALL_RADIUS - 6.2);
+
+      // Four crosshair ticks plus a bright centre dot.
+      graphics.lineStyle(2.6, 0xff7a7a, 1);
+      graphics.lineBetween(center - 12.4, center, center - 7.6, center);
+      graphics.lineBetween(center + 7.6, center, center + 12.4, center);
+      graphics.lineBetween(center, center - 12.4, center, center - 7.6);
+      graphics.lineBetween(center, center + 7.6, center, center + 12.4);
+      graphics.fillStyle(0xffe2e2, 1);
+      graphics.fillCircle(center, center, 2.1);
+
+      // Small glowing target arrow near the top edge (aim hint).
+      graphics.fillStyle(0xff3030, 0.95);
+      graphics.beginPath();
+      graphics.moveTo(center, center - 15.2);
+      graphics.lineTo(center - 3.6, center - 10.6);
+      graphics.lineTo(center + 3.6, center - 10.6);
+      graphics.closePath();
+      graphics.fillPath();
+
+      graphics.generateTexture(`zs-marble-sniper-${index}`, size, size);
     });
 
     graphics.destroy();
   }
 
   updateChainMovement(step) {
-    // Pause marble: time is frozen, so the chain holds its exact position
-    // for the whole duration. No tail push, no magnetic catch-up, no
-    // momentum transfer and no combo can run; only the pause timer ticks.
+    // Pause marble: time is frozen for ALL chains. No tail push, magnetic
+    // catch-up, momentum transfer or combo can run; only the timer ticks.
     if (this.pauseTimer > 0) {
       this.pauseTimer = Math.max(0, this.pauseTimer - step);
 
-      for (const marble of this.marbles) {
-        marble.magnetApproaching = false;
+      for (const chain of this.chains) {
+        for (const marble of chain.marbles) {
+          marble.magnetApproaching = false;
+        }
+
+        this.refreshChainMetrics(chain);
       }
 
-      const pausedFront = this.marbles[0];
-      this.chainHeadDistance = pausedFront
-        ? pausedFront.t * this.trackLength
-        : 0;
-      this.chainComplete = pausedFront
-        ? pausedFront.t >= 1
-        : this.spawnedMarblesCount >= this.getTotalMarbles();
+      this.syncPrimaryAliases();
       return;
     }
 
@@ -1807,36 +2699,58 @@ export class GameScene extends Phaser.Scene {
 
     // Reverse-time marble: the timer is read once per frame so the frame
     // that consumes the final chunk of time still reverses; the next frame
-    // falls back to normal forward movement. It also decrements with an
-    // empty chain so a hit can never leave the timer stuck on.
+    // falls back to normal forward movement. It also decrements with empty
+    // chains so a hit can never leave the timer stuck on.
     const isReversing = this.reverseTimer > 0;
 
     if (isReversing) {
       this.reverseTimer = Math.max(0, this.reverseTimer - step);
     }
 
-    if (this.marbles.length === 0) {
-      this.chainHeadDistance = 0;
-      this.chainComplete =
+    for (const chain of this.chains) {
+      this.updateChainMovementForChain(chain, step, isSlowed, isReversing);
+    }
+
+    this.syncPrimaryAliases();
+
+    // Any chain reaching the end of its own track ends the run.
+    if (
+      this.gameState === 'PLAYING' &&
+      this.chains.some(
+        (chain) => chain.marbles.length > 0 && chain.marbles[0].t >= 1,
+      )
+    ) {
+      this.endGame(false);
+    }
+  }
+
+  updateChainMovementForChain(chain, step, isSlowed, isReversing) {
+    const marbles = chain.marbles;
+    const trackLength = chain.trackLength;
+    const deltaT = chain.deltaT;
+
+    if (marbles.length === 0) {
+      chain.headDistance = 0;
+      chain.chainComplete =
         this.spawnedMarblesCount >= this.getTotalMarbles();
       return;
     }
 
     const chainSpeed = this.getChainSpeed();
     const standardTravelT =
-      (chainSpeed * (isSlowed ? 0.3 : 1) * step) / this.trackLength;
+      (chainSpeed * (isSlowed ? 0.3 : 1) * step) / trackLength;
     const catchUpTravelT =
-      (chainSpeed * CATCH_UP_MULTIPLIER * step) / this.trackLength;
+      (chainSpeed * CATCH_UP_MULTIPLIER * step) / trackLength;
 
     // Step 1: split the array wherever a real physical gap exists.
     const segments = [];
-    let segment = [this.marbles[0]];
+    let segment = [marbles[0]];
 
-    for (let index = 1; index < this.marbles.length; index += 1) {
-      const ahead = this.marbles[index - 1];
-      const marble = this.marbles[index];
+    for (let index = 1; index < marbles.length; index += 1) {
+      const ahead = marbles[index - 1];
+      const marble = marbles[index];
 
-      if (ahead.t - marble.t > this.deltaT + 0.002) {
+      if (ahead.t - marble.t > deltaT + 0.002) {
         segments.push(segment);
         segment = [marble];
       } else {
@@ -1873,11 +2787,7 @@ export class GameScene extends Phaser.Scene {
         }
       }
 
-      const reverseFront = this.marbles[0];
-      this.chainHeadDistance = reverseFront
-        ? reverseFront.t * this.trackLength
-        : 0;
-      this.chainComplete = reverseFront ? reverseFront.t >= 1 : false;
+      this.refreshChainMetrics(chain);
       return;
     }
 
@@ -1916,7 +2826,7 @@ export class GameScene extends Phaser.Scene {
       // the back towards the front, so the inherited speed keeps propagating
       // into the next stopped car in the same frame: the connected chain is
       // pushed like a train instead of one car at a time.
-      const closingDistance = frontTail.t - rearHead.t - this.deltaT;
+      const closingDistance = frontTail.t - rearHead.t - deltaT;
 
       if (closingDistance <= rear.speed + 0.002) {
         // The inherited speed is capped at the base chain speed. A magnetic
@@ -1942,13 +2852,13 @@ export class GameScene extends Phaser.Scene {
       if (index > 0) {
         const frontRearMarble = segments[index - 1];
         const frontTail = frontRearMarble[frontRearMarble.length - 1];
-        const maxT = frontTail.t - this.deltaT;
+        const maxT = frontTail.t - deltaT;
         const newGap = frontTail.t - nextT;
 
         // The +0.002 grouping tolerance would merge these two segments on
         // the next frame. Treat entering that band as contact now, snap to
         // the rigid spacing, and allow the magnetic combo check to fire.
-        if (nextT >= maxT || newGap <= this.deltaT + 0.002) {
+        if (nextT >= maxT || newGap <= deltaT + 0.002) {
           nextT = maxT;
 
           if (
@@ -1967,7 +2877,7 @@ export class GameScene extends Phaser.Scene {
       for (let cart = 1; cart < current.length; cart += 1) {
         current[cart].t = Math.max(
           0,
-          current[cart - 1].t - this.deltaT,
+          current[cart - 1].t - deltaT,
         );
         current[cart].magnetApproaching = false;
       }
@@ -1984,41 +2894,40 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
-    const currentFront = this.marbles[0];
-    this.chainHeadDistance = currentFront
-      ? currentFront.t * this.trackLength
-      : 0;
-    this.chainComplete = currentFront ? currentFront.t >= 1 : false;
-
-    if (
-      this.gameState === 'PLAYING' &&
-      currentFront &&
-      currentFront.t >= 1
-    ) {
-      this.endGame(false);
-    }
+    this.refreshChainMetrics(chain);
   }
 
   updateChainPositions() {
-    for (const marble of this.marbles) {
-      marble.t = Phaser.Math.Clamp(marble.t, 0, 1);
-      marble.pushOffset = Phaser.Math.Linear(marble.pushOffset ?? 0, 0, 0.15);
+    for (const chain of this.chains) {
+      for (const marble of chain.marbles) {
+        marble.t = Phaser.Math.Clamp(marble.t, 0, 1);
+        marble.pushOffset = Phaser.Math.Linear(
+          marble.pushOffset ?? 0,
+          0,
+          0.15,
+        );
 
-      // Physical progress (t) is authoritative; pushOffset only delays the
-      // visual slide so the insertion reads as a physical shove.
-      const visualT = Phaser.Math.Clamp(
-        marble.t + marble.pushOffset,
-        0,
-        1,
-      );
-      const position = this.track.getPointAt(visualT);
-      marble.setPosition(position.x, position.y);
+        // Physical progress (t) is authoritative; pushOffset only delays the
+        // visual slide so the insertion reads as a physical shove.
+        const visualT = Phaser.Math.Clamp(
+          marble.t + marble.pushOffset,
+          0,
+          1,
+        );
+        const position = chain.track.getPointAt(visualT);
+        marble.setPosition(position.x, position.y);
+      }
     }
   }
 
-  getTrackPoint(distance) {
-    const t = this.trackLength > 0 ? Phaser.Math.Clamp(distance / this.trackLength, 0, 1) : 0;
-    return this.track.getPointAt(t);
+  getTrackPoint(distance, chain = this.chains[0]) {
+    if (!chain || chain.trackLength <= 0) {
+      return new Phaser.Math.Vector2(CENTER_X, CENTER_Y);
+    }
+
+    const t = Phaser.Math.Clamp(distance / chain.trackLength, 0, 1);
+
+    return chain.track.getPointAt(t);
   }
 
   /* ------------------------------------------------------------------ */
@@ -2288,9 +3197,9 @@ export class GameScene extends Phaser.Scene {
       if (this.levelWon) {
         this.startNextLevel();
       } else {
-        // A lost run restarts a fresh run at level 1 with a zeroed score.
-        // Unlocked levels and the high score are preserved.
-        this.startGame(1);
+        // A lost run restarts a fresh run at World 1 Stage 1 with a zeroed
+        // score. Unlocked progress and the high score are preserved.
+        this.startGame(1, 1);
       }
       return;
     }
@@ -2384,11 +3293,18 @@ export class GameScene extends Phaser.Scene {
     sprite.isBomb = false;
     sprite.isReverse = false;
     sprite.isPause = false;
+    sprite.isSniper = false;
+
+    // Sniper buff: near-instant projectiles (swept collision prevents
+    // tunneling in updateShots); normal shots keep the base speed.
+    const shotSpeed = this.sniperBuffActive
+      ? SNIPER_SHOT_SPEED
+      : SHOT_SPEED;
 
     this.shots.push({
       sprite,
-      vx: Math.cos(angle) * SHOT_SPEED,
-      vy: Math.sin(angle) * SHOT_SPEED,
+      vx: Math.cos(angle) * shotSpeed,
+      vy: Math.sin(angle) * shotSpeed,
       radius: SHOT_RADIUS,
       colorIndex,
     });
@@ -2403,16 +3319,34 @@ export class GameScene extends Phaser.Scene {
 
       // Straight-line, constant-speed travel. The direction was captured at
       // the moment of the click and never changes afterwards.
+      const previousX = shot.sprite.x;
+      const previousY = shot.sprite.y;
       shot.sprite.x += shot.vx * step;
       shot.sprite.y += shot.vy * step;
 
-      const marble = this.findMarbleHit(shot);
+      // Sniper instant-fire shots cover up to 10000 px/s, so point tests
+      // would tunnel straight through the target. Sweep the travel segment.
+      const marble = this.sniperBuffActive
+        ? this.findSweptMarbleHit(
+            previousX,
+            previousY,
+            shot.sprite.x,
+            shot.sprite.y,
+          )
+        : this.findMarbleHit(shot);
       if (marble) {
         this.resolveHit(shot, marble);
         continue;
       }
 
-      const bonus = this.findBonusHit(shot);
+      const bonus = this.sniperBuffActive
+        ? this.findSweptBonusHit(
+            previousX,
+            previousY,
+            shot.sprite.x,
+            shot.sprite.y,
+          )
+        : this.findBonusHit(shot);
       if (bonus) {
         this.collectBonus(bonus, shot);
         continue;
@@ -2434,24 +3368,335 @@ export class GameScene extends Phaser.Scene {
   findMarbleHit(shot) {
     const hitDistanceSq = (SHOT_RADIUS + BALL_RADIUS) ** 2;
 
-    for (const marble of this.marbles) {
-      if (!marble.active) {
-        continue;
-      }
+    // Shots search every active chain; the hit marble carries a back-reference
+    // to its own chain so insertion/matching can never leak across tracks.
+    for (const chain of this.chains) {
+      for (const marble of chain.marbles) {
+        if (!marble.active) {
+          continue;
+        }
 
-      const dx = marble.x - shot.sprite.x;
-      const dy = marble.y - shot.sprite.y;
+        const dx = marble.x - shot.sprite.x;
+        const dy = marble.y - shot.sprite.y;
 
-      if (dx * dx + dy * dy <= hitDistanceSq) {
-        return marble;
+        if (dx * dx + dy * dy <= hitDistanceSq) {
+          return marble;
+        }
       }
     }
 
     return null;
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Sniper marble: aiming laser + instant hitscan shots                 */
+  /* ------------------------------------------------------------------ */
+
+  // Every marble on every active chain (World 3 runs two independent chains).
+  getAllMarbles() {
+    if (Array.isArray(this.chains) && this.chains.length > 0) {
+      const all = [];
+
+      for (const chain of this.chains) {
+        if (chain && Array.isArray(chain.marbles)) {
+          all.push(...chain.marbles);
+        }
+      }
+
+      return all;
+    }
+
+    return this.marbles;
+  }
+
+  // Ray/circle entry distance. Returns the distance along the ray at which the
+  // aim line first enters the marble, or null when the ray misses it.
+  rayCircleEntry(originX, originY, dirX, dirY, centerX, centerY, radius) {
+    const toCenterX = centerX - originX;
+    const toCenterY = centerY - originY;
+    const along = toCenterX * dirX + toCenterY * dirY;
+
+    if (along <= 0) {
+      return null;
+    }
+
+    const perpendicularSq =
+      toCenterX * toCenterX + toCenterY * toCenterY - along * along;
+
+    if (perpendicularSq > radius * radius) {
+      return null;
+    }
+
+    const entry = along - Math.sqrt(Math.max(0, radius * radius - perpendicularSq));
+
+    return entry >= 0 ? entry : along;
+  }
+
+  // Nearest marble on ANY track along the aim ray (the laser impact point).
+  findSniperRayTarget(originX, originY, dirX, dirY) {
+    let best = null;
+
+    for (const marble of this.getAllMarbles()) {
+      if (!marble || marble.active === false) {
+        continue;
+      }
+
+      const entry = this.rayCircleEntry(
+        originX,
+        originY,
+        dirX,
+        dirY,
+        marble.x,
+        marble.y,
+        BALL_RADIUS,
+      );
+
+      if (entry !== null && (!best || entry < best.distance)) {
+        best = { marble, distance: entry };
+      }
+    }
+
+    return best;
+  }
+
+  // First positive intersection of the aim ray with the screen border.
+  sniperEdgePoint(originX, originY, dirX, dirY) {
+    const candidates = [];
+
+    if (dirX > 1e-6) {
+      candidates.push((VIEW_WIDTH - originX) / dirX);
+    } else if (dirX < -1e-6) {
+      candidates.push((0 - originX) / dirX);
+    }
+
+    if (dirY > 1e-6) {
+      candidates.push((VIEW_HEIGHT - originY) / dirY);
+    } else if (dirY < -1e-6) {
+      candidates.push((0 - originY) / dirY);
+    }
+
+    let distance = Math.hypot(VIEW_WIDTH, VIEW_HEIGHT);
+
+    for (const candidate of candidates) {
+      if (candidate > 0 && candidate < distance) {
+        distance = candidate;
+      }
+    }
+
+    return {
+      x: originX + dirX * distance,
+      y: originY + dirY * distance,
+      distance,
+    };
+  }
+
+  // Red aiming laser from the cannon centre to the nearest marble on either
+  // track (or the screen edge). Drawn above balls/track depth.
+  updateSniperLaser() {
+    if (!this.sniperBuffActive) {
+      this.hideSniperLaser();
+      return;
+    }
+
+    const originX = CENTER_X;
+    const originY = CENTER_Y;
+    const angle = this.cannon ? this.cannon.rotation : -Math.PI / 2;
+    const dirX = Math.cos(angle);
+    const dirY = Math.sin(angle);
+    const rayTarget = this.findSniperRayTarget(originX, originY, dirX, dirY);
+    const edge = this.sniperEdgePoint(originX, originY, dirX, dirY);
+    const end = rayTarget
+      ? {
+          x: originX + dirX * rayTarget.distance,
+          y: originY + dirY * rayTarget.distance,
+          distance: rayTarget.distance,
+        }
+      : edge;
+
+    if (!this.sniperLaser) {
+      this.sniperLaser = this.add.graphics().setDepth(SNIPER_LASER_DEPTH);
+    }
+
+    const laser = this.sniperLaser;
+    laser.clear();
+    laser.setVisible(true);
+
+    // Outer glow, solid core, then a hot inner line.
+    laser.lineStyle(7, 0xff2222, 0.16);
+    laser.lineBetween(originX, originY, end.x, end.y);
+    laser.lineStyle(2.4, 0xff3b3b, 0.82);
+    laser.lineBetween(originX, originY, end.x, end.y);
+    laser.lineStyle(1, 0xffd0d0, 0.95);
+    laser.lineBetween(originX, originY, end.x, end.y);
+
+    // Reticle at the impact point (bigger when a marble is targeted).
+    laser.lineStyle(2, 0xff5252, 0.9);
+    laser.strokeCircle(end.x, end.y, rayTarget ? BALL_RADIUS + 4 : 9);
+    laser.lineStyle(1.2, 0xffb0b0, 0.85);
+    laser.lineBetween(end.x - 12, end.y, end.x + 12, end.y);
+    laser.lineBetween(end.x, end.y - 12, end.x, end.y + 12);
+
+    this.sniperLaserTarget = rayTarget ? rayTarget.marble : null;
+    this.sniperLaserEnd = { x: end.x, y: end.y, distance: end.distance };
+    this.sniperLaserVisible = true;
+  }
+
+  hideSniperLaser() {
+    this.sniperLaserVisible = false;
+    this.sniperLaserTarget = null;
+    this.sniperLaserEnd = null;
+
+    if (this.sniperLaser) {
+      this.sniperLaser.clear();
+      this.sniperLaser.setVisible(false);
+    }
+  }
+
+  // Per-frame sniper tick (called once from update()). Decrements the buff and
+  // refreshes the laser; the laser is hidden exactly when the timer hits 0.
+  updateSniper(step) {
+    if (!this.sniperBuffActive) {
+      if (this.sniperLaser && this.sniperLaser.visible) {
+        this.hideSniperLaser();
+      }
+      return;
+    }
+
+    this.sniperTimer = Math.max(0, this.sniperTimer - step);
+
+    if (this.sniperTimer <= 0) {
+      this.sniperBuffActive = false;
+      this.sniperTimer = 0;
+      this.hideSniperLaser();
+      return;
+    }
+
+    this.updateSniperLaser();
+  }
+
+  // Entry parameter (0..1) of a segment against a circle, or null when missed.
+  segmentCircleEntry(
+    fromX,
+    fromY,
+    segmentX,
+    segmentY,
+    segmentLengthSq,
+    centerX,
+    centerY,
+    radius,
+  ) {
+    const toCenterX = centerX - fromX;
+    const toCenterY = centerY - fromY;
+
+    if (segmentLengthSq <= 1e-9) {
+      const dx = centerX - fromX;
+      const dy = centerY - fromY;
+      return dx * dx + dy * dy <= radius * radius ? 0 : null;
+    }
+
+    const b = -2 * (toCenterX * segmentX + toCenterY * segmentY);
+    const c =
+      toCenterX * toCenterX + toCenterY * toCenterY - radius * radius;
+    const discriminant = b * b - 4 * segmentLengthSq * c;
+
+    if (discriminant < 0) {
+      return null;
+    }
+
+    const root = Math.sqrt(discriminant);
+    const entry = (-b - root) / (2 * segmentLengthSq);
+    const exit = (-b + root) / (2 * segmentLengthSq);
+
+    if (entry >= 0 && entry <= 1) {
+      return entry;
+    }
+
+    if (exit >= 0 && entry < 0) {
+      return 0; // segment starts inside the circle
+    }
+
+    return null;
+  }
+
+  // Swept marble test for instant-fire shots: first marble the travel segment
+  // crosses, across EVERY chain, so high speed cannot tunnel or pick the wrong
+  // track (the hit marble keeps its chain back-reference for resolveHit).
+  findSweptMarbleHit(fromX, fromY, toX, toY) {
+    const radius = SHOT_RADIUS + BALL_RADIUS;
+    const segmentX = toX - fromX;
+    const segmentY = toY - fromY;
+    const segmentLengthSq = segmentX * segmentX + segmentY * segmentY;
+    let best = null;
+    let bestEntry = Infinity;
+
+    for (const marble of this.getAllMarbles()) {
+      if (!marble || marble.active === false) {
+        continue;
+      }
+
+      const entry = this.segmentCircleEntry(
+        fromX,
+        fromY,
+        segmentX,
+        segmentY,
+        segmentLengthSq,
+        marble.x,
+        marble.y,
+        radius,
+      );
+
+      if (entry !== null && entry < bestEntry) {
+        bestEntry = entry;
+        best = marble;
+      }
+    }
+
+    return best;
+  }
+
+  // Swept bonus test so fast sniper shots still collect stars.
+  findSweptBonusHit(fromX, fromY, toX, toY) {
+    const radius = SHOT_RADIUS + BONUS_RADIUS;
+    const segmentX = toX - fromX;
+    const segmentY = toY - fromY;
+    const segmentLengthSq = segmentX * segmentX + segmentY * segmentY;
+    let best = null;
+    let bestEntry = Infinity;
+
+    for (const item of this.bonusItems) {
+      if (!item || item.active === false) {
+        continue;
+      }
+
+      const entry = this.segmentCircleEntry(
+        fromX,
+        fromY,
+        segmentX,
+        segmentY,
+        segmentLengthSq,
+        item.x,
+        item.y,
+        radius,
+      );
+
+      if (entry !== null && entry < bestEntry) {
+        bestEntry = entry;
+        best = item;
+      }
+    }
+
+    return best;
+  }
+
   resolveHit(shot, hitMarble) {
-    const hitIndex = this.marbles.indexOf(hitMarble);
+    const chain = hitMarble.chain ?? this.chains[0];
+
+    if (!chain) {
+      return;
+    }
+
+    const marbles = chain.marbles;
+    const hitIndex = marbles.indexOf(hitMarble);
 
     // Defensive guard: the chain can change between the collision check and
     // this handler if several projectiles collide during the same frame.
@@ -2484,7 +3729,7 @@ export class GameScene extends Phaser.Scene {
       const reverseY = hitMarble.y;
       const reverseColor = hitMarble.colorIndex;
       hitMarble.magnetApproaching = false;
-      this.marbles.splice(hitIndex, 1);
+      marbles.splice(hitIndex, 1);
 
       this.tweens.add({
         targets: hitMarble,
@@ -2496,12 +3741,9 @@ export class GameScene extends Phaser.Scene {
         onComplete: () => hitMarble.destroy(),
       });
 
+      this.refreshChainMetrics(chain);
+      this.syncPrimaryAliases();
       this.updateMarbleCount();
-      const reverseFront = this.marbles[0];
-      this.chainHeadDistance = reverseFront
-        ? reverseFront.t * this.trackLength
-        : 0;
-      this.chainComplete = reverseFront ? reverseFront.t >= 1 : false;
 
       this.reverseTimer = REVERSE_DURATION;
       this.createMatchBurst(reverseX, reverseY, reverseColor);
@@ -2531,7 +3773,7 @@ export class GameScene extends Phaser.Scene {
       const pauseY = hitMarble.y;
       const pauseColor = hitMarble.colorIndex;
       hitMarble.magnetApproaching = false;
-      this.marbles.splice(hitIndex, 1);
+      marbles.splice(hitIndex, 1);
 
       this.tweens.add({
         targets: hitMarble,
@@ -2543,18 +3785,55 @@ export class GameScene extends Phaser.Scene {
         onComplete: () => hitMarble.destroy(),
       });
 
+      this.refreshChainMetrics(chain);
+      this.syncPrimaryAliases();
       this.updateMarbleCount();
-      const pauseFront = this.marbles[0];
-      this.chainHeadDistance = pauseFront
-        ? pauseFront.t * this.trackLength
-        : 0;
-      this.chainComplete = pauseFront ? pauseFront.t >= 1 : false;
 
       this.reverseTimer = 0;
       this.pauseTimer = PAUSE_DURATION;
       this.createMatchBurst(pauseX, pauseY, pauseColor);
       this.createFloatingText(pauseX, pauseY, '時間暫停！', '#bfe6ff', 20);
       this.cameras.main.flash(160, 120, 200, 255);
+      return;
+    }
+
+    // Sniper marble: the hit consumes the shot and the marble and grants
+    // the instant-fire buff (aiming laser + 10000 px/s shots) for 3 s. It
+    // removes the marble from its OWN chain only and never inserts/matches.
+    if (hitMarble.isSniper) {
+      const shotIndex = this.shots.indexOf(shot);
+      if (shotIndex !== -1) {
+        this.shots.splice(shotIndex, 1);
+      }
+
+      shot.sprite.destroy();
+
+      const sniperX = hitMarble.x;
+      const sniperY = hitMarble.y;
+      const sniperColor = hitMarble.colorIndex;
+      hitMarble.magnetApproaching = false;
+      marbles.splice(hitIndex, 1);
+
+      this.tweens.add({
+        targets: hitMarble,
+        scale: 1.3,
+        alpha: 0,
+        angle: hitMarble.angle - 35,
+        duration: 240,
+        ease: 'Cubic.easeOut',
+        onComplete: () => hitMarble.destroy(),
+      });
+
+      this.refreshChainMetrics(chain);
+      this.syncPrimaryAliases();
+      this.updateMarbleCount();
+
+      this.sniperBuffActive = true;
+      this.sniperTimer = SNIPER_BUFF_DURATION;
+      this.createMatchBurst(sniperX, sniperY, sniperColor);
+      this.createFloatingText(sniperX, sniperY, '狙擊模式！', '#ff9a9a', 20);
+      this.cameras.main.flash(160, 255, 90, 90);
+      this.updateSniperLaser();
       return;
     }
 
@@ -2571,8 +3850,9 @@ export class GameScene extends Phaser.Scene {
 
     // The distance check already happened in findMarbleHit(). Here the angle
     // between the impact point and the path tangent decides which side of the
-    // struck marble owns the new slot.
-    const tangent = this.track.getTangentAt(hitT);
+    // struck marble owns the new slot. The tangent comes from the HIT chain's
+    // spline, never from the primary track.
+    const tangent = chain.track.getTangentAt(hitT);
     const tangentAngle = Math.atan2(tangent.y, tangent.x);
     const impactAngle = Math.atan2(shotY - hitY, shotX - hitX);
     const angleFromTangent = Phaser.Math.Angle.Wrap(
@@ -2582,21 +3862,22 @@ export class GameScene extends Phaser.Scene {
 
     // Do not push the tail past t = 0. A rear insertion at the entrance is
     // mirrored to the front side so it can always open a legal slot.
-    const isTail = hitIndex === this.marbles.length - 1;
+    const isTail = hitIndex === marbles.length - 1;
     const wouldFallOffStart =
-      !approachedFromFront && isTail && hitT < this.deltaT;
+      !approachedFromFront && isTail && hitT < chain.deltaT;
     const insertInFront = approachedFromFront || wouldFallOffStart;
     const insertIndex = insertInFront ? hitIndex : hitIndex + 1;
 
     // The projectile is already a PathFollower. Rebind the exact same object
-    // to the chain now that its t value can be assigned.
+    // to the hit chain now that its t value can be assigned.
     const insertedMarble = shot.sprite;
     insertedMarble
       .setDepth(DEPTH.balls)
       .setData('type', 'marble')
       .setData('colorIndex', shot.colorIndex);
+    insertedMarble.chain = chain;
     insertedMarble.colorIndex = shot.colorIndex;
-    insertedMarble.t = insertInFront ? hitT : hitT - this.deltaT;
+    insertedMarble.t = insertInFront ? hitT : hitT - chain.deltaT;
     insertedMarble.pushOffset = 0;
     insertedMarble.magnetApproaching = false;
     insertedMarble.isBomb = false;
@@ -2605,33 +3886,34 @@ export class GameScene extends Phaser.Scene {
 
     // Insert first, then propagate the pressure forwards through the chain.
     // A sufficiently large pre-existing gap absorbs the force completely.
-    this.marbles.splice(insertIndex, 0, insertedMarble);
+    marbles.splice(insertIndex, 0, insertedMarble);
 
     for (
       let index = insertIndex;
-      index < this.marbles.length - 1;
+      index < marbles.length - 1;
       index += 1
     ) {
-      const current = this.marbles[index];
-      const behind = this.marbles[index + 1];
+      const current = marbles[index];
+      const behind = marbles[index + 1];
       const gap = current.t - behind.t;
 
-      if (gap >= this.deltaT) {
+      if (gap >= chain.deltaT) {
         // The gap is large enough to absorb the push. The rest of the chain
         // must not move at all.
         break;
       }
 
-      const shiftAmount = this.deltaT - gap;
+      const shiftAmount = chain.deltaT - gap;
       behind.t -= shiftAmount;
       behind.pushOffset += shiftAmount;
     }
 
     // Commit all pushed t values to screen coordinates BEFORE scanning for
     // matches. This keeps the visual chain and the matching logic in sync.
-    this.normalizePushedChain();
+    this.normalizePushedChain(chain);
     this.updateChainPositions();
-    this.chainHeadDistance = this.marbles[0].t * this.trackLength;
+    this.refreshChainMetrics(chain);
+    this.syncPrimaryAliases();
     this.updateMarbleCount();
 
     this.createInsertPulse(hitX, hitY, shot.colorIndex);
@@ -2647,6 +3929,9 @@ export class GameScene extends Phaser.Scene {
   resolveBombHit(shot, bombMarble, bombIndex) {
     this.playExplosionSound();
 
+    const chain = bombMarble.chain ?? this.chains[0];
+    const marbles = chain ? chain.marbles : [];
+
     const shotIndex = this.shots.indexOf(shot);
     if (shotIndex !== -1) {
       this.shots.splice(shotIndex, 1);
@@ -2658,11 +3943,11 @@ export class GameScene extends Phaser.Scene {
     const colorIndex = bombMarble.colorIndex;
     const start = Math.max(0, bombIndex - BOMB_BLAST_NEIGHBOURS);
     const end = Math.min(
-      this.marbles.length - 1,
+      marbles.length - 1,
       bombIndex + BOMB_BLAST_NEIGHBOURS,
     );
 
-    const destroyed = this.marbles.splice(start, end - start + 1);
+    const destroyed = marbles.splice(start, end - start + 1);
     destroyed.forEach((marble, index) => {
       marble.magnetApproaching = false;
 
@@ -2678,11 +3963,12 @@ export class GameScene extends Phaser.Scene {
       });
     });
 
-    this.updateMarbleCount();
+    if (chain) {
+      this.refreshChainMetrics(chain);
+    }
 
-    const front = this.marbles[0];
-    this.chainHeadDistance = front ? front.t * this.trackLength : 0;
-    this.chainComplete = front ? front.t >= 1 : false;
+    this.syncPrimaryAliases();
+    this.updateMarbleCount();
 
     this.addScore(BOMB_SCORE);
     this.slowdownTimer = 1.5;
@@ -2698,7 +3984,14 @@ export class GameScene extends Phaser.Scene {
   }
 
   findMatchRun(marble) {
-    const insertedIndex = this.marbles.indexOf(marble);
+    const chain = marble.chain ?? this.chains[0];
+
+    if (!chain) {
+      return null;
+    }
+
+    const marbles = chain.marbles;
+    const insertedIndex = marbles.indexOf(marble);
 
     if (insertedIndex === -1) {
       return null;
@@ -2708,16 +4001,13 @@ export class GameScene extends Phaser.Scene {
     let start = insertedIndex;
     let end = insertedIndex;
 
-    while (
-      start > 0 &&
-      this.marbles[start - 1].colorIndex === colorIndex
-    ) {
+    while (start > 0 && marbles[start - 1].colorIndex === colorIndex) {
       start -= 1;
     }
 
     while (
-      end < this.marbles.length - 1 &&
-      this.marbles[end + 1].colorIndex === colorIndex
+      end < marbles.length - 1 &&
+      marbles[end + 1].colorIndex === colorIndex
     ) {
       end += 1;
     }
@@ -2730,6 +4020,13 @@ export class GameScene extends Phaser.Scene {
   }
 
   resolveMatches(insertedMarble, isCombo = false) {
+    const chain = insertedMarble.chain ?? this.chains[0];
+
+    if (!chain) {
+      return 0;
+    }
+
+    const marbles = chain.marbles;
     const run = this.findMatchRun(insertedMarble);
 
     if (!run || run.length < MIN_MATCH) {
@@ -2751,13 +4048,13 @@ export class GameScene extends Phaser.Scene {
     // before the splice, while both marbles still exist. A rear marble that
     // sits across an existing hole must not be yanked backwards across it
     // (that telekinetic pull was the old pushback bug).
-    const pushbackMarble = this.marbles[end + 1] ?? null;
+    const pushbackMarble = marbles[end + 1] ?? null;
     const pushbackGap = pushbackMarble
-      ? this.marbles[end].t - pushbackMarble.t
+      ? marbles[end].t - pushbackMarble.t
       : 0;
-    const pushbackTouching = pushbackGap <= this.deltaT + 0.005;
+    const pushbackTouching = pushbackGap <= chain.deltaT + 0.005;
 
-    const matched = this.marbles.splice(start, matchLength);
+    const matched = marbles.splice(start, matchLength);
     let centerX = 0;
     let centerY = 0;
     for (const marble of matched) {
@@ -2771,16 +4068,18 @@ export class GameScene extends Phaser.Scene {
 
     if (pushbackMarble) {
       if (pushbackTouching) {
-        pushbackMarble.pushOffset = this.deltaT * 1.5;
+        pushbackMarble.pushOffset = chain.deltaT * 1.5;
         pushbackMarble.t = Math.max(
           0,
-          pushbackMarble.t - this.deltaT * 1.5,
+          pushbackMarble.t - chain.deltaT * 1.5,
         );
       }
 
       pushbackMarble.magnetApproaching = false;
     }
 
+    this.refreshChainMetrics(chain);
+    this.syncPrimaryAliases();
     this.updateMarbleCount();
 
     // Remove from the collision array immediately, then let the visuals
@@ -2937,6 +4236,8 @@ export class GameScene extends Phaser.Scene {
     this.createBonusTexture();
     this.bonusItems = [];
 
+    const cap = this.getBonusCap();
+    const regularTarget = Math.max(1, cap - 1);
     const positions = [];
     const anchors = Phaser.Utils.Array.Shuffle([
       { x: 240, y: 220 },
@@ -2947,10 +4248,11 @@ export class GameScene extends Phaser.Scene {
       { x: 560, y: 260 },
     ]);
 
-    // Two regular 100-point pickups must be directly reachable; otherwise
-    // every star would accidentally become a 300-point gap shot.
+    // Regular 100-point pickups must be directly reachable; otherwise every
+    // star would accidentally become a 300-point gap shot. Early worlds spawn
+    // fewer stars so the board never feels cluttered.
     for (const anchor of anchors) {
-      if (positions.length >= BONUS_COUNT - 1) {
+      if (positions.length >= regularTarget) {
         break;
       }
 
@@ -2973,30 +4275,45 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
-    // One star sits above the top track: reaching it requires firing through
-    // a gap in the chain, so it is worth the 300-point Gap Shot bonus.
-    let gapX = Phaser.Math.Between(480, 600);
-    let gapY = Phaser.Math.Between(24, 34);
+    // World 3's second track covers many of the old anchors, so fill any
+    // remaining slots from the open-spot grid (these may become gap shots).
+    while (positions.length < regularTarget) {
+      const spot = this.findOpenBonusSpot(positions, true);
 
-    if (
-      this.distanceToTrack(gapX, gapY) < TRACK_CLEARANCE ||
-      !this.isBonusPositionClear(
-        gapX,
-        gapY,
-        positions,
-        TRACK_CLEARANCE,
-      ) ||
-      !this.shotPathCrossesTrack(gapX, gapY)
-    ) {
-      gapX = 540;
-      gapY = 28;
+      if (!spot) {
+        break;
+      }
+
+      positions.push({ x: spot.x, y: spot.y, clearance: 48 });
     }
 
-    positions.push({
-      x: gapX,
-      y: gapY,
-      clearance: TRACK_CLEARANCE,
-    });
+    // One star sits above the top track: reaching it requires firing through
+    // a gap in the chain, so it is worth the 300-point Gap Shot bonus. It is
+    // only added once the world's cap leaves room for a second pickup.
+    if (cap > 1) {
+      let gapX = Phaser.Math.Between(480, 600);
+      let gapY = Phaser.Math.Between(24, 34);
+
+      if (
+        this.distanceToTrack(gapX, gapY) < TRACK_CLEARANCE ||
+        !this.isBonusPositionClear(
+          gapX,
+          gapY,
+          positions,
+          TRACK_CLEARANCE,
+        ) ||
+        !this.shotPathCrossesTrack(gapX, gapY)
+      ) {
+        gapX = 540;
+        gapY = 28;
+      }
+
+      positions.push({
+        x: gapX,
+        y: gapY,
+        clearance: TRACK_CLEARANCE,
+      });
+    }
 
     for (const position of positions) {
       this.spawnBonusItem(position.x, position.y);
@@ -3072,13 +4389,74 @@ export class GameScene extends Phaser.Scene {
     );
   }
 
+  // Pick an open pickup spot. The curated anchors keep the classic layout for
+  // Worlds 1-2; a board-wide fallback grid makes sure the progressive pickup
+  // cap can still be filled on World 3's busier dual-track board.
+  findOpenBonusSpot(positions, allowCross = false) {
+    const anchors = Phaser.Utils.Array.Shuffle([
+      { x: 240, y: 220 },
+      { x: 560, y: 220 },
+      { x: 200, y: 300 },
+      { x: 600, y: 300 },
+      { x: 240, y: 260 },
+      { x: 560, y: 260 },
+    ]);
+
+    const candidates = anchors.map((anchor) => ({
+      x: Phaser.Math.Clamp(
+        anchor.x + Phaser.Math.Between(-15, 15),
+        70,
+        VIEW_WIDTH - 70,
+      ),
+      y: Phaser.Math.Clamp(
+        anchor.y + Phaser.Math.Between(-15, 15),
+        80,
+        VIEW_HEIGHT - 70,
+      ),
+    }));
+
+    for (let x = 90; x <= VIEW_WIDTH - 90; x += 40) {
+      for (let y = 130; y <= VIEW_HEIGHT - 100; y += 35) {
+        candidates.push({ x, y });
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (
+        !this.isBonusPositionClear(
+          candidate.x,
+          candidate.y,
+          positions,
+          48,
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        !allowCross &&
+        this.shotPathCrossesTrack(candidate.x, candidate.y)
+      ) {
+        continue;
+      }
+
+      return candidate;
+    }
+
+    return null;
+  }
+
   distanceToTrack(x, y) {
     let nearest = Infinity;
 
-    for (const point of this.trackSamples) {
-      const distance = Phaser.Math.Distance.Between(x, y, point.x, point.y);
-      if (distance < nearest) {
-        nearest = distance;
+    // Bonus placement and "shoots through a gap" checks consider EVERY active
+    // track (both World 3 chains) and use the closest one.
+    for (const chain of this.chains) {
+      for (const point of chain.trackSamples) {
+        const distance = Phaser.Math.Distance.Between(x, y, point.x, point.y);
+        if (distance < nearest) {
+          nearest = distance;
+        }
       }
     }
 
@@ -3478,15 +4856,14 @@ export class GameScene extends Phaser.Scene {
     this.updateScoreHud();
   }
 
-  // Level-aware HUD labels. Kept as their own methods so the localisation
-  // pass can replace only the text templates below.
+  // World/Stage-aware HUD labels (World-Stage + absolute difficulty D).
   updateLevelHud() {
     if (!this.levelText) {
       return;
     }
 
     this.levelText.setText(
-      `第 ${this.currentLevel} 關 / 共 ${this.getTotalMarbles()} 顆球`,
+      `世界 ${this.currentWorld}-${this.currentStage} · D${this.getDifficulty()} · 共 ${this.getTotalMarbles()} 顆球`,
     );
   }
 
@@ -3495,9 +4872,10 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    const count = this.marbles.length;
+    const count = this.getTotalChainMarbles();
+    const dualSuffix = this.isDualTrack() ? '（雙軌）' : '';
     this.marbleCountText.setText(
-      `軌道上 ${count} 顆 · 已生成 ${this.spawnedMarblesCount}/${this.getTotalMarbles()}`,
+      `軌道上 ${count} 顆${dualSuffix} · 已生成 ${this.spawnedMarblesCount}/${this.getTotalMarbles()}`,
     );
   }
 }
