@@ -62,6 +62,22 @@ const TRACK_CLEARANCE = 44;
 const BONUS_SPAWN_INTERVAL = 8;
 const WIN_BONUS = 500;
 
+// Custom background-music tracks. The mp3 files live in public/ and are
+// served from the site root (/<name>.mp3). They MUST be part of the final
+// commit; a missing file only disables that track (the manager checks the
+// Phaser audio cache before every play).
+const BGM_KEYS = {
+  menu: 'bgm-menu',
+  gameplay: 'bgm-gameplay',
+  victory: 'bgm-victory',
+};
+const BGM_TRACKS = [
+  { key: BGM_KEYS.menu, url: '/pixel_lounge.mp3' },
+  { key: BGM_KEYS.gameplay, url: '/whimsical_wander.mp3' },
+  { key: BGM_KEYS.victory, url: '/playful_path.mp3' },
+];
+const BGM_VOLUME = 0.42;
+
 // Distinct World palettes for the play board and the home-screen preview.
 // World 1 reuses the original jungle backdrop textures; the desert and volcano
 // variants are generated as canvases on first use.
@@ -341,9 +357,113 @@ export class GameScene extends Phaser.Scene {
     this.homeButton = null;
     this.homeHover = null;
     this.exitButtonDownTime = null;
+    // Victory animation on the win overlay (video when H.264 is available,
+    // Graphics/star fallback otherwise).
+    this.victoryVideoSupported = false;
+    this.victoryVideo = null;
+    this.victoryVideoErrorHandler = null;
+    this.victorySlot = null;
+    this.victoryFallbackTweens = [];
     this.hudObjects = [];
     this.launcherHalo = null;
     this.launcherBase = null;
+
+    // Background-music manager state (custom mp3 tracks, see preload()).
+    this.bgmTracks = {};
+    this.currentBgmKey = null;
+    this.bgmUnlockBound = false;
+    this.bgmDecodePatched = false;
+  }
+
+  preload() {
+    // Chromium's callback-style decodeAudioData ALSO returns (and rejects) a
+    // Promise. For a corrupt/missing mp3 that rejection is unhandled and
+    // surfaces as an uncaught EncodingError. Attach a no-op catch so a bad
+    // BGM asset can never crash/white-screen the game; Phaser's own failure
+    // callback still reports the load error and boot continues.
+    const audioContext = this.sound && this.sound.context;
+
+    if (audioContext && typeof audioContext.decodeAudioData === 'function') {
+      this.bgmDecodePatched = true;
+      this.bgmOriginalDecode = audioContext.decodeAudioData.bind(audioContext);
+
+      audioContext.decodeAudioData = (data, success, failure) => {
+        let promise = null;
+
+        try {
+          promise = this.bgmOriginalDecode(data, success, failure);
+        } catch (error) {
+          if (typeof failure === 'function') {
+            failure(error);
+          }
+
+          return;
+        }
+
+        if (promise && typeof promise.catch === 'function') {
+          promise.catch(() => {});
+        }
+
+        return promise;
+      };
+
+      this.load.once('complete', () => {
+        if (this.bgmDecodePatched) {
+          audioContext.decodeAudioData = this.bgmOriginalDecode;
+          this.bgmDecodePatched = false;
+        }
+      });
+    }
+
+    // Stream the custom BGM through Phaser's loader so the manager can rely
+    // on decoded cache entries. A 404 or undecodable file only warns; the
+    // game keeps running silently (playBgm() checks the cache first).
+    this.load.on('loaderror', (file) => {
+      if (file && typeof file.key === 'string' && file.key.startsWith('bgm-')) {
+        console.warn(
+          `[BGM] failed to load "${file.key}" (${file.src || file.url})`,
+        );
+      }
+    });
+
+    for (const track of BGM_TRACKS) {
+      if (!this.cache.audio.exists(track.key)) {
+        this.load.audio(track.key, track.url);
+      }
+    }
+
+    // Optional victory clip, loaded only when H.264 decoding is available.
+    this.loadVictoryVideoAsset();
+  }
+
+  loadVictoryVideoAsset() {
+    this.victoryVideoSupported = false;
+
+    try {
+      const probe = document.createElement('video');
+      const canPlayH264 =
+        probe.canPlayType('video/mp4; codecs="avc1.42E01E"') !== '';
+
+      if (
+        !canPlayH264 ||
+        !this.load ||
+        typeof this.load.video !== 'function'
+      ) {
+        return false;
+      }
+
+      this.load.video(
+        'zs-victory-video',
+        '/match-three_game_stage_clear_20261027.mp4',
+        'loadeddata',
+        true,
+      );
+      this.victoryVideoSupported = true;
+      return true;
+    } catch {
+      this.victoryVideoSupported = false;
+      return false;
+    }
   }
 
   create() {
@@ -356,6 +476,11 @@ export class GameScene extends Phaser.Scene {
     this.sniperLaserTarget = null;
     this.sniperLaserEnd = null;
     this.sniperLaserVisible = false;
+    // BGM state is rebuilt every scene create; stop any stale track first.
+    this.stopBgm();
+    this.bgmTracks = {};
+    this.currentBgmKey = null;
+    this.bgmUnlockBound = false;
     this.score = 0;
     this.currentWorld = 1;
     this.currentStage = 1;
@@ -399,6 +524,7 @@ export class GameScene extends Phaser.Scene {
 
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       this.input.off('pointerdown', this.handlePointerDown, this);
+      this.stopBgm();
       this.shots = [];
     });
   }
@@ -465,6 +591,40 @@ export class GameScene extends Phaser.Scene {
       this.menuOverlay.destroy();
       this.menuOverlay = null;
     }
+
+    if (this.victoryVideo) {
+      this.tweens.killTweensOf(this.victoryVideo);
+
+      if (this.victoryVideoErrorHandler) {
+        try {
+          this.victoryVideoErrorHandler.element.removeEventListener(
+            'error',
+            this.victoryVideoErrorHandler.handler,
+          );
+        } catch {
+          // The media element may already be gone.
+        }
+        this.victoryVideoErrorHandler = null;
+      }
+
+      try {
+        this.victoryVideo.stop();
+      } catch {
+        // Video may already be torn down by a scene shutdown.
+      }
+      this.victoryVideo = null;
+    }
+
+    if (this.victoryFallbackTweens.length > 0) {
+      for (const tween of this.victoryFallbackTweens) {
+        if (tween) {
+          tween.remove();
+        }
+      }
+      this.victoryFallbackTweens = [];
+    }
+
+    this.victorySlot = null;
 
     if (this.gameOverOverlay) {
       this.gameOverOverlay.destroy();
@@ -946,6 +1106,185 @@ export class GameScene extends Phaser.Scene {
         // Audio is a progressive enhancement; never break gameplay for it.
       }
     }
+
+    // A gesture can also unlock the Phaser sound manager; retry BGM then.
+    this.retryBgmAfterUnlock();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Background music (custom mp3 tracks loaded in preload())            */
+  /* ------------------------------------------------------------------ */
+
+  // Resolve a cached BGM key to a Phaser Sound, creating it lazily.
+  getBgmTrack(key) {
+    if (!key || !this.sound) {
+      return null;
+    }
+
+    const cached = this.cache && this.cache.audio && this.cache.audio.exists(key);
+
+    if (!cached) {
+      // Missing / undecodable asset: never throw, just remember the intent.
+      return null;
+    }
+
+    if (this.bgmTracks[key]) {
+      return this.bgmTracks[key];
+    }
+
+    let track = null;
+
+    try {
+      track = this.sound.get(key);
+    } catch {
+      track = null;
+    }
+
+    if (!track) {
+      try {
+        track = this.sound.add(key, { loop: true, volume: BGM_VOLUME });
+      } catch {
+        track = null;
+      }
+    }
+
+    if (track) {
+      this.bgmTracks[key] = track;
+    }
+
+    return track;
+  }
+
+  // Play one BGM track and stop every other one. Returns the Sound or null.
+  playBgm(key) {
+    if (!key) {
+      return null;
+    }
+
+    // Browser autoplay lock: remember the intent and retry on first gesture.
+    if (!this.sound || this.sound.locked) {
+      this.stopBgm({ except: key });
+      this.currentBgmKey = key;
+      this.bindBgmUnlockRetry();
+      return this.bgmTracks[key] || null;
+    }
+
+    const track = this.getBgmTrack(key);
+
+    if (!track) {
+      // Asset unavailable: stop the previous theme, keep the intent so a
+      // later hook/gesture can retry once the asset exists.
+      this.stopBgm({ except: key });
+      this.currentBgmKey = key;
+      return null;
+    }
+
+    // Never restart a track that is already playing.
+    if (this.currentBgmKey === key && track.isPlaying) {
+      return track;
+    }
+
+    this.stopBgm({ except: key });
+
+    try {
+      track.setVolume(BGM_VOLUME);
+      track.play();
+    } catch {
+      // A racing autoplay lock must never break the game.
+      this.bindBgmUnlockRetry();
+    }
+
+    this.currentBgmKey = key;
+    return track;
+  }
+
+  // Stop every BGM track (optionally keeping one key playing).
+  stopBgm(options = {}) {
+    const except = options && options.except ? options.except : null;
+
+    for (const track of BGM_TRACKS) {
+      const key = track.key;
+
+      if (except && key === except) {
+        continue;
+      }
+
+      let sound = this.bgmTracks ? this.bgmTracks[key] : null;
+
+      if (!sound && this.sound) {
+        try {
+          sound = this.sound.get(key);
+        } catch {
+          sound = null;
+        }
+      }
+
+      if (!sound) {
+        continue;
+      }
+
+      try {
+        sound.stop();
+      } catch {
+        // Already stopped/destroyed tracks are fine.
+      }
+    }
+
+    if (!except) {
+      this.currentBgmKey = null;
+    }
+  }
+
+  // True when a BGM key exists in the cache and is currently playing.
+  isBgmPlaying(key) {
+    const track = this.getBgmTrack(key);
+    return !!(track && track.isPlaying);
+  }
+
+  // Current track key (helper for menus/tests).
+  getCurrentBgmKey() {
+    return this.currentBgmKey;
+  }
+
+  // Retry the intended BGM after an autoplay unlock / user gesture.
+  retryBgmAfterUnlock() {
+    if (!this.sound || this.sound.locked || !this.currentBgmKey) {
+      return;
+    }
+
+    if (!this.isBgmPlaying(this.currentBgmKey)) {
+      this.playBgm(this.currentBgmKey);
+    }
+  }
+
+  // Listen once for the Phaser sound unlock and retry the queued BGM.
+  bindBgmUnlockRetry() {
+    if (this.bgmUnlockBound) {
+      return;
+    }
+
+    this.bgmUnlockBound = true;
+
+    const retry = () => {
+      this.bgmUnlockBound = false;
+      this.retryBgmAfterUnlock();
+    };
+
+    try {
+      if (this.sound && typeof this.sound.once === 'function') {
+        this.sound.once('unlocked', retry);
+      }
+    } catch {
+      // Ignore: the gesture-based retry below still covers the unlock.
+    }
+
+    try {
+      if (this.input && typeof this.input.once === 'function') {
+        this.input.once('pointerdown', retry);
+      }
+    } catch {
+      // Ignore: the sound-manager unlock event above is the primary path.
+    }
   }
 
   playShootSound() {
@@ -1199,6 +1538,10 @@ export class GameScene extends Phaser.Scene {
     this.pointerSeen = true;
     this.aimAtPointer();
     this.cameras.main.resetFX();
+
+    // PLAYING (including startNextLevel) always runs the gameplay theme;
+    // the menu/victory tracks are stopped by playBgm().
+    this.playBgm(BGM_KEYS.gameplay);
   }
 
   // Called by the win overlay ("進入下一關"): advance Stage 1..10, rolling
@@ -1274,6 +1617,13 @@ export class GameScene extends Phaser.Scene {
         this.currentWorld,
         this.currentStage,
       );
+
+      // Victory: the gameplay loop stops and the victory theme plays.
+      this.stopBgm();
+      this.playBgm(BGM_KEYS.victory);
+    } else {
+      // Loss: gameplay music stops; the menu theme resumes on return.
+      this.stopBgm();
     }
 
     this.setHudVisible(false);
@@ -1655,6 +2005,10 @@ export class GameScene extends Phaser.Scene {
       repeat: -1,
       ease: 'Sine.easeInOut',
     });
+
+    // Home screen BGM. Idempotent (same key is not restarted) and it queues
+    // safely when the browser has not unlocked audio yet.
+    this.playBgm(BGM_KEYS.menu);
   }
 
   // Leave the current run and go back to the start screen. Called directly by
@@ -1725,10 +2079,282 @@ export class GameScene extends Phaser.Scene {
 
     this.destroyOverlays();
     this.createMenu();
+
+    // Mid-game exit: switch straight back to the menu theme.
+    this.playBgm(BGM_KEYS.menu);
+  }
+
+  // Phaser's video loader stores the clip in the Video Cache (not the Texture
+  // Manager); a same-key canvas texture must not be treated as playable.
+  hasVictoryVideoTexture() {
+    try {
+      if (
+        this.cache &&
+        this.cache.video &&
+        typeof this.cache.video.exists === 'function' &&
+        this.cache.video.exists('zs-victory-video')
+      ) {
+        return true;
+      }
+
+      if (!this.textures.exists('zs-victory-video')) {
+        return false;
+      }
+
+      const texture = this.textures.get('zs-victory-video');
+      const source = texture && texture.source && texture.source[0];
+      return !!(source && source.video);
+    } catch {
+      return false;
+    }
+  }
+
+  // Build the win-layer objects. The caller adds them to a dedicated slot
+  // container placed right after the backdrop and before all text/buttons, so
+  // `進入下一關` always renders on top and stays clickable.
+  createVictoryAnimation() {
+    if (this.hasVictoryVideoTexture()) {
+      try {
+        return this.createVictoryVideo();
+      } catch {
+        if (this.victoryVideo) {
+          try {
+            this.victoryVideo.destroy();
+          } catch {
+            // Already torn down.
+          }
+          this.victoryVideo = null;
+        }
+      }
+    }
+
+    return this.createVictoryFallback();
+  }
+
+  createVictoryVideo() {
+    const key = 'zs-victory-video';
+    const video = this.add.video(CENTER_X, CENTER_Y, key);
+    const element = video.video;
+    const cachedVideo =
+      this.cache && this.cache.video ? this.cache.video.get(key) : null;
+
+    if (element) {
+      element.muted = true;
+      element.loop = true;
+      element.playsInline = true;
+      element.setAttribute('playsinline', '');
+    }
+
+    video.setMute(true);
+    video.setLoop(true);
+    video.setOrigin(0.5);
+    video.setPosition(CENTER_X, CENTER_Y);
+
+    // Cover the whole 800x600 stage without letterboxing. Metadata can arrive
+    // a frame later, and the cached HTMLVideoElement is a second reliable
+    // source for the intrinsic size.
+    const applyCover = () => {
+      const sourceWidth =
+        (element && element.videoWidth) ||
+        (cachedVideo && cachedVideo.videoWidth) ||
+        VIEW_WIDTH;
+      const sourceHeight =
+        (element && element.videoHeight) ||
+        (cachedVideo && cachedVideo.videoHeight) ||
+        VIEW_HEIGHT;
+      const cover = Math.max(
+        VIEW_WIDTH / sourceWidth,
+        VIEW_HEIGHT / sourceHeight,
+      );
+      video.setDisplaySize(sourceWidth * cover, sourceHeight * cover);
+    };
+
+    applyCover();
+
+    if (element && !element.videoWidth) {
+      element.addEventListener('loadedmetadata', applyCover, { once: true });
+      element.addEventListener('loadeddata', applyCover, { once: true });
+    }
+
+    video.setAlpha(0);
+    this.victoryVideo = video;
+
+    this.tweens.add({
+      targets: video,
+      alpha: 0.46,
+      duration: 420,
+      ease: 'Sine.easeOut',
+    });
+
+    this.time.delayedCall(120, () => {
+      if (this.victoryVideo === video) {
+        applyCover();
+      }
+    });
+
+    try {
+      video.play();
+
+      if (element && element.play) {
+        const playing = element.play();
+        if (playing && typeof playing.catch === 'function') {
+          playing.catch(() => {
+            // Autoplay may be rejected; the poster frame still renders.
+          });
+        }
+      }
+    } catch {
+      // Autoplay may be rejected; the video still renders its poster frame.
+    }
+
+    if (element) {
+      const handleError = () => this.replaceVictoryVideoWithFallback(video);
+      element.addEventListener('error', handleError, { once: true });
+      this.victoryVideoErrorHandler = { element, handler: handleError };
+    }
+
+    // Subtle dark veil keeps the CJK title/score/button readable.
+    const veil = this.add.rectangle(
+      CENTER_X,
+      CENTER_Y,
+      VIEW_WIDTH,
+      VIEW_HEIGHT,
+      0x041009,
+      0.26,
+    );
+
+    return [video, veil];
+  }
+
+  // Fallback used by headless/Linux browsers without H.264: golden rings, rays
+  // and slowly twinkling stars behind the win text.
+  createVictoryFallback() {
+    const layers = [];
+
+    const glow = this.add.graphics().setPosition(CENTER_X, CENTER_Y);
+
+    for (let ring = 6; ring >= 1; ring -= 1) {
+      glow.fillStyle(0xffd76a, 0.014 * ring);
+      glow.fillCircle(0, 0, 72 * ring);
+    }
+
+    glow.lineStyle(1.5, 0xffe39a, 0.18);
+    for (let ring = 1; ring <= 3; ring += 1) {
+      glow.strokeCircle(0, 0, 84 + ring * 44);
+    }
+
+    glow.lineStyle(2, 0xffe08a, 0.09);
+    for (let ray = 0; ray < 12; ray += 1) {
+      const angle = (ray / 12) * Math.PI * 2;
+      glow.beginPath();
+      glow.moveTo(Math.cos(angle) * 92, Math.sin(angle) * 92);
+      glow.lineTo(Math.cos(angle) * 268, Math.sin(angle) * 268);
+      glow.strokePath();
+    }
+
+    layers.push(glow);
+
+    const stars = [];
+    const rng = new Phaser.Math.RandomDataGenerator(['zs-victory-fallback']);
+
+    for (let index = 0; index < 14; index += 1) {
+      const angle = rng.realInRange(0, Math.PI * 2);
+      const distance = rng.realInRange(105, 255);
+      const star = this.add
+        .image(
+          CENTER_X + Math.cos(angle) * distance,
+          CENTER_Y + Math.sin(angle) * distance,
+          'zs-bonus-star',
+        )
+        .setAlpha(rng.realInRange(0.25, 0.7))
+        .setScale(rng.realInRange(0.45, 0.95))
+        .setAngle(rng.between(-22, 22));
+
+      stars.push(star);
+      layers.push(star);
+    }
+
+    const glowTween = this.tweens.add({
+      targets: glow,
+      alpha: { from: 0.72, to: 1 },
+      scale: { from: 0.97, to: 1.03 },
+      duration: 1700,
+      yoyo: true,
+      repeat: -1,
+      ease: 'Sine.easeInOut',
+    });
+
+    const starTween = this.tweens.add({
+      targets: stars,
+      alpha: { from: 0.2, to: 0.85 },
+      scale: { from: 0.5, to: 1.05 },
+      duration: 1150,
+      yoyo: true,
+      repeat: -1,
+      ease: 'Sine.easeInOut',
+    });
+
+    this.victoryFallbackTweens = [glowTween, starTween];
+
+    return layers;
+  }
+
+  // A decode error can arrive after the overlay is built; swap the video for
+  // the Graphics/star fallback in the same slot without touching the text.
+  replaceVictoryVideoWithFallback(video) {
+    if (this.victoryVideo !== video) {
+      return;
+    }
+
+    if (!this.victorySlot || !this.gameOverOverlay) {
+      return;
+    }
+
+    this.tweens.killTweensOf(video);
+
+    if (this.victoryVideoErrorHandler) {
+      try {
+        this.victoryVideoErrorHandler.element.removeEventListener(
+          'error',
+          this.victoryVideoErrorHandler.handler,
+        );
+      } catch {
+        // The media element may already be gone.
+      }
+      this.victoryVideoErrorHandler = null;
+    }
+
+    try {
+      video.stop();
+      video.destroy();
+    } catch {
+      // Already torn down.
+    }
+
+    this.victoryVideo = null;
+    this.victorySlot.removeAll(true);
+
+    const fallbackLayers = this.createVictoryFallback();
+
+    if (fallbackLayers.length > 0) {
+      this.victorySlot.add(fallbackLayers);
+    }
   }
 
   showGameOverOverlay(isWin) {
     this.destroyOverlays();
+
+    let victorySlot = null;
+
+    if (isWin) {
+      victorySlot = this.add.container(0, 0);
+      this.victorySlot = victorySlot;
+      const victoryLayers = this.createVictoryAnimation();
+
+      if (victoryLayers.length > 0) {
+        victorySlot.add(victoryLayers);
+      }
+    }
 
     const overlay = this.add
       .container(0, 0)
@@ -1740,7 +2366,7 @@ export class GameScene extends Phaser.Scene {
       VIEW_WIDTH,
       VIEW_HEIGHT,
       0x041009,
-      0.84,
+      isWin ? 0.68 : 0.84,
     );
 
     const title = this.add
@@ -1818,6 +2444,7 @@ export class GameScene extends Phaser.Scene {
 
     overlay.add([
       backdrop,
+      ...(victorySlot ? [victorySlot] : []),
       title,
       bonusLine,
       finalLabel,
@@ -3168,6 +3795,9 @@ export class GameScene extends Phaser.Scene {
     if (!pointer || pointer.button !== 0) {
       return;
     }
+
+    // Any real gesture also retries a BGM track queued behind autoplay lock.
+    this.retryBgmAfterUnlock();
 
     // The HUD exit button has its own object-level handler. Depending on the
     // Phaser dispatch order the scene-wide 'pointerdown' can still arrive for
