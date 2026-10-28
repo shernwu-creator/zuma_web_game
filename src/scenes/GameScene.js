@@ -36,7 +36,7 @@ const MAX_STAGE = 10;
 // A 3-match plus the elastic kickback leaves roughly a 4.5-slot gap, so the
 // old 1.6-slot limit disabled the cascade entirely. Ten slots covers that
 // case while still refusing to yank a marble across a genuinely empty lane.
-const CATCH_UP_MULTIPLIER = 2.2;
+const CATCH_UP_MULTIPLIER = 4.5;
 const MAGNET_MAX_SLOTS = 10.0;
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
@@ -2829,7 +2829,28 @@ export class GameScene extends Phaser.Scene {
     container.setPosition(this.uiOriginX, this.uiOriginY);
 
     if (backdrop) {
-      backdrop.setSize(this.vw / scale, this.vh / scale);
+      // Phaser Rectangle.setSize() only changes its input hit area; it does
+      // not resize the rendered shape. Assign the visible width/height so the
+      // dim backdrop actually covers the whole live board (16:9 included)
+      // instead of staying clipped to the 800x600 design box.
+      backdrop.width = this.vw / scale;
+      backdrop.height = this.vh / scale;
+
+      // Rectangle rendering uses `geom` + cached `pathData`, not the public
+      // width/height fields. Sync them (without calling setSize(), whose
+      // input-side effect is not needed here) and refresh the display origin so
+      // the enlarged rectangle is what actually gets drawn.
+      if (backdrop.geom) {
+        backdrop.geom.setSize(backdrop.width, backdrop.height);
+      }
+
+      if (typeof backdrop.updateData === 'function') {
+        backdrop.updateData();
+      }
+
+      if (typeof backdrop.updateDisplayOrigin === 'function') {
+        backdrop.updateDisplayOrigin();
+      }
     }
   }
 
