@@ -32,12 +32,12 @@ const LEVEL_BASE_SPEED = 35; // pixels per second
 const LEVEL_SPEED_STEP = 2.5;
 const MAX_WORLD = 3;
 const MAX_STAGE = 10;
-// Same-colour magnetism may only pull a rear segment over a hole that is
-// smaller than roughly one marble slot. A wider hole (for example the gap a
-// destroyed run leaves behind) is closed by the regular conveyor speed, so a
-// marble is never yanked across empty track.
+// Same-colour magnetism may pull a rear segment across a fairly large hole.
+// A 3-match plus the elastic kickback leaves roughly a 4.5-slot gap, so the
+// old 1.6-slot limit disabled the cascade entirely. Ten slots covers that
+// case while still refusing to yank a marble across a genuinely empty lane.
 const CATCH_UP_MULTIPLIER = 2.2;
-const MAGNET_MAX_SLOTS = 1.6;
+const MAGNET_MAX_SLOTS = 10.0;
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
 const SHOT_SPAWN_OFFSET = 56;
@@ -2725,10 +2725,24 @@ export class GameScene extends Phaser.Scene {
   }
 
   layoutBackdrop() {
+    // Both textures are baked at 800x600. Apply a single uniform ENVELOP scale
+    // and centre the result, so the radial canopy glow stays a perfect circle
+    // in 16:9, 9:16 and every aspect in between. Independent width/height
+    // scaling is what used to stretch the glow into an ellipse; cropping the
+    // overflow is preferable to distorting it.
+    const coverScale = Math.max(
+      this.vw / VIEW_WIDTH,
+      this.vh / VIEW_HEIGHT,
+    );
+    const displayWidth = VIEW_WIDTH * coverScale;
+    const displayHeight = VIEW_HEIGHT * coverScale;
+
     for (const image of [this.backdropImage, this.vignetteImage]) {
       if (image) {
-        // Both textures are baked at 800x600; stretch them over the live board.
-        image.setDisplaySize(this.vw, this.vh);
+        image
+          .setOrigin(0.5)
+          .setDisplaySize(displayWidth, displayHeight)
+          .setPosition(this.cx, this.cy);
       }
     }
   }
@@ -2859,10 +2873,14 @@ export class GameScene extends Phaser.Scene {
       0.6,
       (this.vh - marginY * 2) / (VIEW_HEIGHT - marginY * 2),
     );
+    // Never scale X and Y independently: doing so stretched the authored 4:3
+    // splines into distorted curves on a 16:9 board. A single uniform scale
+    // keeps each lane's true shape and merely centres the board.
+    const scale = Math.min(sx, sy);
 
     return points.map(([x, y]) => [
-      this.cx + (x - CENTER_X) * sx,
-      this.cy + (y - CENTER_Y) * sy,
+      this.cx + (x - CENTER_X) * scale,
+      this.cy + (y - CENTER_Y) * scale,
     ]);
   }
 
