@@ -1,7 +1,12 @@
 import Phaser from 'phaser';
+import { computeViewSize, DESIGN_HEIGHT, DESIGN_WIDTH } from './viewport.js';
 
-const VIEW_WIDTH = 800;
-const VIEW_HEIGHT = 600;
+// Design-space constants. Overlays (menu, victory/loss panel), baked textures
+// and the HUD anchors are authored in this 800x600 space; live gameplay uses
+// the per-instance view rectangle (this.vw / this.vh / launcherX / launcherY)
+// so the board can follow the window aspect ratio.
+const VIEW_WIDTH = DESIGN_WIDTH;
+const VIEW_HEIGHT = DESIGN_HEIGHT;
 const CENTER_X = VIEW_WIDTH / 2;
 const CENTER_Y = VIEW_HEIGHT / 2;
 
@@ -27,7 +32,12 @@ const LEVEL_BASE_SPEED = 35; // pixels per second
 const LEVEL_SPEED_STEP = 2.5;
 const MAX_WORLD = 3;
 const MAX_STAGE = 10;
-const CATCH_UP_MULTIPLIER = 4.5;
+// Same-colour magnetism may only pull a rear segment over a hole that is
+// smaller than roughly one marble slot. A wider hole (for example the gap a
+// destroyed run leaves behind) is closed by the regular conveyor speed, so a
+// marble is never yanked across empty track.
+const CATCH_UP_MULTIPLIER = 2.2;
+const MAGNET_MAX_SLOTS = 1.6;
 const SHOT_SPEED = 520; // pixels per second
 const SHOT_RADIUS = BALL_RADIUS;
 const SHOT_SPAWN_OFFSET = 56;
@@ -44,6 +54,22 @@ const BOMB_LEVEL_CHANCE = 0.08;
 const REVERSE_LEVEL_CHANCE = 0.08;
 const PAUSE_BASE_CHANCE = 0.02;
 const PAUSE_LEVEL_CHANCE = 0.06;
+// Special marbles carry NO colour any more: a hit (or a bomb blast) removes
+// them and hands out their buff, exactly like a coloured marble that is shot
+// away. Because they can never be matched nor pushed into a run, they can also
+// never block a colour the launcher is missing.
+const SPECIAL_MARBLE_TYPES = ['bomb', 'reverse', 'pause', 'sniper'];
+const SPECIAL_COLOR_INDEX = -1;
+// Neutral stone body used by every special marble texture, so a power-up can
+// never be mistaken for a matchable colour.
+const SPECIAL_MARBLE_BODY = 0x5f6f63;
+// Spread the specials out: at least SPECIAL_SPAWN_GAP marbles must spawn
+// between two specials, and the first SPECIAL_MIN_SPAWN marbles are always
+// plain colours so a stage never opens with a cluster of power-ups.
+const SPECIAL_SPAWN_GAP = 9;
+const SPECIAL_MIN_SPAWN = 6;
+// localStorage key for the music mute preference (the SFX stay on).
+const MUSIC_STORAGE_KEY = 'zumaJungleMusicMuted';
 const REVERSE_DURATION = 2.0;
 const PAUSE_DURATION = 3.0;
 // Sniper marble: documented ~5% special chance (mutually exclusive with
@@ -352,6 +378,9 @@ export class GameScene extends Phaser.Scene {
     this.levelText = null;
     this.gameState = 'MENU';
     this.spawnedMarblesCount = 0;
+    // Spawn index of the last special marble, so power-ups stay spread out
+    // (see SPECIAL_SPAWN_GAP / SPECIAL_MIN_SPAWN).
+    this.lastSpecialSpawnIndex = -SPECIAL_SPAWN_GAP;
     this.bonusTimer = 0;
     this.levelWon = false;
     this.menuOverlay = null;
@@ -371,6 +400,40 @@ export class GameScene extends Phaser.Scene {
     this.hudObjects = [];
     this.launcherHalo = null;
     this.launcherBase = null;
+
+    // Responsive playfield. `vw`/`vh` are the live logical board size, `cx`/`cy`
+    // its centre and `launcherX`/`launcherY` where the turret sits (centre on a
+    // landscape board, bottom-centre on a portrait board). `uiScale` is the
+    // uniform factor applied to the design-space overlays so text and pills
+    // never distort. All values are (re)computed by applyViewport().
+    this.vw = VIEW_WIDTH;
+    this.vh = VIEW_HEIGHT;
+    this.cx = CENTER_X;
+    this.cy = CENTER_Y;
+    this.isPortraitView = false;
+    this.uiScale = 1;
+    this.uiOriginX = 0;
+    this.uiOriginY = 0;
+    this.launcherX = CENTER_X;
+    this.launcherY = CENTER_Y;
+    this.hudLeftTexts = [];
+    this.hudRightTexts = [];
+    this.layoutSpecs = [];
+    this.menuBackdrop = null;
+    this.resultBackdrop = null;
+    this.foliagePlacements = [];
+    this.moteSprites = [];
+    // Music mute toggle (HUD-level button, visible on the menu too).
+    this.musicMuted = false;
+    this.musicButton = null;
+    this.musicButtonBg = null;
+    this.musicButtonHover = null;
+    this.musicButtonStrike = null;
+    this.musicButtonLabel = null;
+    this.musicButtonBounds = null;
+    this.musicControlDownTime = null;
+    this.pendingBgmKey = null;
+    this.loadMusicPreference();
 
     // Background-music manager state (custom mp3 tracks, see preload()).
     this.bgmTracks = {};
@@ -501,6 +564,9 @@ export class GameScene extends Phaser.Scene {
     this.bonusItems = [];
     this.exitButtonDownTime = null;
     this.menuControlDownTime = null;
+    // Derive the live board rectangle from the configured game size before
+    // anything is built, so every layer below uses the responsive geometry.
+    this.applyViewport(true);
     this.createBackdrop();
 
     // No track and no marble chain on the start menu: they are built per level
@@ -510,6 +576,7 @@ export class GameScene extends Phaser.Scene {
     this.createLauncher();
     this.createAmbientMotes();
     this.createHud();
+    this.createMusicToggle();
 
     this.hudObjects = this.children.list.filter(
       (object) => object.depth === DEPTH.hud,
@@ -517,6 +584,10 @@ export class GameScene extends Phaser.Scene {
     this.setHudVisible(false);
     this.setLauncherVisible(false);
     this.createMenu();
+
+    // The board follows the window: main.js keeps the Phaser game size in sync
+    // with the viewport aspect ratio, and every resize re-lays-out the scene.
+    this.scale.on(Phaser.Scale.Events.RESIZE, this.handleViewportResize, this);
 
     this.input.on('pointermove', () => {
       this.pointerSeen = true;
@@ -531,6 +602,7 @@ export class GameScene extends Phaser.Scene {
 
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       this.input.off('pointerdown', this.handlePointerDown, this);
+      this.scale.off(Phaser.Scale.Events.RESIZE, this.handleViewportResize, this);
       this.stopBgm();
       this.shots = [];
     });
@@ -597,6 +669,7 @@ export class GameScene extends Phaser.Scene {
     if (this.menuOverlay) {
       this.menuOverlay.destroy();
       this.menuOverlay = null;
+      this.menuBackdrop = null;
     }
 
     if (this.victoryVideo) {
@@ -636,6 +709,7 @@ export class GameScene extends Phaser.Scene {
     if (this.gameOverOverlay) {
       this.gameOverOverlay.destroy();
       this.gameOverOverlay = null;
+      this.resultBackdrop = null;
     }
 
     this.menuButton = null;
@@ -679,9 +753,10 @@ export class GameScene extends Phaser.Scene {
     return (this.currentWorld - 1) * MAX_STAGE + this.currentStage;
   }
 
-  // World 3 (D >= 21) runs two independent tracks/chains.
+  // World 3 (D >= 21) runs two independent tracks/chains. A portrait board is
+  // too narrow for two overlapping serpentines, so it always stays single-track.
   isDualTrack() {
-    return this.currentWorld >= MAX_WORLD;
+    return this.currentWorld >= MAX_WORLD && !this.isPortraitView;
   }
 
   getTotalMarbles() {
@@ -1169,6 +1244,16 @@ export class GameScene extends Phaser.Scene {
       return null;
     }
 
+    // Muted: remember the theme (so unmuting resumes it) but stay silent.
+    if (this.musicMuted) {
+      this.stopBgm();
+      this.currentBgmKey = key;
+      this.pendingBgmKey = null;
+      return null;
+    }
+
+    this.pendingBgmKey = key;
+
     // Browser autoplay lock: remember the intent and retry on first gesture.
     if (!this.sound || !this.isSoundUnlocked()) {
       this.stopBgm({ except: key });
@@ -1587,6 +1672,7 @@ export class GameScene extends Phaser.Scene {
     this.gameState = 'PLAYING';
     this.spawnedMarblesCount = 0;
     this.spawnChainCursor = 0;
+    this.lastSpecialSpawnIndex = -SPECIAL_SPAWN_GAP;
     this.bonusTimer = 0;
     this.slowdownTimer = 0;
     this.reverseTimer = 0;
@@ -1604,10 +1690,12 @@ export class GameScene extends Phaser.Scene {
     this.chainHeadDistance = 0;
     this.levelWon = false;
     // Reset the launcher queue inside the palette active for this stage (also
-    // covers jumping stages/worlds through the home selector).
+    // covers jumping stages/worlds through the home selector). The queued next
+    // colour goes through pickNextBulletColor so a late level can never ask for
+    // a colour that is no longer on the board.
     const activeColorCount = this.getActiveColorCount();
     this.currentBulletColor = INITIAL_CURRENT_COLOR % activeColorCount;
-    this.nextBulletColor = INITIAL_NEXT_COLOR % activeColorCount;
+    this.nextBulletColor = this.pickNextBulletColor(this.currentBulletColor);
     this.updateShooterIndicator();
     this.updateScoreHud();
     this.updateLevelHud();
@@ -2076,7 +2164,9 @@ export class GameScene extends Phaser.Scene {
     ]);
 
     this.menuOverlay = overlay;
+    this.menuBackdrop = backdrop;
     this.menuButton = startButton;
+    this.layoutOverlays();
 
     this.tweens.add({
       targets: startButton,
@@ -2212,12 +2302,36 @@ export class GameScene extends Phaser.Scene {
     return this.createVictoryFallback();
   }
 
+  // Cover-fit the victory video over the live board. Called on creation, when
+  // its metadata arrives and on every resize while the result panel is open.
+  fitVictoryVideo(video = this.victoryVideo) {
+    if (!video || video.active === false) {
+      return;
+    }
+
+    const cached =
+      this.cache && this.cache.video
+        ? this.cache.video.get('zs-victory-video')
+        : null;
+    const element = video.video;
+    const sourceWidth =
+      (element && element.videoWidth) ||
+      (cached && cached.videoWidth) ||
+      this.vw;
+    const sourceHeight =
+      (element && element.videoHeight) ||
+      (cached && cached.videoHeight) ||
+      this.vh;
+    const cover = Math.max(this.vw / sourceWidth, this.vh / sourceHeight);
+
+    video.setPosition(this.cx, this.cy);
+    video.setDisplaySize(sourceWidth * cover, sourceHeight * cover);
+  }
+
   createVictoryVideo() {
     const key = 'zs-victory-video';
-    const video = this.add.video(CENTER_X, CENTER_Y, key);
+    const video = this.add.video(this.cx, this.cy, key);
     const element = video.video;
-    const cachedVideo =
-      this.cache && this.cache.video ? this.cache.video.get(key) : null;
 
     if (element) {
       element.muted = true;
@@ -2229,26 +2343,12 @@ export class GameScene extends Phaser.Scene {
     video.setMute(true);
     video.setLoop(true);
     video.setOrigin(0.5);
-    video.setPosition(CENTER_X, CENTER_Y);
+    video.setPosition(this.cx, this.cy);
 
-    // Cover the whole 800x600 stage without letterboxing. Metadata can arrive
-    // a frame later, and the cached HTMLVideoElement is a second reliable
-    // source for the intrinsic size.
-    const applyCover = () => {
-      const sourceWidth =
-        (element && element.videoWidth) ||
-        (cachedVideo && cachedVideo.videoWidth) ||
-        VIEW_WIDTH;
-      const sourceHeight =
-        (element && element.videoHeight) ||
-        (cachedVideo && cachedVideo.videoHeight) ||
-        VIEW_HEIGHT;
-      const cover = Math.max(
-        VIEW_WIDTH / sourceWidth,
-        VIEW_HEIGHT / sourceHeight,
-      );
-      video.setDisplaySize(sourceWidth * cover, sourceHeight * cover);
-    };
+    // Cover the whole live board without letterboxing. Metadata can arrive a
+    // frame later, and the cached HTMLVideoElement is a second reliable source
+    // for the intrinsic size.
+    const applyCover = () => this.fitVictoryVideo(video);
 
     applyCover();
 
@@ -2296,10 +2396,10 @@ export class GameScene extends Phaser.Scene {
 
     // Subtle dark veil keeps the CJK title/score/button readable.
     const veil = this.add.rectangle(
-      CENTER_X,
-      CENTER_Y,
-      VIEW_WIDTH,
-      VIEW_HEIGHT,
+      this.cx,
+      this.cy,
+      this.vw,
+      this.vh,
       0x041009,
       0.26,
     );
@@ -2312,7 +2412,7 @@ export class GameScene extends Phaser.Scene {
   createVictoryFallback() {
     const layers = [];
 
-    const glow = this.add.graphics().setPosition(CENTER_X, CENTER_Y);
+    const glow = this.add.graphics().setPosition(this.cx, this.cy);
 
     for (let ring = 6; ring >= 1; ring -= 1) {
       glow.fillStyle(0xffd76a, 0.014 * ring);
@@ -2343,8 +2443,8 @@ export class GameScene extends Phaser.Scene {
       const distance = rng.realInRange(105, 255);
       const star = this.add
         .image(
-          CENTER_X + Math.cos(angle) * distance,
-          CENTER_Y + Math.sin(angle) * distance,
+          this.cx + Math.cos(angle) * distance,
+          this.cy + Math.sin(angle) * distance,
           'zs-bonus-star',
         )
         .setAlpha(rng.realInRange(0.25, 0.7))
@@ -2535,7 +2635,9 @@ export class GameScene extends Phaser.Scene {
     ]);
 
     this.gameOverOverlay = overlay;
+    this.resultBackdrop = backdrop;
     this.restartButton = restartButton;
+    this.layoutOverlays();
 
     this.tweens.add({
       targets: restartButton,
@@ -2545,6 +2647,637 @@ export class GameScene extends Phaser.Scene {
       repeat: -1,
       ease: 'Sine.easeInOut',
     });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Responsive viewport                                                 */
+  /* ------------------------------------------------------------------ */
+
+  // Derive every live geometry value from the current game size. `initial` is
+  // true exactly once (inside create(), where nothing else exists yet); later
+  // calls come from the RESIZE handler and re-map the running board in place.
+  applyViewport(initial = false) {
+    const size = this.scale.gameSize;
+    const width = Math.round(size.width || VIEW_WIDTH);
+    const height = Math.round(size.height || VIEW_HEIGHT);
+    const wasPortrait = this.isPortraitView;
+
+    this.vw = Math.max(320, width);
+    this.vh = Math.max(320, height);
+    this.cx = this.vw / 2;
+    this.cy = this.vh / 2;
+    this.isPortraitView = this.vh > this.vw;
+
+    // The turret always sits in the middle of the board: the landscape
+    // serpentines wrap around it and the portrait spiral opens right above it.
+    this.launcherX = this.cx;
+    this.launcherY = this.cy;
+
+    this.uiScale = this.getOverlayScale();
+    this.uiOriginX = this.cx - CENTER_X * this.uiScale;
+    this.uiOriginY = this.cy - CENTER_Y * this.uiScale;
+
+    this.layoutBackdrop();
+    this.layoutFoliage();
+    this.layoutLauncher();
+    this.layoutHud();
+    this.createMusicToggle();
+    this.layoutMusicToggle();
+    this.layoutOverlays();
+
+    if (initial) {
+      return;
+    }
+
+    this.createAmbientMotes();
+
+    // A portrait board hosts a single chain, so flipping a World-3 level
+    // between the two orientations changes how many chains the board needs.
+    if (
+      this.gameState === 'PLAYING' &&
+      this.chains.length > 0 &&
+      wasPortrait !== this.isPortraitView &&
+      (this.chains.length > 1 || this.isDualTrack())
+    ) {
+      this.relayoutForOrientation();
+    } else {
+      this.rebuildTrackForView();
+    }
+
+    this.updateSniperLaser();
+  }
+
+  // Uniform factor for every design-space overlay (menu, result panel, HUD
+  // pills). Fitting the 800x600 authoring box keeps the text undistorted
+  // instead of stretching it with the board.
+  getOverlayScale() {
+    return Phaser.Math.Clamp(
+      Math.min(this.vw / VIEW_WIDTH, this.vh / VIEW_HEIGHT),
+      0.44,
+      1.4,
+    );
+  }
+
+  // Phaser fires RESIZE once per layout change (main.js debounces the canvas
+  // resize itself), so a rebuild per event is cheap enough and always exact.
+  handleViewportResize() {
+    this.applyViewport(false);
+  }
+
+  layoutBackdrop() {
+    for (const image of [this.backdropImage, this.vignetteImage]) {
+      if (image) {
+        // Both textures are baked at 800x600; stretch them over the live board.
+        image.setDisplaySize(this.vw, this.vh);
+      }
+    }
+  }
+
+  layoutFoliage() {
+    if (!this.foliageSprites) {
+      return;
+    }
+
+    const sx = this.vw / VIEW_WIDTH;
+    const sy = this.vh / VIEW_HEIGHT;
+
+    this.foliageSprites.forEach((leaf, index) => {
+      const placement = this.foliagePlacements
+        ? this.foliagePlacements[index]
+        : null;
+
+      if (!placement) {
+        return;
+      }
+
+      leaf.setPosition(placement.x * sx, placement.y * sy);
+    });
+  }
+
+  layoutLauncher() {
+    // The halo/base graphics are painted around the design centre, so they
+    // only need an offset; the cannon container is anchored directly.
+    const offsetX = this.launcherX - CENTER_X;
+    const offsetY = this.launcherY - CENTER_Y;
+
+    if (this.launcherHalo) {
+      this.launcherHalo.setPosition(offsetX, offsetY);
+    }
+
+    if (this.launcherBase) {
+      this.launcherBase.setPosition(offsetX, offsetY);
+    }
+
+    if (this.cannon) {
+      this.cannon.setPosition(this.launcherX, this.launcherY);
+    }
+  }
+
+  // HUD text is authored against the 800x600 corners: keep the left column
+  // pinned to the left edge and the right column pinned to the right edge of
+  // whatever board the window currently uses.
+  layoutHud() {
+    const margin = 30;
+    const right = Math.max(margin + 120, this.vw - margin);
+
+    for (const text of this.hudLeftTexts || []) {
+      text.setX(margin);
+    }
+
+    for (const text of this.hudRightTexts || []) {
+      text.setX(right);
+    }
+
+    if (this.homeButton) {
+      this.homeButton.setPosition(right, this.vh - margin);
+    }
+  }
+
+  layoutOverlays() {
+    this.layoutOverlay(this.menuOverlay, this.menuBackdrop);
+    this.layoutOverlay(this.gameOverOverlay, this.resultBackdrop);
+
+    // The win video/fallback art is not part of a scaled container, so it has
+    // to be re-centred whenever the board changes shape.
+    this.fitVictoryVideo();
+  }
+
+  // Scale a design-space overlay container into the live board and keep its
+  // dim backdrop covering the whole board instead of the 800x600 design box.
+  layoutOverlay(container, backdrop) {
+    if (!container) {
+      return;
+    }
+
+    const scale = this.uiScale || 1;
+
+    container.setScale(scale);
+    container.setPosition(this.uiOriginX, this.uiOriginY);
+
+    if (backdrop) {
+      backdrop.setSize(this.vw / scale, this.vh / scale);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Track geometry for the live board                                   */
+  /* ------------------------------------------------------------------ */
+
+  createSpline(points) {
+    return new Phaser.Curves.Spline(
+      points.map(([x, y]) => new Phaser.Math.Vector2(x, y)),
+    );
+  }
+
+  // Turn a level's layout spec into live board points. Landscape boards reuse
+  // the authored serpentines (simply spread to the window); portrait boards
+  // cannot fit them and get a generated spiral instead.
+  resolveLayoutPoints(spec) {
+    if (!spec) {
+      return this.buildPortraitSpiral();
+    }
+
+    // A portrait board can never host the wide landscape serpentines.
+    if (spec.portrait || this.isPortraitView) {
+      return this.buildPortraitSpiral();
+    }
+
+    return this.mapDesignLayout(spec.points);
+  }
+
+  // Map a design-space (800x600) point list onto the live board. Only offsets
+  // from the board centre are scaled, so two lanes can only ever move further
+  // apart than in the authored layout - never closer than one marble.
+  mapDesignLayout(points) {
+    const marginX = 30;
+    const marginY = 30;
+    const sx = Math.max(
+      0.6,
+      (this.vw - marginX * 2) / (VIEW_WIDTH - marginX * 2),
+    );
+    const sy = Math.max(
+      0.6,
+      (this.vh - marginY * 2) / (VIEW_HEIGHT - marginY * 2),
+    );
+
+    return points.map(([x, y]) => [
+      this.cx + (x - CENTER_X) * sx,
+      this.cy + (y - CENTER_Y) * sy,
+    ]);
+  }
+
+  // Portrait boards cannot host the wide landscape serpentines, so the level
+  // generates its own track: a two-turn rounded-rectangle spiral around the
+  // turret. The chain enters on the outer coil and ends next to the launcher,
+  // exactly like the classic spiral stages. A portrait board is always
+  // single-track (see isDualTrack), so one spiral covers the whole level.
+  buildPortraitSpiral() {
+    const turns = 2;
+    const laneGap = BALL_DIAMETER + 10; // neighbouring coils never touch
+    const sideMargin = 26;
+    const topMargin = 126; // clears the two HUD rows
+    const bottomMargin = 104; // clears the home / music capsules
+
+    const startX = Math.max(120, this.vw / 2 - sideMargin);
+    const startY = Math.max(
+      startX,
+      Math.min(this.vh / 2 - topMargin, this.vh / 2 - bottomMargin),
+    );
+    const endX = Math.max(56, startX - turns * laneGap);
+    const endY = Math.max(72, startY - turns * laneGap);
+    const steps = turns * 26;
+    // Exponent < 1 turns the ellipse into a squarish super-ellipse, which
+    // fills a phone screen far better than a round spiral.
+    const roundness = 0.66;
+    const points = [];
+
+    for (let i = 0; i <= steps; i += 1) {
+      const progress = i / steps;
+      const angle = -Math.PI / 2 + progress * turns * Math.PI * 2;
+      const radiusX = startX + (endX - startX) * progress;
+      const radiusY = startY + (endY - startY) * progress;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+
+      points.push([
+        this.cx + radiusX * Math.sign(cos) * Math.abs(cos) ** roundness,
+        this.cy + radiusY * Math.sign(sin) * Math.abs(sin) ** roundness,
+      ]);
+    }
+
+    return points;
+  }
+
+  // Re-map the running level's splines after a window resize. Marble positions
+  // are arc-length fractions (t), so they survive the remap untouched and the
+  // chain keeps its order, spacing and progress.
+  rebuildTrackForView() {
+    if (this.chains.length === 0 || !this.layoutSpecs) {
+      return;
+    }
+
+    this.chains.forEach((chain) => {
+      const spec = this.layoutSpecs[chain.index];
+
+      if (!spec) {
+        return;
+      }
+
+      const track = this.createSpline(this.resolveLayoutPoints(spec));
+
+      chain.track = track;
+      chain.trackLength = track.getLength();
+      chain.trackSamples = track.getSpacedPoints(240);
+      chain.deltaT =
+        chain.trackLength > 0 ? BALL_DIAMETER / chain.trackLength : 0;
+    });
+
+    this.syncPrimaryAliases();
+    this.initialGapT = this.deltaT;
+    this.createTracks();
+    this.updateChainPositions();
+  }
+
+  // A live orientation flip can change how many chains the board hosts
+  // (portrait boards are single-track). Rebuild the level's tracks for the new
+  // orientation: the primary chain keeps its marbles and progress, extra chains
+  // are removed and their marbles go back into the spawn budget so the level
+  // still spawns exactly getTotalMarbles() marbles, and a newly required second
+  // chain starts empty and is filled by the round-robin spawner.
+  relayoutForOrientation() {
+    const carried = this.chains[0] ? this.chains[0].marbles : [];
+    let dropped = 0;
+
+    for (const chain of this.chains.slice(1)) {
+      dropped += chain.marbles.length;
+
+      for (const marble of chain.marbles) {
+        marble.destroy();
+      }
+    }
+
+    this.buildLevelTracks();
+
+    const primary = this.chains[0];
+
+    if (primary) {
+      primary.marbles = carried;
+
+      for (const marble of carried) {
+        marble.chain = primary;
+      }
+
+      this.refreshChainMetrics(primary);
+    }
+
+    if (dropped > 0) {
+      this.spawnedMarblesCount = Math.max(
+        0,
+        this.spawnedMarblesCount - dropped,
+      );
+    }
+
+    // Specials restart their spacing from the new layout.
+    this.lastSpecialSpawnIndex = -SPECIAL_SPAWN_GAP;
+    this.syncPrimaryAliases();
+    this.initialGapT = this.deltaT;
+    this.createTracks();
+    this.updateChainPositions();
+    this.updateMarbleCount();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Music mute toggle                                                   */
+  /* ------------------------------------------------------------------ */
+
+  // A small capsule pinned to the bottom-left corner, visible on every screen
+  // (menu, gameplay and both result panels). Layout mirrors the HUD exit
+  // button: every child sits in negative local space so the Container itself
+  // carries the (left, bottom) anchor.
+  createMusicToggle() {
+    if (this.musicButton) {
+      return;
+    }
+
+    const width = (this.musicButtonWidth = 98);
+    const height = (this.musicButtonHeight = 34);
+    const left = -width;
+    const top = -height;
+
+    const bg = this.add.graphics().setPosition(left, top);
+    const hover = this.add
+      .graphics()
+      .setPosition(left, top)
+      .setAlpha(0)
+      .setBlendMode(Phaser.BlendModes.ADD);
+    const strike = this.add.graphics().setPosition(left, top);
+    const label = this.add
+      .text(left + width / 2, top + height / 2, '♪ 音樂', {
+        fontFamily: UI_FONT,
+        fontSize: '13px',
+        color: '#f7efd2',
+      })
+      .setOrigin(0.5);
+    label.setShadow(0, 1, '#000000', 4, false, true);
+
+    const hitArea = this.add
+      .zone(left, top, width, height)
+      .setOrigin(0)
+      .setInteractive({ useHandCursor: true });
+
+    this.musicButtonBg = bg;
+    this.musicButtonHover = hover;
+    this.musicButtonStrike = strike;
+    this.musicButtonLabel = label;
+
+    hitArea.on('pointerover', () => {
+      this.tweens.killTweensOf(hover);
+      this.tweens.add({
+        targets: hover,
+        alpha: 0.28,
+        duration: 150,
+        ease: 'Sine.easeOut',
+      });
+    });
+
+    hitArea.on('pointerout', () => {
+      this.tweens.killTweensOf(hover);
+      this.tweens.add({
+        targets: hover,
+        alpha: 0,
+        duration: 150,
+        ease: 'Sine.easeOut',
+      });
+    });
+
+    hitArea.on('pointerdown', (pointer, _x, _y, event) => {
+      if (event && typeof event.stopPropagation === 'function') {
+        event.stopPropagation();
+      }
+
+      if (pointer) {
+        this.musicControlDownTime = pointer.downTime;
+      }
+
+      this.toggleMusicMute();
+    });
+
+    this.musicButton = this.add
+      .container(0, 0, [bg, hover, strike, label, hitArea])
+      .setDepth(DEPTH.overlay + 10);
+
+    this.paintMusicToggle();
+    this.layoutMusicToggle();
+  }
+
+  paintMusicToggle() {
+    const width = this.musicButtonWidth || 98;
+    const height = this.musicButtonHeight || 34;
+    const radius = height / 2;
+
+    if (this.musicButtonBg) {
+      const bg = this.musicButtonBg;
+
+      bg.clear();
+      bg.fillStyle(0x06120c, 0.74);
+      bg.fillRoundedRect(0, 0, width, height, radius);
+      bg.fillStyle(0xffffff, 0.06);
+      bg.fillRoundedRect(3, 2, width - 6, height / 2 - 2, {
+        tl: radius - 2,
+        tr: radius - 2,
+        bl: 0,
+        br: 0,
+      });
+      bg.lineStyle(1, 0xd9e6b8, 0.36);
+      bg.strokeRoundedRect(0.5, 0.5, width - 1, height - 1, radius - 0.5);
+    }
+
+    if (this.musicButtonHover) {
+      this.musicButtonHover.clear();
+      this.musicButtonHover.fillStyle(0xf2ffd4, 1);
+      this.musicButtonHover.fillRoundedRect(0, 0, width, height, radius);
+    }
+
+    if (this.musicButtonStrike) {
+      this.musicButtonStrike.clear();
+
+      if (this.musicMuted) {
+        this.musicButtonStrike.lineStyle(2, 0xff9c9c, 0.92);
+        this.musicButtonStrike.lineBetween(7, height - 7, width - 7, 7);
+      }
+    }
+
+    if (this.musicButtonLabel) {
+      this.musicButtonLabel.setText(this.musicMuted ? '♪ 靜音' : '♪ 音樂');
+      this.musicButtonLabel.setColor(this.musicMuted ? '#e6b0b0' : '#f7efd2');
+    }
+  }
+
+  layoutMusicToggle() {
+    if (!this.musicButton) {
+      return;
+    }
+
+    const margin = 30;
+    const width = this.musicButtonWidth || 98;
+    const height = this.musicButtonHeight || 34;
+
+    this.musicButton.setPosition(margin + width, this.vh - margin);
+
+    // Cached hit rectangle so a press on the capsule never fires a marble.
+    this.musicButtonBounds = new Phaser.Geom.Rectangle(
+      margin,
+      this.vh - margin - height,
+      width,
+      height,
+    );
+  }
+
+  // Mute/unmute only the background music; the synthesised SFX stay audible.
+  toggleMusicMute() {
+    const resumeKey = this.pendingBgmKey || this.currentBgmKey;
+
+    this.musicMuted = !this.musicMuted;
+    this.saveMusicPreference();
+    this.paintMusicToggle();
+
+    if (this.musicMuted) {
+      this.stopBgm();
+      // Remember the theme so unmuting resumes exactly where it left off.
+      this.currentBgmKey = resumeKey;
+      this.pendingBgmKey = null;
+      return;
+    }
+
+    this.initAudio();
+    this.playBgm(resumeKey || BGM_KEYS.menu);
+  }
+
+  loadMusicPreference() {
+    try {
+      this.musicMuted = localStorage.getItem(MUSIC_STORAGE_KEY) === '1';
+    } catch {
+      this.musicMuted = false;
+    }
+  }
+
+  saveMusicPreference() {
+    try {
+      localStorage.setItem(MUSIC_STORAGE_KEY, this.musicMuted ? '1' : '0');
+    } catch {
+      // Private mode / disabled storage: the toggle still works for the session.
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Marble colours and specials                                         */
+  /* ------------------------------------------------------------------ */
+
+  // A special marble carries no colour (SPECIAL_COLOR_INDEX): it can never be
+  // matched, never counts towards a run, and never blocks a colour the
+  // launcher still has to serve.
+  isSpecialMarble(marble) {
+    if (!marble) {
+      return false;
+    }
+
+    if (marble.colorIndex === SPECIAL_COLOR_INDEX) {
+      return true;
+    }
+
+    return !!(
+      marble.isBomb ||
+      marble.isReverse ||
+      marble.isPause ||
+      marble.isSniper
+    );
+  }
+
+  // Neutral (colour-less) texture key of a special marble.
+  getSpecialTextureKey(marble) {
+    if (!marble) {
+      return null;
+    }
+
+    if (marble.isBomb) {
+      return 'zs-marble-bomb';
+    }
+
+    if (marble.isReverse) {
+      return 'zs-marble-reverse';
+    }
+
+    if (marble.isPause) {
+      return 'zs-marble-pause';
+    }
+
+    if (marble.isSniper) {
+      return 'zs-marble-sniper';
+    }
+
+    return null;
+  }
+
+  // 0xRRGGBB value of a marble colour index; specials fall back to stone.
+  getMarbleColorValue(colorIndex) {
+    if (
+      colorIndex === SPECIAL_COLOR_INDEX ||
+      colorIndex === null ||
+      colorIndex === undefined ||
+      !MARBLE_COLORS[colorIndex]
+    ) {
+      return SPECIAL_MARBLE_BODY;
+    }
+
+    return Phaser.Display.Color.HexStringToColor(MARBLE_COLORS[colorIndex])
+      .color;
+  }
+
+  // Colour indices still present on any chain (specials excluded).
+  getColorsOnChain() {
+    const colors = [];
+    const activeCount = this.getActiveColorCount();
+
+    for (const chain of this.chains) {
+      for (const marble of chain.marbles) {
+        const index = marble.colorIndex;
+
+        if (index >= 0 && index < activeCount && !colors.includes(index)) {
+          colors.push(index);
+        }
+      }
+    }
+
+    return colors;
+  }
+
+  // Next queued ammo colour. While marbles still spawn the queue simply walks
+  // the active palette; once everything has spawned it can only serve colours
+  // that are still on the board, so a leftover run can always be finished
+  // instead of the launcher cycling through colours that no longer exist.
+  pickNextBulletColor(previousColor) {
+    const activeCount = this.getActiveColorCount();
+    const fallback = (previousColor + 1) % activeCount;
+
+    if (this.spawnedMarblesCount < this.getTotalMarbles()) {
+      return fallback;
+    }
+
+    const remaining = this.getColorsOnChain();
+
+    if (remaining.length === 0) {
+      return fallback;
+    }
+
+    for (let step = 1; step <= activeCount; step += 1) {
+      const candidate = (previousColor + step) % activeCount;
+
+      if (remaining.includes(candidate)) {
+        return candidate;
+      }
+    }
+
+    return fallback;
   }
 
   /* ------------------------------------------------------------------ */
@@ -2648,6 +3381,8 @@ export class GameScene extends Phaser.Scene {
       .image(0, 0, 'zs-vignette')
       .setOrigin(0)
       .setDepth(DEPTH.vignette);
+    // Both baked canvases are 800x600; stretch them over the live board.
+    this.layoutBackdrop();
     this.createFoliage();
     this.applyWorldBackdrop(this.selectedWorld);
   }
@@ -2685,6 +3420,7 @@ export class GameScene extends Phaser.Scene {
       { x: 164, y: -24, angle: 8, scale: 0.9, alpha: 0.3 },
     ];
 
+    this.foliagePlacements = placements;
     this.foliageSprites = placements.map(({ x, y, angle, scale, alpha }) =>
       this.add
         .image(x, y, 'zs-leaf')
@@ -2694,6 +3430,9 @@ export class GameScene extends Phaser.Scene {
         .setAlpha(alpha)
         .setDepth(DEPTH.foliage),
     );
+
+    // Spread the leaves over whatever board size the window currently uses.
+    this.layoutFoliage();
   }
 
   /* ------------------------------------------------------------------ */
@@ -2706,10 +3445,8 @@ export class GameScene extends Phaser.Scene {
   // that used to be a single scene field (track, length, samples, deltaT,
   // marbles, head metrics) lives here so Worlds 1-2 can run one chain and
   // World 3 can run two without sharing any state.
-  createChainContext(layout, index) {
-    const track = new Phaser.Curves.Spline(
-      layout.map(([x, y]) => new Phaser.Math.Vector2(x, y)),
-    );
+  createChainContext(spec, index) {
+    const track = this.createSpline(this.resolveLayoutPoints(spec));
     const trackLength = track.getLength();
 
     return {
@@ -2738,17 +3475,22 @@ export class GameScene extends Phaser.Scene {
 
     const difficulty = Math.max(1, this.getDifficulty());
     const layoutIndex = (difficulty - 1) % TRACK_LAYOUTS.length;
-    const layouts = [TRACK_LAYOUTS[layoutIndex]];
+    // Portrait boards cannot host the wide landscape serpentines, so every
+    // stage there uses the generated spiral (see buildPortraitSpiral).
+    const specs = this.isPortraitView
+      ? [{ portrait: true, index: 0 }]
+      : [{ points: TRACK_LAYOUTS[layoutIndex] }];
 
     // World 3 (D >= 21) gets a second, independent inner spline.
     if (this.isDualTrack()) {
       const innerIndex =
         (Math.max(21, difficulty) - 21) % DUAL_INNER_LAYOUTS.length;
-      layouts.push(DUAL_INNER_LAYOUTS[innerIndex]);
+      specs.push({ points: DUAL_INNER_LAYOUTS[innerIndex] });
     }
 
-    this.chains = layouts.map((layout, index) =>
-      this.createChainContext(layout, index),
+    this.layoutSpecs = specs;
+    this.chains = specs.map((spec, index) =>
+      this.createChainContext(spec, index),
     );
     this.syncPrimaryAliases();
 
@@ -3001,6 +3743,8 @@ export class GameScene extends Phaser.Scene {
     this.chainHeadDistance = 0;
     this.spawnedMarblesCount = 0;
     this.spawnChainCursor = 0;
+    // Specials are staggered from the first spawn of the level.
+    this.lastSpecialSpawnIndex = -SPECIAL_SPAWN_GAP;
   }
 
   trySpawnMarble() {
@@ -3039,31 +3783,43 @@ export class GameScene extends Phaser.Scene {
 
     // One mutually exclusive special roll (bomb -> reverse -> pause ->
     // sniper); the first three grow with absolute difficulty (World/Stage),
-    // sniper is a fixed documented ~5% chance.
+    // sniper is a fixed documented ~5% chance. Specials are spread out so the
+    // board never stacks them: none during the opening marbles and at least
+    // SPECIAL_SPAWN_GAP marbles between two of them.
     const chances = this.getSpecialChances();
     const specialRoll = Phaser.Math.FloatBetween(0, 1);
     const reverseThreshold = chances.bomb + chances.reverse;
     const pauseThreshold = reverseThreshold + chances.pause;
     const sniperThreshold = pauseThreshold + chances.sniper;
+    const specialSlotOpen =
+      this.spawnedMarblesCount >= SPECIAL_MIN_SPAWN &&
+      this.spawnedMarblesCount - this.lastSpecialSpawnIndex >= SPECIAL_SPAWN_GAP;
 
-    marble.isBomb = specialRoll < chances.bomb;
-    marble.isReverse = !marble.isBomb && specialRoll < reverseThreshold;
-    marble.isPause =
-      !marble.isBomb && !marble.isReverse && specialRoll < pauseThreshold;
-    marble.isSniper =
-      !marble.isBomb &&
-      !marble.isReverse &&
-      !marble.isPause &&
+    const isBomb = specialSlotOpen && specialRoll < chances.bomb;
+    const isReverse =
+      specialSlotOpen && !isBomb && specialRoll < reverseThreshold;
+    const isPause =
+      specialSlotOpen && !isBomb && !isReverse && specialRoll < pauseThreshold;
+    const isSniper =
+      specialSlotOpen &&
+      !isBomb &&
+      !isReverse &&
+      !isPause &&
       specialRoll < sniperThreshold;
 
-    if (marble.isBomb) {
-      marble.setTexture(`zs-marble-bomb-${colorIndex}`);
-    } else if (marble.isReverse) {
-      marble.setTexture(`zs-marble-reverse-${colorIndex}`);
-    } else if (marble.isPause) {
-      marble.setTexture(`zs-marble-pause-${colorIndex}`);
-    } else if (marble.isSniper) {
-      marble.setTexture(`zs-marble-sniper-${colorIndex}`);
+    marble.isBomb = isBomb;
+    marble.isReverse = isReverse;
+    marble.isPause = isPause;
+    marble.isSniper = isSniper;
+
+    if (this.isSpecialMarble(marble)) {
+      // A special carries NO colour at all (SPECIAL_COLOR_INDEX), so it can
+      // never be matched, never counts towards a run and never turns the
+      // launcher's colour queue into an impossible request.
+      marble.colorIndex = SPECIAL_COLOR_INDEX;
+      marble.setData('colorIndex', SPECIAL_COLOR_INDEX);
+      marble.setTexture(this.getSpecialTextureKey(marble));
+      this.lastSpecialSpawnIndex = this.spawnedMarblesCount;
     }
 
     chain.marbles.push(marble);
@@ -3149,6 +3905,9 @@ export class GameScene extends Phaser.Scene {
       const forwardShift = -minT;
       for (const marble of marbles) {
         marble.t += forwardShift;
+        // Keep the rendered marble where it was: pushOffset decays over the
+        // next frames, so the whole chain slides forward instead of snapping.
+        marble.pushOffset -= forwardShift;
       }
       maxT += forwardShift;
     }
@@ -3157,6 +3916,7 @@ export class GameScene extends Phaser.Scene {
       const backwardShift = 1 - maxT;
       for (const marble of marbles) {
         marble.t += backwardShift;
+        marble.pushOffset -= backwardShift;
       }
     }
 
@@ -3183,6 +3943,7 @@ export class GameScene extends Phaser.Scene {
       this.textures.exists('zs-marble-pause-0') &&
       this.textures.exists('zs-marble-sniper-0')
     ) {
+      this.createNeutralSpecialTextures(BALL_RADIUS * 2 + 18);
       return;
     }
 
@@ -3379,6 +4140,45 @@ export class GameScene extends Phaser.Scene {
     });
 
     graphics.destroy();
+    this.createNeutralSpecialTextures(size);
+  }
+
+  // Bake colour-less copies of the four authored special marbles. A power-up
+  // must never read as a matchable colour, so the original art is desaturated
+  // and tinted with the neutral stone body before it becomes the runtime
+  // texture (`zs-marble-<type>`).
+  createNeutralSpecialTextures(size) {
+    SPECIAL_MARBLE_TYPES.forEach((type) => {
+      const key = `zs-marble-${type}`;
+      const sourceKey = `${key}-0`;
+
+      if (this.textures.exists(key) || !this.textures.exists(sourceKey)) {
+        return;
+      }
+
+      const source = this.textures.get(sourceKey).getSourceImage();
+      const texture = this.textures.createCanvas(key, size, size);
+
+      if (!texture) {
+        return;
+      }
+
+      const ctx = texture.getContext();
+
+      ctx.clearRect(0, 0, size, size);
+      // Desaturate the authored marble, then wash the stone body over the
+      // existing pixels only (source-atop keeps the round silhouette).
+      ctx.filter = 'grayscale(1) brightness(1.12)';
+      ctx.drawImage(source, 0, 0, size, size);
+
+      ctx.filter = 'none';
+      ctx.globalCompositeOperation = 'source-atop';
+      ctx.fillStyle = `rgba(95, 111, 99, 0.42)`;
+      ctx.fillRect(0, 0, size, size);
+      ctx.globalCompositeOperation = 'source-over';
+
+      texture.refresh();
+    });
   }
 
   updateChainMovement(step) {
@@ -3520,8 +4320,17 @@ export class GameScene extends Phaser.Scene {
       const front = segments[index - 1];
       const rearHead = rear[0];
       const frontTail = front[front.length - 1];
+      const holeT = frontTail.t - rearHead.t;
+      const holeSlots = deltaT > 0 ? holeT / deltaT : Number.POSITIVE_INFINITY;
 
-      if (rearHead.colorIndex === frontTail.colorIndex) {
+      // Magnetism only closes a hole that is smaller than MAGNET_MAX_SLOTS.
+      // A special marble is colour-less (colorIndex -1), so it can never be
+      // magnetically pulled and never fakes a same-colour connection.
+      if (
+        rearHead.colorIndex >= 0 &&
+        rearHead.colorIndex === frontTail.colorIndex &&
+        holeSlots <= MAGNET_MAX_SLOTS
+      ) {
         rear.speed = catchUpTravelT;
         rear.isMagnetic = true;
       }
@@ -3534,7 +4343,7 @@ export class GameScene extends Phaser.Scene {
       // the back towards the front, so the inherited speed keeps propagating
       // into the next stopped car in the same frame: the connected chain is
       // pushed like a train instead of one car at a time.
-      const closingDistance = frontTail.t - rearHead.t - deltaT;
+      const closingDistance = holeT - deltaT;
 
       if (closingDistance <= rear.speed + 0.002) {
         // The inherited speed is capped at the base chain speed. A magnetic
@@ -3571,6 +4380,7 @@ export class GameScene extends Phaser.Scene {
 
           if (
             current.isMagnetic &&
+            head.colorIndex >= 0 &&
             head.colorIndex === frontTail.colorIndex &&
             !comboMarble
           ) {
@@ -3630,7 +4440,7 @@ export class GameScene extends Phaser.Scene {
 
   getTrackPoint(distance, chain = this.chains[0]) {
     if (!chain || chain.trackLength <= 0) {
-      return new Phaser.Math.Vector2(CENTER_X, CENTER_Y);
+      return new Phaser.Math.Vector2(this.cx, this.cy);
     }
 
     const t = Phaser.Math.Clamp(distance / chain.trackLength, 0, 1);
@@ -3840,6 +4650,9 @@ export class GameScene extends Phaser.Scene {
       .setData('colorIndex', this.currentBulletColor);
 
     this.cannon.add([turret, this.shooterIndicator]);
+
+    // Anchor the freshly built launcher on the live board centre.
+    this.layoutLauncher();
   }
 
   updateShooterIndicator() {
@@ -3896,6 +4709,12 @@ export class GameScene extends Phaser.Scene {
     // swallow the scene-level event dispatched for the same press so changing
     // a level can never launch a run or fire a marble.
     if (this.consumeMenuControlClick(pointer)) {
+      return;
+    }
+
+    // The music capsule exists on every screen (menu, play, results). Tapping
+    // it must never aim, shoot, start or restart anything.
+    if (this.consumeMusicButtonClick(pointer)) {
       return;
     }
 
@@ -3963,14 +4782,39 @@ export class GameScene extends Phaser.Scene {
     return isSamePress;
   }
 
+  // True when this scene-level pointerdown belongs to the music capsule. The
+  // one-shot press marker covers the dispatch order where the capsule handler
+  // already ran, the cached bounds cover the opposite order. A lost run
+  // restarts on any click, so this guard is what keeps the mute button from
+  // wiping the result screen.
+  consumeMusicButtonClick(pointer) {
+    if (this.musicControlDownTime !== null) {
+      const isSamePress = pointer.downTime === this.musicControlDownTime;
+      this.musicControlDownTime = null;
+
+      if (isSamePress) {
+        return true;
+      }
+    }
+
+    return !!(
+      this.musicButtonBounds &&
+      Phaser.Geom.Rectangle.Contains(
+        this.musicButtonBounds,
+        pointer.worldX,
+        pointer.worldY,
+      )
+    );
+  }
+
   shootAt(targetX, targetY) {
     if (!this.cannon) {
       return;
     }
 
     const distanceToTarget = Phaser.Math.Distance.Between(
-      CENTER_X,
-      CENTER_Y,
+      this.launcherX,
+      this.launcherY,
       targetX,
       targetY,
     );
@@ -3979,16 +4823,20 @@ export class GameScene extends Phaser.Scene {
     const angle =
       distanceToTarget < 1
         ? this.cannon.rotation
-        : Phaser.Math.Angle.Between(CENTER_X, CENTER_Y, targetX, targetY);
+        : Phaser.Math.Angle.Between(
+            this.launcherX,
+            this.launcherY,
+            targetX,
+            targetY,
+          );
 
-    const muzzleX = CENTER_X + Math.cos(angle) * SHOT_SPAWN_OFFSET;
-    const muzzleY = CENTER_Y + Math.sin(angle) * SHOT_SPAWN_OFFSET;
+    const muzzleX = this.launcherX + Math.cos(angle) * SHOT_SPAWN_OFFSET;
+    const muzzleY = this.launcherY + Math.sin(angle) * SHOT_SPAWN_OFFSET;
     const colorIndex = this.currentBulletColor;
 
     // Consume the loaded marble and immediately promote the queued colour.
     this.currentBulletColor = this.nextBulletColor;
-    this.nextBulletColor =
-      (this.nextBulletColor + 1) % this.getActiveColorCount();
+    this.nextBulletColor = this.pickNextBulletColor(this.currentBulletColor);
     this.updateShooterIndicator();
     this.cannon.setRotation(angle);
 
@@ -4067,9 +4915,9 @@ export class GameScene extends Phaser.Scene {
       const { x, y } = shot.sprite;
       if (
         x < -SHOT_CULL_MARGIN ||
-        x > VIEW_WIDTH + SHOT_CULL_MARGIN ||
+        x > this.vw + SHOT_CULL_MARGIN ||
         y < -SHOT_CULL_MARGIN ||
-        y > VIEW_HEIGHT + SHOT_CULL_MARGIN
+        y > this.vh + SHOT_CULL_MARGIN
       ) {
         shot.sprite.destroy();
         this.shots.splice(index, 1);
@@ -4176,18 +5024,18 @@ export class GameScene extends Phaser.Scene {
     const candidates = [];
 
     if (dirX > 1e-6) {
-      candidates.push((VIEW_WIDTH - originX) / dirX);
+      candidates.push((this.vw - originX) / dirX);
     } else if (dirX < -1e-6) {
       candidates.push((0 - originX) / dirX);
     }
 
     if (dirY > 1e-6) {
-      candidates.push((VIEW_HEIGHT - originY) / dirY);
+      candidates.push((this.vh - originY) / dirY);
     } else if (dirY < -1e-6) {
       candidates.push((0 - originY) / dirY);
     }
 
-    let distance = Math.hypot(VIEW_WIDTH, VIEW_HEIGHT);
+    let distance = Math.hypot(this.vw, this.vh);
 
     for (const candidate of candidates) {
       if (candidate > 0 && candidate < distance) {
@@ -4210,8 +5058,8 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    const originX = CENTER_X;
-    const originY = CENTER_Y;
+    const originX = this.launcherX;
+    const originY = this.launcherY;
     const angle = this.cannon ? this.cannon.rotation : -Math.PI / 2;
     const dirX = Math.cos(angle);
     const dirY = Math.sin(angle);
@@ -4967,9 +5815,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   createInsertPulse(x, y, colorIndex) {
-    const color = Phaser.Display.Color.HexStringToColor(
-      MARBLE_COLORS[colorIndex % MARBLE_COLORS.length],
-    ).color;
+    const color = this.getMarbleColorValue(colorIndex);
 
     const ring = this.add
       .circle(x, y, 24, color, 0.08)
@@ -4987,9 +5833,8 @@ export class GameScene extends Phaser.Scene {
   }
 
   createMatchBurst(x, y, colorIndex) {
-    const color = Phaser.Display.Color.HexStringToColor(
-      MARBLE_COLORS[colorIndex % MARBLE_COLORS.length],
-    ).color;
+    // Specials have no colour; getMarbleColorValue falls back to stone.
+    const color = this.getMarbleColorValue(colorIndex);
 
     // White impact flash pulse.
     const whiteFlash = this.add
@@ -5053,14 +5898,7 @@ export class GameScene extends Phaser.Scene {
     const cap = this.getBonusCap();
     const regularTarget = Math.max(1, cap - 1);
     const positions = [];
-    const anchors = Phaser.Utils.Array.Shuffle([
-      { x: 240, y: 220 },
-      { x: 560, y: 220 },
-      { x: 200, y: 300 },
-      { x: 600, y: 300 },
-      { x: 240, y: 260 },
-      { x: 560, y: 260 },
-    ]);
+    const anchors = Phaser.Utils.Array.Shuffle(this.getBonusAnchors());
 
     // Regular 100-point pickups must be directly reachable; otherwise every
     // star would accidentally become a 300-point gap shot. Early worlds spawn
@@ -5073,12 +5911,12 @@ export class GameScene extends Phaser.Scene {
       const x = Phaser.Math.Clamp(
         anchor.x + Phaser.Math.Between(-10, 10),
         70,
-        VIEW_WIDTH - 70,
+        Math.max(70, this.vw - 70),
       );
       const y = Phaser.Math.Clamp(
         anchor.y + Phaser.Math.Between(-10, 10),
         80,
-        VIEW_HEIGHT - 70,
+        Math.max(80, this.vh - 70),
       );
 
       if (
@@ -5105,7 +5943,10 @@ export class GameScene extends Phaser.Scene {
     // a gap in the chain, so it is worth the 300-point Gap Shot bonus. It is
     // only added once the world's cap leaves room for a second pickup.
     if (cap > 1) {
-      let gapX = Phaser.Math.Between(480, 600);
+      let gapX = Phaser.Math.Between(
+        this.cx + this.vw * 0.1,
+        this.cx + this.vw * 0.25,
+      );
       let gapY = Phaser.Math.Between(24, 34);
 
       if (
@@ -5118,7 +5959,7 @@ export class GameScene extends Phaser.Scene {
         ) ||
         !this.shotPathCrossesTrack(gapX, gapY)
       ) {
-        gapX = 540;
+        gapX = this.cx + this.vw * 0.175;
         gapY = 28;
       }
 
@@ -5188,8 +6029,23 @@ export class GameScene extends Phaser.Scene {
     graphics.destroy();
   }
 
+  // Curated pickup anchors as fractions of the live board, so the same layout
+  // works on a wide desktop board and on a tall phone board.
+  getBonusAnchors() {
+    return [
+      [0.3, 0.367],
+      [0.7, 0.367],
+      [0.25, 0.5],
+      [0.75, 0.5],
+      [0.3, 0.433],
+      [0.7, 0.433],
+    ].map(([fx, fy]) => ({ x: fx * this.vw, y: fy * this.vh }));
+  }
+
   isBonusPositionClear(x, y, positions, clearance) {
-    if (Phaser.Math.Distance.Between(CENTER_X, CENTER_Y, x, y) < 115) {
+    if (
+      Phaser.Math.Distance.Between(this.launcherX, this.launcherY, x, y) < 115
+    ) {
       return false;
     }
 
@@ -5207,30 +6063,23 @@ export class GameScene extends Phaser.Scene {
   // Worlds 1-2; a board-wide fallback grid makes sure the progressive pickup
   // cap can still be filled on World 3's busier dual-track board.
   findOpenBonusSpot(positions, allowCross = false) {
-    const anchors = Phaser.Utils.Array.Shuffle([
-      { x: 240, y: 220 },
-      { x: 560, y: 220 },
-      { x: 200, y: 300 },
-      { x: 600, y: 300 },
-      { x: 240, y: 260 },
-      { x: 560, y: 260 },
-    ]);
+    const anchors = Phaser.Utils.Array.Shuffle(this.getBonusAnchors());
 
     const candidates = anchors.map((anchor) => ({
       x: Phaser.Math.Clamp(
         anchor.x + Phaser.Math.Between(-15, 15),
         70,
-        VIEW_WIDTH - 70,
+        Math.max(70, this.vw - 70),
       ),
       y: Phaser.Math.Clamp(
         anchor.y + Phaser.Math.Between(-15, 15),
         80,
-        VIEW_HEIGHT - 70,
+        Math.max(80, this.vh - 70),
       ),
     }));
 
-    for (let x = 90; x <= VIEW_WIDTH - 90; x += 40) {
-      for (let y = 130; y <= VIEW_HEIGHT - 100; y += 35) {
+    for (let x = 90; x <= this.vw - 90; x += 40) {
+      for (let y = 130; y <= this.vh - 100; y += 35) {
         candidates.push({ x, y });
       }
     }
@@ -5282,8 +6131,8 @@ export class GameScene extends Phaser.Scene {
 
     for (let step = 6; step <= steps - 4; step += 1) {
       const ratio = step / steps;
-      const x = CENTER_X + (targetX - CENTER_X) * ratio;
-      const y = CENTER_Y + (targetY - CENTER_Y) * ratio;
+      const x = this.launcherX + (targetX - this.launcherX) * ratio;
+      const y = this.launcherY + (targetY - this.launcherY) * ratio;
 
       if (this.distanceToTrack(x, y) < 14) {
         return true;
@@ -5457,11 +6306,20 @@ export class GameScene extends Phaser.Scene {
   /* ------------------------------------------------------------------ */
 
   createAmbientMotes() {
+    // A resize regenerates the field, so drop the previous motes (and their
+    // infinite tweens) first or every layout change would stack another 16.
+    for (const mote of this.moteSprites || []) {
+      this.tweens.killTweensOf(mote);
+      mote.destroy();
+    }
+
+    this.moteSprites = [];
+
     const rng = new Phaser.Math.RandomDataGenerator(['serpentine-motes']);
 
     for (let i = 0; i < 16; i += 1) {
-      const x = rng.between(34, VIEW_WIDTH - 34);
-      const y = rng.between(90, VIEW_HEIGHT - 50);
+      const x = rng.between(34, Math.max(68, this.vw - 34));
+      const y = rng.between(Math.min(90, this.vh / 4), Math.max(140, this.vh - 50));
       const radius = rng.realInRange(0.7, 1.9);
       const baseAlpha = rng.realInRange(0.12, 0.32);
 
@@ -5469,6 +6327,8 @@ export class GameScene extends Phaser.Scene {
         .circle(x, y, radius, 0xe4efaf, baseAlpha)
         .setDepth(DEPTH.motes)
         .setBlendMode(Phaser.BlendModes.ADD);
+
+      this.moteSprites.push(mote);
 
       this.tweens.add({
         targets: mote,
@@ -5614,7 +6474,7 @@ export class GameScene extends Phaser.Scene {
       .container(770, 570, [homeBg, homeHover, homeLabel, homeHitArea])
       .setDepth(DEPTH.hud);
 
-    this.add
+    const scoreLabel = this.add
       .text(770, 18, '目前分數', {
         fontFamily: UI_FONT,
         fontSize: '11px',
@@ -5645,7 +6505,7 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.54)
       .setDepth(DEPTH.hud);
 
-    this.add
+    const hintText = this.add
       .text(770, 77, '移動滑鼠瞄準，點擊發射', {
         fontFamily: UI_FONT,
         fontSize: '11px',
@@ -5665,9 +6525,21 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.38)
       .setDepth(DEPTH.hud);
 
+    // Kept so a resize can re-pin both HUD columns against the live board
+    // edges instead of the authored 800x600 corners.
+    this.hudLeftTexts = [title, this.levelText];
+    this.hudRightTexts = [
+      scoreLabel,
+      this.scoreText,
+      this.highScoreText,
+      hintText,
+      this.marbleCountText,
+    ];
+
     this.updateLevelHud();
     this.updateMarbleCount();
     this.updateScoreHud();
+    this.layoutHud();
   }
 
   // World/Stage-aware HUD labels (World-Stage + absolute difficulty D).
