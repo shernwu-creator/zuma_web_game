@@ -47,9 +47,11 @@ const PAUSE_LEVEL_CHANCE = 0.06;
 const REVERSE_DURATION = 2.0;
 const PAUSE_DURATION = 3.0;
 // Sniper marble: documented ~5% special chance (mutually exclusive with
-// bomb/reverse/pause) that grants a short aiming laser + instant shots.
+// bomb/reverse/pause) that grants an aiming laser + instant-fire shots. The
+// buff window was doubled from the original 3 s to 6 s so the reward is
+// actually worth playing around.
 const SNIPER_CHANCE = 0.05;
-const SNIPER_BUFF_DURATION = 3.0;
+const SNIPER_BUFF_DURATION = 6.0;
 const SNIPER_SHOT_SPEED = 10000; // instant-fire shot speed while buffed
 const SNIPER_LASER_DEPTH = 11; // above balls (5) and launcher (9)
 const BOMB_BLAST_NEIGHBOURS = 2;
@@ -4508,8 +4510,9 @@ export class GameScene extends Phaser.Scene {
     }
 
     // Sniper marble: the hit consumes the shot and the marble and grants
-    // the instant-fire buff (aiming laser + 10000 px/s shots) for 3 s. It
-    // removes the marble from its OWN chain only and never inserts/matches.
+    // the instant-fire buff (aiming laser + 10000 px/s shots) for
+    // SNIPER_BUFF_DURATION (6 s). It removes the marble from its OWN chain
+    // only and never inserts/matches.
     if (hitMarble.isSniper) {
       const shotIndex = this.shots.indexOf(shot);
       if (shotIndex !== -1) {
@@ -4636,6 +4639,54 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  // Inclusive [start, end] index range destroyed by a bomb. The chain array is
+  // ordered head -> tail (t descending), so the shockwave simply walks outwards
+  // from the bomb index and stops at the first real gap. Two neighbouring
+  // marbles that are more than one diameter apart form a hole that absorbs the
+  // blast, so marbles beyond it are neither destroyed nor displaced: the
+  // explosion can never travel across empty track to reach a distant marble.
+  getBombBlastRange(marbles, bombIndex, deltaT) {
+    const contactTolerance = 0.005;
+    let start = bombIndex;
+    let end = bombIndex;
+
+    // Towards the head of the chain (front of the blast).
+    for (let step = 0; step < BOMB_BLAST_NEIGHBOURS; step += 1) {
+      const index = start - 1;
+
+      if (index < 0) {
+        break;
+      }
+
+      const gap = marbles[index].t - marbles[index + 1].t;
+
+      if (!Number.isFinite(gap) || gap > deltaT + contactTolerance) {
+        break;
+      }
+
+      start = index;
+    }
+
+    // Towards the tail of the chain (back of the blast).
+    for (let step = 0; step < BOMB_BLAST_NEIGHBOURS; step += 1) {
+      const index = end + 1;
+
+      if (index > marbles.length - 1) {
+        break;
+      }
+
+      const gap = marbles[index - 1].t - marbles[index].t;
+
+      if (!Number.isFinite(gap) || gap > deltaT + contactTolerance) {
+        break;
+      }
+
+      end = index;
+    }
+
+    return { start, end };
+  }
+
   resolveBombHit(shot, bombMarble, bombIndex) {
     this.playExplosionSound();
 
@@ -4651,10 +4702,14 @@ export class GameScene extends Phaser.Scene {
     const bombX = bombMarble.x;
     const bombY = bombMarble.y;
     const colorIndex = bombMarble.colorIndex;
-    const start = Math.max(0, bombIndex - BOMB_BLAST_NEIGHBOURS);
-    const end = Math.min(
-      marbles.length - 1,
-      bombIndex + BOMB_BLAST_NEIGHBOURS,
+    // Blast radius measured along the track: only the marbles physically
+    // packed against the blast group are destroyed, and the survivors below
+    // keep their own t. No push is applied anywhere else, so a hole in the
+    // chain stops the shockwave instead of shoving distant marbles into it.
+    const { start, end } = this.getBombBlastRange(
+      marbles,
+      bombIndex,
+      chain ? chain.deltaT : 0,
     );
 
     const destroyed = marbles.splice(start, end - start + 1);

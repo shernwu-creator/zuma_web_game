@@ -11,10 +11,11 @@ const game = new Phaser.Game({
   scene: [GameScene],
   scale: {
     // Keep the fixed 4:3 playfield letterboxed and centred on every device.
+    // No orientation is forced: the board is playable in BOTH portrait and
+    // landscape, and FIT simply letterboxes the canvas inside its parent on
+    // whichever axis the device leaves over.
     mode: Phaser.Scale.FIT,
     autoCenter: Phaser.Scale.CENTER_BOTH,
-    // Mobile browsers get a landscape canvas and a smoothly expanding parent.
-    orientation: Phaser.Scale.LANDSCAPE,
     expandParent: true,
     autoRound: true,
     resizeInterval: 250,
@@ -44,9 +45,10 @@ const isCoarsePointer = () => {
   );
 };
 
-// Best-effort fullscreen + landscape lock. Every step is optional: desktop
-// browsers, iOS Safari and embedded webviews simply reject these promises, so
-// failures are swallowed and the normal FIT canvas keeps working.
+// Best-effort fullscreen request. Every step is optional: desktop browsers,
+// iOS Safari and embedded webviews simply reject the promise, so failures are
+// swallowed and the normal FIT canvas keeps working. The screen orientation is
+// deliberately NOT locked any more: portrait and landscape are both playable.
 const requestImmersiveMode = async () => {
   const root = document.documentElement;
 
@@ -59,17 +61,6 @@ const requestImmersiveMode = async () => {
     }
   } catch {
     // Fullscreen may be blocked by policy or unsupported (iOS Safari).
-  }
-
-  try {
-    if (
-      screen.orientation &&
-      typeof screen.orientation.lock === 'function'
-    ) {
-      await screen.orientation.lock('landscape');
-    }
-  } catch {
-    // Orientation lock needs fullscreen + browser support; safe to ignore.
   }
 };
 

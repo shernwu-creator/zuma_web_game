@@ -180,92 +180,23 @@ noscript {
 }
 
 /* ------------------------------------------------------------------ */
-/* Portrait rotate-to-landscape hint                                   */
+/* Portrait phones                                                     */
 /* ------------------------------------------------------------------ */
 
-.rotate-hint {
-  position: fixed;
-  z-index: 50;
-  inset: 0;
-  display: none;
-  place-items: center;
-  padding:
-    max(28px, env(safe-area-inset-top, 0px))
-    max(28px, env(safe-area-inset-right, 0px))
-    max(28px, env(safe-area-inset-bottom, 0px))
-    max(28px, env(safe-area-inset-left, 0px));
-  background:
-    radial-gradient(ellipse 90% 70% at 50% 40%, rgb(12 28 18 / 92%), rgb(3 9 5 / 97%));
-  pointer-events: none;
-  text-align: center;
-}
-
-.rotate-hint__card {
-  display: flex;
-  max-width: 340px;
-  flex-direction: column;
-  align-items: center;
-  gap: 14px;
-  padding: 28px 26px 26px;
-  border: 1px solid rgb(215 193 125 / 32%);
-  border-radius: 20px;
-  background: rgb(8 20 12 / 82%);
-  box-shadow:
-    0 24px 64px rgb(0 0 0 / 55%),
-    inset 0 0 0 1px rgb(230 239 203 / 6%);
-  color: #f7e9c2;
-  font-family: "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif;
-}
-
-.rotate-hint__device {
-  position: relative;
-  width: 46px;
-  height: 76px;
-  border: 2px solid #d7c17d;
-  border-radius: 11px;
-  box-shadow: 0 0 22px rgb(215 193 125 / 22%);
-  animation: rotate-device 2.6s ease-in-out infinite;
-}
-
-.rotate-hint__screen {
-  position: absolute;
-  inset: 5px 4px;
-  border-radius: 6px;
-  background: linear-gradient(160deg, rgb(95 137 88 / 55%), rgb(22 48 29 / 85%));
-}
-
-.rotate-hint__title {
-  margin: 0;
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-}
-
-.rotate-hint__copy {
-  margin: 0;
-  color: rgb(214 226 195 / 72%);
-  font-size: 13px;
-  line-height: 1.7;
-}
-
-@keyframes rotate-device {
-  0%,
-  24% {
-    transform: rotate(0deg);
+/* The game no longer forces a landscape screen: portrait and landscape are
+   both fully playable. The 4:3 board stays centred and is additionally capped
+   by the viewport height so it can never clip on short portrait windows. */
+@media (orientation: portrait) {
+  body {
+    padding:
+      max(8px, env(safe-area-inset-top, 0px))
+      max(8px, env(safe-area-inset-right, 0px))
+      max(8px, env(safe-area-inset-bottom, 0px))
+      max(8px, env(safe-area-inset-left, 0px));
   }
 
-  64%,
-  100% {
-    transform: rotate(90deg);
-  }
-}
-
-/* Only portrait touch devices see the hint: desktop (fine pointer / hover)
-   and every landscape orientation stay clean and fully interactive. */
-@media (orientation: portrait) and (max-width: 900px) and (hover: none),
-  (orientation: portrait) and (max-width: 900px) and (pointer: coarse) {
-  .rotate-hint {
-    display: grid;
+  .shell {
+    width: min(800px, 100%, calc((100svh - 28px) * 4 / 3));
   }
 }
 
@@ -274,10 +205,5 @@ noscript {
   *::before,
   *::after {
     scroll-behavior: auto !important;
-  }
-
-  .rotate-hint__device {
-    animation: none;
-    transform: rotate(90deg);
   }
 }
