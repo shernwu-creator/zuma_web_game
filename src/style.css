@@ -23,16 +23,19 @@ body {
   touch-action: manipulation;
 }
 
+/* The body is nothing but the page background. It is deliberately NOT a grid
+   (or flex) container any more: a desktop browser extension that injects an
+   extra node into <body> would create implicit grid rows and split the viewport
+   height between all of them, which trapped the intrinsically zero-height
+   .shell in the top third of the screen. The play shell is pinned to the
+   viewport instead (see .shell), so nothing rendered next to it can move,
+   shrink or re-flow it. */
 body {
-  display: grid;
-  height: 100svh;
-  min-height: 100svh;
-  place-items: center;
-  padding:
-    max(6px, env(safe-area-inset-top, 0px))
-    max(6px, env(safe-area-inset-right, 0px))
-    max(6px, env(safe-area-inset-bottom, 0px))
-    max(6px, env(safe-area-inset-left, 0px));
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  margin: 0;
   overflow: hidden;
   background:
     radial-gradient(ellipse 80% 56% at 50% 6%, rgb(56 96 63 / 34%), transparent 62%),
@@ -50,13 +53,26 @@ body::before {
   pointer-events: none;
 }
 
+/* The shell is locked to all four viewport edges and carries the safe-area
+   padding itself, so it no longer depends on how <body> lays out its children.
+   This is the last line of defence against any foreign node (browser extension,
+   injected banner, devtools overlay) squeezing the playfield. */
 .shell {
+  position: fixed;
+  z-index: 1;
+  inset: 0;
   display: flex;
-  width: 100%;
-  height: 100%;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
   min-height: 0;
   flex-direction: column;
   gap: 6px;
+  padding:
+    max(6px, env(safe-area-inset-top, 0px))
+    max(6px, env(safe-area-inset-right, 0px))
+    max(6px, env(safe-area-inset-bottom, 0px))
+    max(6px, env(safe-area-inset-left, 0px));
 }
 
 .stage {
@@ -66,7 +82,7 @@ body::before {
   min-height: 0;
   /* Basis 0 (instead of auto) so the playfield height comes from the free
      space in .shell and can never collapse to the height of the caption. */
-  flex: 1 1 0;
+  flex: 1 1 0%;
   overflow: hidden;
   border: 1px solid rgb(196 218 155 / 15%);
   border-radius: 18px;
@@ -93,6 +109,8 @@ body::before {
 #game {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
 }
 
 #game canvas {
@@ -122,16 +140,13 @@ noscript {
 }
 
 @media (max-width: 560px) {
-  body {
+  .shell {
+    gap: 4px;
     padding:
       max(4px, env(safe-area-inset-top, 0px))
       max(4px, env(safe-area-inset-right, 0px))
       max(4px, env(safe-area-inset-bottom, 0px))
       max(4px, env(safe-area-inset-left, 0px));
-  }
-
-  .shell {
-    gap: 4px;
   }
 
   .stage {

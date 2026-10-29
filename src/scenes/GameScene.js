@@ -2945,28 +2945,12 @@ export class GameScene extends Phaser.Scene {
     container.setPosition(this.uiOriginX, this.uiOriginY);
 
     if (backdrop) {
-      // Phaser Rectangle.setSize() only changes its input hit area; it does
-      // not resize the rendered shape. Assign the visible width/height so the
-      // dim backdrop actually covers the whole live board (16:9 included)
-      // instead of staying clipped to the 800x600 design box.
-      backdrop.width = this.vw / scale;
-      backdrop.height = this.vh / scale;
-
-      // Rectangle rendering uses `geom` + cached `pathData`, not the public
-      // width/height fields. Sync them (without calling setSize(), whose
-      // input-side effect is not needed here) and refresh the display origin so
-      // the enlarged rectangle is what actually gets drawn.
-      if (backdrop.geom) {
-        backdrop.geom.setSize(backdrop.width, backdrop.height);
-      }
-
-      if (typeof backdrop.updateData === 'function') {
-        backdrop.updateData();
-      }
-
-      if (typeof backdrop.updateDisplayOrigin === 'function') {
-        backdrop.updateDisplayOrigin();
-      }
+      // setDisplaySize() drives width, height and scale together through the
+      // object's transform, so the backdrop covers the whole live board on both
+      // the WebGL and the Canvas renderer. Assigning `width` alone only changed
+      // the shape's data and left the rendered quad at design size.
+      backdrop.setPosition(CENTER_X, CENTER_Y);
+      backdrop.setDisplaySize(this.vw / scale, this.vh / scale);
     }
   }
 
@@ -2996,13 +2980,17 @@ export class GameScene extends Phaser.Scene {
     return this.mapDesignLayout(spec.points);
   }
 
-  // Map a design-space (800x600) point list onto the live board. Only offsets
-  // from the board centre are scaled, so two lanes can only ever move further
-  // apart than in the authored layout - never closer than one marble.
+  // Map a design-space (800x600) point list onto the live board. The X and Y
+  // axes are scaled separately so a landscape serpentine stretches out and
+  // fills a 16:9 board instead of sitting as a small 4:3 island in the middle.
+  // X is capped at 1.45x the Y scale so an ultra-wide window cannot smear the
+  // curves horizontally; both axes keep a 0.6 floor so two lanes can only ever
+  // move further apart than in the authored layout - never closer than one
+  // marble.
   mapDesignLayout(points) {
     const marginX = 30;
     const marginY = 30;
-    const sx = Math.max(
+    const rawSx = Math.max(
       0.6,
       (this.vw - marginX * 2) / (VIEW_WIDTH - marginX * 2),
     );
@@ -3010,14 +2998,11 @@ export class GameScene extends Phaser.Scene {
       0.6,
       (this.vh - marginY * 2) / (VIEW_HEIGHT - marginY * 2),
     );
-    // Never scale X and Y independently: doing so stretched the authored 4:3
-    // splines into distorted curves on a 16:9 board. A single uniform scale
-    // keeps each lane's true shape and merely centres the board.
-    const scale = Math.min(sx, sy);
+    const sx = Math.min(rawSx, sy * 1.45);
 
     return points.map(([x, y]) => [
-      this.cx + (x - CENTER_X) * scale,
-      this.cy + (y - CENTER_Y) * scale,
+      this.cx + (x - CENTER_X) * sx,
+      this.cy + (y - CENTER_Y) * sy,
     ]);
   }
 

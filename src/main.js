@@ -55,8 +55,8 @@ window.__ZUMA_GAME__ = game;
 // ScaleManager then fires RESIZE, which the scene listens to in order to
 // re-lay-out the backdrop, the track, the launcher, the HUD and the overlays.
 // Returns true when the board (and therefore the canvas) was rebuilt.
-const syncViewSize = (options = {}) => {
-  const size = computeViewSize(window, measureStage(), options);
+const syncViewSize = () => {
+  const size = computeViewSize(window, measureStage());
   const current = game.scale.gameSize;
 
   if (current.width === size.width && current.height === size.height) {
@@ -111,9 +111,11 @@ const repairCanvasFill = (attempt = 0) => {
   game.scale.refresh();
 
   if (attempt >= 1) {
-    // Still wrong, so the logical board itself is stale. Rebuild it from the
-    // live stage box and trust that measurement this time.
-    syncViewSize({ trustBounds: true });
+    // Still wrong, so the logical board itself is stale: rebuild it from the
+    // current measurement. `trustBounds` is deliberately NOT forced here - that
+    // bypassed the MIN_STAGE_RATIO guard in viewport.js and locked the canvas
+    // to a bogus flat aspect while the page was still settling.
+    syncViewSize();
     game.scale.refresh();
     return;
   }
