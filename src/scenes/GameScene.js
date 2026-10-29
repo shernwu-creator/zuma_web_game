@@ -1,5 +1,11 @@
 import Phaser from 'phaser';
 import { computeViewSize, DESIGN_HEIGHT, DESIGN_WIDTH } from './viewport.js';
+import {
+  dualInnerTrackPoints,
+  landscapeTrackPoints,
+  portraitTrackFrame,
+  portraitTrackPoints,
+} from './trackLayouts.js';
 
 // Design-space constants. Overlays (menu, victory/loss panel), baked textures
 // and the HUD anchors are authored in this 800x600 space; live gameplay uses
@@ -179,91 +185,6 @@ const WORLD_THEMES = [
   },
 ];
 
-// One outer track per stage, cycled with `(D - 1) % TRACK_LAYOUTS.length`.
-// Every layout lives inside the 800x600 board and keeps the sampled track
-// centerline clear (>= 22px, plus a little margin) of the on-screen UI:
-//   - top-left HUD title/level area  (about 15..300 x 15..110)
-//   - top-right score HUD            (about 610..800 x 10..110)
-//   - bottom-right home capsule      (about 646..770 x 536..570 + margin)
-// Most entrances (t = 0) are on the left/upper-left edge; layout 4 is the
-// exception and enters from the bottom-right corner. Each layout keeps a
-// distinct silhouette:
-//   layout 1 - wide S crossing the board (original S shape, re-routed around UI)
-//   layout 2 - two staggered S-bands (upper serpentine -> right descent ->
-//              lower serpentine) with more, tighter bends than layout 1
-//   layout 3 - a wavy loop that encircles the launcher and opens on the left
-//   layout 4 - enters bottom-right (clear of the home capsule) and spirals
-//              inwards towards the middle of the board
-//   layout 5 - continuous hairpin switchbacks running up and down the board
-const TRACK_LAYOUTS = [
-  // Layout 1: wide S, re-routed around the UI corners.
-  [
-    [44, 162], [140, 146], [248, 140], [322, 134], [396, 96], [478, 68],
-    [560, 80], [588, 132], [600, 190], [660, 238], [738, 300], [712, 356],
-    [600, 398], [470, 384], [360, 402], [240, 384], [152, 424], [118, 496],
-    [160, 552], [270, 576], [390, 580], [500, 560], [562, 516], [612, 468],
-    [690, 452],
-  ],
-  // Layout 2: double S-band serpentine with extra bends.
-  [
-    [46, 150], [170, 144], [250, 146], [315, 140], [370, 116], [430, 80],
-    [490, 64], [540, 86], [570, 120], [592, 164], [636, 190], [684, 222],
-    [728, 256], [748, 302], [742, 352], [712, 398], [676, 436], [620, 470],
-    [540, 446], [460, 478], [380, 450], [300, 482], [220, 454], [140, 486],
-    [100, 446], [68, 400],
-  ],
-  // Layout 3: wavy loop around the launcher, open on the left.
-  [
-    [58, 204], [150, 176], [250, 154], [340, 134], [410, 88], [475, 58],
-    [535, 76], [572, 112], [600, 164], [650, 214], [712, 250], [754, 300],
-    [734, 356], [750, 412], [716, 456], [680, 470], [594, 500], [490, 492],
-    [386, 524], [282, 496], [178, 532], [72, 544], [50, 486], [58, 418],
-    [56, 360], [82, 306], [126, 268], [162, 246],
-  ],
-  // Layout 4: enters bottom-right (outside the home capsule) and spirals
-  // inwards towards the middle of the board.
-  [
-    [720, 470], [676, 494], [620, 492], [560, 512], [490, 536], [400, 540],
-    [300, 528], [190, 540], [104, 512], [64, 440], [58, 360], [72, 286],
-    [110, 220], [168, 166], [260, 142], [350, 130], [430, 112], [520, 130],
-    [590, 164], [646, 206], [694, 258], [716, 322], [700, 388], [650, 430],
-    [590, 458], [520, 468], [452, 446], [398, 406], [352, 392],
-  ],
-  // Layout 5: continuous hairpin switchbacks sweeping across the board.
-  [
-    [46, 150], [160, 142], [280, 138], [400, 128], [520, 140], [630, 150],
-    [700, 160], [742, 192], [752, 238], [744, 290], [728, 342], [706, 382],
-    [672, 404], [640, 424], [560, 420], [480, 438], [400, 420], [320, 440],
-    [240, 420], [160, 440], [96, 420], [64, 448], [56, 492], [82, 522],
-    [140, 540], [220, 530], [320, 548], [420, 530], [520, 548], [590, 536],
-    [618, 512], [636, 486], [664, 470], [680, 460],
-  ],
-];
-
-// World 3 runs TWO independent chains. The outer chain uses one of the five
-// TRACK_LAYOUTS; the inner chain uses one of these compact rings so the two
-// splines have clearly different silhouettes and both stay clear of the
-// launcher (>= 115px from the centre), the HUD corners and the home capsule.
-const DUAL_INNER_LAYOUTS = [
-  // Inner 1: rounded central circuit, open on the left.
-  [
-    [210, 190], [320, 165], [440, 170], [545, 205], [600, 270], [595, 345],
-    [545, 410], [455, 445], [350, 440], [255, 410], [195, 350], [180, 270],
-  ],
-  // Inner 2: wide wavy oval (upper band -> right descent -> lower band).
-  [
-    [170, 190], [270, 170], [380, 185], [490, 170], [590, 195], [650, 245],
-    [650, 355], [590, 405], [490, 425], [380, 420], [270, 425], [170, 405],
-    [120, 350], [120, 250],
-  ],
-  // Inner 3: diagonal sweep with a hooked lower-left return.
-  [
-    [180, 220], [290, 185], [410, 180], [520, 200], [600, 245], [630, 310],
-    [600, 375], [530, 420], [440, 430], [360, 420], [300, 370], [250, 390],
-    [200, 430], [150, 440], [120, 390], [130, 320], [150, 260],
-  ],
-];
-
 const OUTER_TRACK_STYLE = {
   shadow: 0x000000,
   shadowAlpha: 0.26,
@@ -318,10 +239,12 @@ export class GameScene extends Phaser.Scene {
     super({ key: 'GameScene' });
 
     // Tracks are level-dependent and do NOT exist on the start menu. They are
-    // (re)built in startLevel() from TRACK_LAYOUTS (plus DUAL_INNER_LAYOUTS for
-    // World 3) into independent chain contexts. `this.track*`, `this.deltaT`
-    // and `this.marbles` are kept as aliases of the primary (outer) chain for
-    // compatibility with older tooling and UI helpers.
+    // (re)built in startLevel() by buildLevelTracks(), which asks
+    // trackLayouts.js for the running stage's landscape/portrait family (plus
+    // the World-3 inner ring) and wraps each one in an independent chain
+    // context. `this.track*`, `this.deltaT` and `this.marbles` are kept as
+    // aliases of the primary (outer) chain for compatibility with older tooling
+    // and UI helpers.
     this.chains = [];
     this.primaryChain = null;
     this.spawnChainCursor = 0;
@@ -2996,17 +2919,17 @@ export class GameScene extends Phaser.Scene {
     );
   }
 
-  // Turn a level's layout spec into live board points. Landscape boards reuse
-  // the authored serpentines (simply spread to the window); portrait boards
-  // cannot fit them and get a generated spiral instead.
+  // Turn a level's layout spec into live board points. Landscape boards map the
+  // stage's authored/generated 800x600 mother onto the window; portrait boards
+  // generate their own family of routes instead.
   resolveLayoutPoints(spec) {
     if (!spec) {
-      return this.buildPortraitSpiral();
+      return this.buildPortraitTrack(1);
     }
 
     // A portrait board can never host the wide landscape serpentines.
     if (spec.portrait || this.isPortraitView) {
-      return this.buildPortraitSpiral();
+      return this.buildPortraitTrack(spec.difficulty ?? this.getDifficulty());
     }
 
     return this.mapDesignLayout(spec.points);
@@ -3038,46 +2961,38 @@ export class GameScene extends Phaser.Scene {
     ]);
   }
 
-  // Portrait boards cannot host the wide landscape serpentines, so the level
-  // generates its own track: a two-turn rounded-rectangle spiral around the
-  // turret. The chain enters on the outer coil and ends next to the launcher,
-  // exactly like the classic spiral stages. A portrait board is always
-  // single-track (see isDualTrack), so one spiral covers the whole level.
-  buildPortraitSpiral() {
-    const turns = 2;
-    const laneGap = BALL_DIAMETER + 10; // neighbouring coils never touch
-    const sideMargin = 26;
-    const topMargin = 126; // clears the two HUD rows
-    const bottomMargin = 104; // clears the home / music capsules
-
-    const startX = Math.max(120, this.vw / 2 - sideMargin);
-    const startY = Math.max(
-      startX,
-      Math.min(this.vh / 2 - topMargin, this.vh / 2 - bottomMargin),
+  // Portrait boards cannot host the wide landscape serpentines, so the stage
+  // generates its own route from the portrait family in trackLayouts.js: four
+  // geometric mothers (spiral, lobed/petal spiral, vertical serpentine with a
+  // central bypass, hourglass/pinched loop) crossed with eight parameter
+  // cycles, so all 30 portrait stages differ. The route is produced in live
+  // board pixels inside the portrait safe frame (top HUD, bottom capsules and
+  // side margins) and always ends >= 68px from the turret. A portrait board is
+  // single-track (see isDualTrack), so one route covers the whole level.
+  buildPortraitTrack(difficulty = this.getDifficulty()) {
+    return portraitTrackPoints(
+      difficulty,
+      portraitTrackFrame(this.vw, this.vh, BALL_DIAMETER),
     );
-    const endX = Math.max(56, startX - turns * laneGap);
-    const endY = Math.max(72, startY - turns * laneGap);
-    const steps = turns * 26;
-    // Exponent < 1 turns the ellipse into a squarish super-ellipse, which
-    // fills a phone screen far better than a round spiral.
-    const roundness = 0.66;
-    const points = [];
+  }
 
-    for (let i = 0; i <= steps; i += 1) {
-      const progress = i / steps;
-      const angle = -Math.PI / 2 + progress * turns * Math.PI * 2;
-      const radiusX = startX + (endX - startX) * progress;
-      const radiusY = startY + (endY - startY) * progress;
-      const cos = Math.cos(angle);
-      const sin = Math.sin(angle);
+  // Compatibility alias for tooling that still calls the old builder name.
+  buildPortraitSpiral() {
+    return this.buildPortraitTrack(this.getDifficulty());
+  }
 
-      points.push([
-        this.cx + radiusX * Math.sign(cos) * Math.abs(cos) ** roundness,
-        this.cy + radiusY * Math.sign(sin) * Math.abs(sin) ** roundness,
-      ]);
-    }
+  // Landscape route for one stage, in 800x600 design space: one of the eight
+  // mothers (five authored serpentines + star ring, corner maze, hourglass)
+  // plus the stage's safe transform. `mapDesignLayout` then spreads it over the
+  // live window.
+  buildLandscapeTrack(difficulty = this.getDifficulty()) {
+    return landscapeTrackPoints(difficulty).points;
+  }
 
-    return points;
+  // World 3's second, inner spline for one stage (three authored rings x four
+  // transforms + a stage wave).
+  buildDualInnerTrack(difficulty = this.getDifficulty()) {
+    return dualInnerTrackPoints(difficulty);
   }
 
   // Re-map the running level's splines after a window resize. Marble positions
@@ -3646,18 +3561,18 @@ export class GameScene extends Phaser.Scene {
     this.clearTrackVisuals();
 
     const difficulty = Math.max(1, this.getDifficulty());
-    const layoutIndex = (difficulty - 1) % TRACK_LAYOUTS.length;
-    // Portrait boards cannot host the wide landscape serpentines, so every
-    // stage there uses the generated spiral (see buildPortraitSpiral).
+    // Every stage owns its own route. The spec carries the difficulty (plus the
+    // resolved 800x600 points for landscape boards) so rebuildTrackForView() can
+    // regenerate exactly the same stage layout after a window resize: portrait
+    // routes are rebuilt from the difficulty against the live board, landscape
+    // ones are simply re-mapped from their stored design points.
     const specs = this.isPortraitView
-      ? [{ portrait: true, index: 0 }]
-      : [{ points: TRACK_LAYOUTS[layoutIndex] }];
+      ? [{ portrait: true, difficulty }]
+      : [{ points: this.buildLandscapeTrack(difficulty), difficulty }];
 
     // World 3 (D >= 21) gets a second, independent inner spline.
     if (this.isDualTrack()) {
-      const innerIndex =
-        (Math.max(21, difficulty) - 21) % DUAL_INNER_LAYOUTS.length;
-      specs.push({ points: DUAL_INNER_LAYOUTS[innerIndex] });
+      specs.push({ points: this.buildDualInnerTrack(difficulty), difficulty });
     }
 
     this.layoutSpecs = specs;
