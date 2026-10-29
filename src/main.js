@@ -54,15 +54,71 @@ window.__ZUMA_GAME__ = game;
 // Re-derive the logical board size whenever the viewport changes. Phaser's
 // ScaleManager then fires RESIZE, which the scene listens to in order to
 // re-lay-out the backdrop, the track, the launcher, the HUD and the overlays.
-const syncViewSize = () => {
-  const size = computeViewSize(window, measureStage());
+// Returns true when the board (and therefore the canvas) was rebuilt.
+const syncViewSize = (options = {}) => {
+  const size = computeViewSize(window, measureStage(), options);
   const current = game.scale.gameSize;
 
   if (current.width === size.width && current.height === size.height) {
-    return;
+    return false;
   }
 
   game.scale.setGameSize(size.width, size.height);
+  return true;
+};
+
+const stageHost = document.querySelector('.stage');
+const gameHost = document.getElementById('game');
+
+// FIT only leaves the canvas smaller than its parent when the logical board
+// aspect no longer matches the stage box, so "the canvas fills #game" is the
+// invariant that keeps the picture full screen. Checking it (instead of
+// assuming it) is what stops the board from ever staying squeezed into a
+// corner after a window restore, a tab switch or a mobile browser hiding its
+// toolbars at load time.
+const canvasFillsHost = () => {
+  const host = gameHost;
+  const canvas = game.canvas;
+
+  if (!host || !canvas) {
+    return true;
+  }
+
+  const hostRect = host.getBoundingClientRect();
+  const canvasRect = canvas.getBoundingClientRect();
+
+  // Not laid out yet (hidden tab, pre-boot): nothing to verify.
+  if (hostRect.width < 16 || hostRect.height < 16) {
+    return true;
+  }
+
+  if (canvasRect.width < 16 || canvasRect.height < 16) {
+    return true;
+  }
+
+  return (
+    canvasRect.width >= hostRect.width * 0.99 &&
+    canvasRect.height >= hostRect.height * 0.99
+  );
+};
+
+const repairCanvasFill = (attempt = 0) => {
+  if (canvasFillsHost()) {
+    return;
+  }
+
+  // First try the cheap fix: re-apply FIT against the current parent box.
+  game.scale.refresh();
+
+  if (attempt >= 1) {
+    // Still wrong, so the logical board itself is stale. Rebuild it from the
+    // live stage box and trust that measurement this time.
+    syncViewSize({ trustBounds: true });
+    game.scale.refresh();
+    return;
+  }
+
+  window.setTimeout(() => repairCanvasFill(attempt + 1), 180);
 };
 
 let viewResizeTimer = null;
@@ -75,11 +131,60 @@ const scheduleViewSync = (delay = 140) => {
   viewResizeTimer = setTimeout(() => {
     viewResizeTimer = null;
     syncViewSize();
+    repairCanvasFill();
   }, delay);
 };
 
 window.addEventListener('resize', () => scheduleViewSync());
 window.addEventListener('orientationchange', () => scheduleViewSync(320));
+
+// The window "resize" event is not the only thing that changes the stage box:
+// restoring a maximised window, the mobile browser hiding its URL bar, entering
+// fullscreen or a webfont swap all resize it. Watching the element itself keeps
+// the board matched to what the player actually sees.
+if (typeof ResizeObserver === 'function' && stageHost) {
+  const stageObserver = new ResizeObserver(() => scheduleViewSync(0));
+  stageObserver.observe(stageHost);
+}
+
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', () => scheduleViewSync(60));
+}
+
+document.addEventListener('fullscreenchange', () => scheduleViewSync(0));
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    scheduleViewSync(0);
+  }
+});
+window.addEventListener('pageshow', () => scheduleViewSync(0));
+
+// The very first measurement happens while the page is still settling, so the
+// board size is re-checked a few times after boot. Every call is idempotent:
+// an unchanged size does not touch the scene at all.
+const scheduleBootViewChecks = () => {
+  for (const delay of [0, 150, 500, 1200, 2500]) {
+    window.setTimeout(() => {
+      syncViewSize();
+      repairCanvasFill();
+    }, delay);
+  }
+
+  if (
+    document.fonts &&
+    document.fonts.ready &&
+    typeof document.fonts.ready.then === 'function'
+  ) {
+    document.fonts.ready
+      .then(() => {
+        syncViewSize();
+        repairCanvasFill();
+      })
+      .catch(() => {});
+  }
+};
+
+scheduleBootViewChecks();
 
 /* ------------------------------------------------------------------ */
 /* Optional mobile immersive mode                                      */

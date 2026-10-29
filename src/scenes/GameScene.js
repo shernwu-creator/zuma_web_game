@@ -108,6 +108,23 @@ const BGM_TRACKS = [
 ];
 const BGM_VOLUME = 0.42;
 
+// Victory clips. The same win panel hosts one of two cuts:
+//   landscape -> the wide 16:9 celebration clip (desktop, tablet, docked phone)
+//   portrait  -> a dedicated 720x1280 vertical clip, so a phone in portrait
+//                really fills its tall board instead of cover-cropping a
+//                16:9 video down to a thin strip.
+// Both files live in public/ and are referenced RELATIVE to the page for the
+// same GitHub Pages subpath reason as the BGM tracks. A missing/unplayable cut
+// simply falls back to the other one, then to the graphics fallback.
+const VICTORY_VIDEO_KEYS = {
+  landscape: 'zs-victory-video',
+  portrait: 'zs-victory-video-portrait',
+};
+const VICTORY_VIDEO_SOURCES = {
+  landscape: './match-three_game_stage_clear_20261027.mp4',
+  portrait: './marble_shooter_stage_clear_portrait_20261027.mp4',
+};
+
 // Distinct World palettes for the play board and the home-screen preview.
 // World 1 reuses the original jungle backdrop textures; the desert and volcano
 // variants are generated as canvases on first use.
@@ -394,6 +411,7 @@ export class GameScene extends Phaser.Scene {
     // Graphics/star fallback otherwise).
     this.victoryVideoSupported = false;
     this.victoryVideo = null;
+    this.victoryVideoKey = null;
     this.victoryVideoErrorHandler = null;
     this.victorySlot = null;
     this.victoryFallbackTweens = [];
@@ -491,6 +509,18 @@ export class GameScene extends Phaser.Scene {
           `[BGM] failed to load "${file.key}" (${file.src || file.url})`,
         );
       }
+
+      // A missing victory cut is survivable: the win panel falls back to the
+      // other orientation and finally to the generated graphics art.
+      if (
+        file &&
+        typeof file.key === 'string' &&
+        Object.values(VICTORY_VIDEO_KEYS).includes(file.key)
+      ) {
+        console.warn(
+          `[Victory] failed to load "${file.key}" (${file.src || file.url})`,
+        );
+      }
     });
 
     for (const track of BGM_TRACKS) {
@@ -522,12 +552,23 @@ export class GameScene extends Phaser.Scene {
       // Relative to the page (no leading "/"), so the clip also loads when the
       // build is deployed under a GitHub Pages subpath. The H.264 gate above
       // and the hasVictoryVideoTexture() fallback still guard playback.
-      this.load.video(
-        'zs-victory-video',
-        './match-three_game_stage_clear_20261027.mp4',
-        'loadeddata',
-        true,
-      );
+      // Both cuts are registered up front: the board can flip orientation
+      // (phone rotation, desktop window resize) while the win panel is open.
+      for (const orientation of Object.keys(VICTORY_VIDEO_KEYS)) {
+        const key = VICTORY_VIDEO_KEYS[orientation];
+
+        if (this.cache && this.cache.video && this.cache.video.exists(key)) {
+          continue;
+        }
+
+        this.load.video(
+          key,
+          VICTORY_VIDEO_SOURCES[orientation],
+          'loadeddata',
+          true,
+        );
+      }
+
       this.victoryVideoSupported = true;
       return true;
     } catch {
@@ -672,28 +713,9 @@ export class GameScene extends Phaser.Scene {
       this.menuBackdrop = null;
     }
 
-    if (this.victoryVideo) {
-      this.tweens.killTweensOf(this.victoryVideo);
-
-      if (this.victoryVideoErrorHandler) {
-        try {
-          this.victoryVideoErrorHandler.element.removeEventListener(
-            'error',
-            this.victoryVideoErrorHandler.handler,
-          );
-        } catch {
-          // The media element may already be gone.
-        }
-        this.victoryVideoErrorHandler = null;
-      }
-
-      try {
-        this.victoryVideo.stop();
-      } catch {
-        // Video may already be torn down by a scene shutdown.
-      }
-      this.victoryVideo = null;
-    }
+    // The win video owns a media element plus a private texture key, so it is
+    // torn down through its own helper (stops playback, frees the texture).
+    this.destroyVictoryVideo();
 
     if (this.victoryFallbackTweens.length > 0) {
       for (const tween of this.victoryFallbackTweens) {
@@ -2257,22 +2279,22 @@ export class GameScene extends Phaser.Scene {
 
   // Phaser's video loader stores the clip in the Video Cache (not the Texture
   // Manager); a same-key canvas texture must not be treated as playable.
-  hasVictoryVideoTexture() {
+  hasVictoryVideoTexture(key = VICTORY_VIDEO_KEYS.landscape) {
     try {
       if (
         this.cache &&
         this.cache.video &&
         typeof this.cache.video.exists === 'function' &&
-        this.cache.video.exists('zs-victory-video')
+        this.cache.video.exists(key)
       ) {
         return true;
       }
 
-      if (!this.textures.exists('zs-victory-video')) {
+      if (!this.textures.exists(key)) {
         return false;
       }
 
-      const texture = this.textures.get('zs-victory-video');
+      const texture = this.textures.get(key);
       const source = texture && texture.source && texture.source[0];
       return !!(source && source.video);
     } catch {
@@ -2280,22 +2302,40 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  // Which cut the current board should show. Portrait boards (phones held
+  // upright) get the vertical clip; everything else keeps the landscape clip
+  // that was already shipped. If the preferred file is missing or unplayable
+  // the other one is used, so a deployment that forgets one asset still shows a
+  // video instead of the fallback art.
+  resolveVictoryVideoKey() {
+    const preferred = this.isPortraitView
+      ? VICTORY_VIDEO_KEYS.portrait
+      : VICTORY_VIDEO_KEYS.landscape;
+    const other =
+      preferred === VICTORY_VIDEO_KEYS.portrait
+        ? VICTORY_VIDEO_KEYS.landscape
+        : VICTORY_VIDEO_KEYS.portrait;
+
+    if (this.hasVictoryVideoTexture(preferred)) {
+      return preferred;
+    }
+
+    return this.hasVictoryVideoTexture(other) ? other : null;
+  }
+
   // Build the win-layer objects. The caller adds them to a dedicated slot
   // container placed right after the backdrop and before all text/buttons, so
   // `進入下一關` always renders on top and stays clickable.
   createVictoryAnimation() {
-    if (this.hasVictoryVideoTexture()) {
+    const videoKey = this.resolveVictoryVideoKey();
+
+    if (videoKey) {
       try {
-        return this.createVictoryVideo();
+        return this.createVictoryVideo(videoKey);
       } catch {
-        if (this.victoryVideo) {
-          try {
-            this.victoryVideo.destroy();
-          } catch {
-            // Already torn down.
-          }
-          this.victoryVideo = null;
-        }
+        // A half-built video still owns a texture key, so tear it down fully
+        // before falling back to the generated art.
+        this.destroyVictoryVideo();
       }
     }
 
@@ -2309,10 +2349,9 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    const key = this.victoryVideoKey || VICTORY_VIDEO_KEYS.landscape;
     const cached =
-      this.cache && this.cache.video
-        ? this.cache.video.get('zs-victory-video')
-        : null;
+      this.cache && this.cache.video ? this.cache.video.get(key) : null;
     const element = video.video;
     const sourceWidth =
       (element && element.videoWidth) ||
@@ -2325,13 +2364,102 @@ export class GameScene extends Phaser.Scene {
     const cover = Math.max(this.vw / sourceWidth, this.vh / sourceHeight);
 
     video.setPosition(this.cx, this.cy);
-    video.setDisplaySize(sourceWidth * cover, sourceHeight * cover);
+    // `setScale`, not `setDisplaySize`: a Video Game Object starts life as a
+    // 256x256 placeholder and Phaser keeps the resulting scale when the first
+    // decoded frame replaces that placeholder, so a display size would end up
+    // several times too large. A uniform scale stays exact through the swap.
+    video.setScale(cover);
   }
 
-  createVictoryVideo() {
-    const key = 'zs-victory-video';
+  // A Phaser Video Game Object cannot switch to a clip with another aspect
+  // ratio (its texture keeps the size of the first decoded frame), so a board
+  // that flips orientation while the win panel is open gets a fresh object for
+  // the new cut.
+  refreshVictoryVideoOrientation() {
+    if (!this.victoryVideo || !this.victorySlot) {
+      return;
+    }
+
+    const key = this.resolveVictoryVideoKey();
+
+    if (!key || key === this.victoryVideoKey) {
+      return;
+    }
+
+    this.destroyVictoryVideo();
+    // The slot only ever hosts one cut, so drop the previous veil as well.
+    this.victorySlot.removeAll(true);
+
+    let layers = [];
+
+    try {
+      layers = this.createVictoryVideo(key);
+    } catch {
+      this.victoryVideo = null;
+      this.victoryVideoKey = null;
+      layers = this.createVictoryFallback();
+    }
+
+    if (layers.length > 0) {
+      this.victorySlot.add(layers);
+    }
+  }
+
+  // Tear the video object (and its private video texture) down without
+  // touching the rest of the win panel.
+  destroyVictoryVideo() {
+    const video = this.victoryVideo;
+
+    if (this.victoryVideoErrorHandler) {
+      try {
+        this.victoryVideoErrorHandler.element.removeEventListener(
+          'error',
+          this.victoryVideoErrorHandler.handler,
+        );
+      } catch {
+        // The media element may already be gone.
+      }
+      this.victoryVideoErrorHandler = null;
+    }
+
+    this.victoryVideo = null;
+    this.victoryVideoKey = null;
+
+    if (!video) {
+      return;
+    }
+
+    // The per-object video texture is a UUID key that Phaser does not release
+    // on destroy, so remember it and free it after the object is gone.
+    const textureKey = video.videoTexture ? video.videoTexture.key : null;
+
+    try {
+      this.tweens.killTweensOf(video);
+      video.stop();
+      video.destroy();
+    } catch {
+      // Already torn down.
+    }
+
+    if (textureKey) {
+      try {
+        if (this.textures.exists(textureKey)) {
+          this.textures.remove(textureKey);
+        }
+      } catch {
+        // Nothing left to free.
+      }
+    }
+  }
+
+  createVictoryVideo(key = VICTORY_VIDEO_KEYS.landscape) {
     const video = this.add.video(this.cx, this.cy, key);
     const element = video.video;
+
+    // Remember which cut is on screen before the first cover fit runs, so
+    // fitVictoryVideo() can fall back to the right cache entry.
+    this.victoryVideo = video;
+    this.victoryVideoKey = key;
 
     if (element) {
       element.muted = true;
@@ -2357,8 +2485,11 @@ export class GameScene extends Phaser.Scene {
       element.addEventListener('loadeddata', applyCover, { once: true });
     }
 
+    // Phaser only builds the video texture once the first frame is decoded, so
+    // re-apply the cover fit when that happens.
+    video.once(Phaser.GameObjects.Events.VIDEO_TEXTURE, applyCover);
+
     video.setAlpha(0);
-    this.victoryVideo = video;
 
     this.tweens.add({
       targets: video,
@@ -2493,26 +2624,9 @@ export class GameScene extends Phaser.Scene {
 
     this.tweens.killTweensOf(video);
 
-    if (this.victoryVideoErrorHandler) {
-      try {
-        this.victoryVideoErrorHandler.element.removeEventListener(
-          'error',
-          this.victoryVideoErrorHandler.handler,
-        );
-      } catch {
-        // The media element may already be gone.
-      }
-      this.victoryVideoErrorHandler = null;
-    }
-
-    try {
-      video.stop();
-      video.destroy();
-    } catch {
-      // Already torn down.
-    }
-
-    this.victoryVideo = null;
+    // destroyVictoryVideo() also drops the error listener and frees the
+    // per-object video texture key, so the swap does not leak GPU textures.
+    this.destroyVictoryVideo();
     this.victorySlot.removeAll(true);
 
     const fallbackLayers = this.createVictoryFallback();
@@ -2812,7 +2926,9 @@ export class GameScene extends Phaser.Scene {
     this.layoutOverlay(this.gameOverOverlay, this.resultBackdrop);
 
     // The win video/fallback art is not part of a scaled container, so it has
-    // to be re-centred whenever the board changes shape.
+    // to be re-centred whenever the board changes shape - and switched to the
+    // other orientation cut when the board flips portrait <-> landscape.
+    this.refreshVictoryVideoOrientation();
     this.fitVictoryVideo();
   }
 
