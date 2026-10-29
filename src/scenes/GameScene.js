@@ -111,7 +111,7 @@ const BGM_VOLUME = 0.42;
 // Victory clips. The same win panel hosts one of two cuts:
 //   landscape -> the wide 16:9 celebration clip (desktop, tablet, docked phone)
 //   portrait  -> a dedicated 720x1280 vertical clip, so a phone in portrait
-//                really fills its tall board instead of cover-cropping a
+//                really fills its tall board instead of contain-fitting a
 //                16:9 video down to a thin strip.
 // Both files live in public/ and are referenced RELATIVE to the page for the
 // same GitHub Pages subpath reason as the BGM tracks. A missing/unplayable cut
@@ -414,6 +414,7 @@ export class GameScene extends Phaser.Scene {
     this.victoryVideoKey = null;
     this.victoryVideoErrorHandler = null;
     this.victorySlot = null;
+    this.victoryVeil = null;
     this.victoryFallbackTweens = [];
     this.hudObjects = [];
     this.launcherHalo = null;
@@ -2342,33 +2343,42 @@ export class GameScene extends Phaser.Scene {
     return this.createVictoryFallback();
   }
 
-  // Cover-fit the victory video over the live board. Called on creation, when
-  // its metadata arrives and on every resize while the result panel is open.
+  // Contain-fit the victory video inside the live board. Called on creation,
+  // when its metadata arrives and on every resize while the result panel is
+  // open. `Math.min` (contain) is deliberate: a cover fit cropped the clip on
+  // portrait phones, where the board is narrower than the 16:9 footage.
   fitVictoryVideo(video = this.victoryVideo) {
     if (!video || video.active === false) {
       return;
     }
 
     const key = this.victoryVideoKey || VICTORY_VIDEO_KEYS.landscape;
-    const cached =
-      this.cache && this.cache.video ? this.cache.video.get(key) : null;
-    const element = video.video;
-    const sourceWidth =
-      (element && element.videoWidth) ||
-      (cached && cached.videoWidth) ||
-      this.vw;
-    const sourceHeight =
-      (element && element.videoHeight) ||
-      (cached && cached.videoHeight) ||
-      this.vh;
-    const cover = Math.max(this.vw / sourceWidth, this.vh / sourceHeight);
+    const isPortraitClip = key === VICTORY_VIDEO_KEYS.portrait;
+    // Before the first frame is decoded `videoWidth` is 0, so fall back to the
+    // intrinsic size of the cut we asked for instead of the live board: using
+    // the board size produced a wildly wrong factor that then stuck to the
+    // object once the real texture arrived.
+    const defaultW = isPortraitClip ? 720 : 1280;
+    const defaultH = isPortraitClip ? 1280 : 720;
 
+    const element = video.video;
+    const sourceWidth = (element && element.videoWidth) || defaultW;
+    const sourceHeight = (element && element.videoHeight) || defaultH;
+
+    // Fit the whole clip inside the board (contain mode) and centre it.
+    const fitScale = Math.min(this.vw / sourceWidth, this.vh / sourceHeight);
+
+    // The victory slot cancels the overlay container transform, so these are
+    // world coordinates again.
     video.setPosition(this.cx, this.cy);
-    // `setScale`, not `setDisplaySize`: a Video Game Object starts life as a
-    // 256x256 placeholder and Phaser keeps the resulting scale when the first
-    // decoded frame replaces that placeholder, so a display size would end up
-    // several times too large. A uniform scale stays exact through the swap.
-    video.setScale(cover);
+
+    // Phaser keeps a Video object's SCALE, not its display size, when the real
+    // frame replaces the placeholder texture (`setSizeToFrame` re-derives the
+    // scale against the new frame, which is a no-op), and VIDEO_TEXTURE fires
+    // *before* that swap. Applying the factor measured from the source size
+    // therefore survives the swap, whereas `setDisplaySize` would bake in the
+    // placeholder frame (a 32x32 default) and blow the clip up on the board.
+    video.setScale(fitScale);
   }
 
   // A Phaser Video Game Object cannot switch to a clip with another aspect
@@ -2424,6 +2434,7 @@ export class GameScene extends Phaser.Scene {
 
     this.victoryVideo = null;
     this.victoryVideoKey = null;
+    this.victoryVeil = null;
 
     if (!video) {
       return;
@@ -2456,8 +2467,8 @@ export class GameScene extends Phaser.Scene {
     const video = this.add.video(this.cx, this.cy, key);
     const element = video.video;
 
-    // Remember which cut is on screen before the first cover fit runs, so
-    // fitVictoryVideo() can fall back to the right cache entry.
+    // Remember which cut is on screen before the first fit runs, so
+    // fitVictoryVideo() can fall back to the right default source size.
     this.victoryVideo = video;
     this.victoryVideoKey = key;
 
@@ -2473,21 +2484,20 @@ export class GameScene extends Phaser.Scene {
     video.setOrigin(0.5);
     video.setPosition(this.cx, this.cy);
 
-    // Cover the whole live board without letterboxing. Metadata can arrive a
-    // frame later, and the cached HTMLVideoElement is a second reliable source
-    // for the intrinsic size.
-    const applyCover = () => this.fitVictoryVideo(video);
+    // Fit the whole clip inside the live board (contain). Metadata can arrive a
+    // frame later, which is why the fit is re-applied from several events.
+    const applyFit = () => this.fitVictoryVideo(video);
 
-    applyCover();
+    applyFit();
 
     if (element && !element.videoWidth) {
-      element.addEventListener('loadedmetadata', applyCover, { once: true });
-      element.addEventListener('loadeddata', applyCover, { once: true });
+      element.addEventListener('loadedmetadata', applyFit, { once: true });
+      element.addEventListener('loadeddata', applyFit, { once: true });
     }
 
     // Phaser only builds the video texture once the first frame is decoded, so
-    // re-apply the cover fit when that happens.
-    video.once(Phaser.GameObjects.Events.VIDEO_TEXTURE, applyCover);
+    // re-apply the fit when that happens.
+    video.once(Phaser.GameObjects.Events.VIDEO_TEXTURE, applyFit);
 
     video.setAlpha(0);
 
@@ -2500,7 +2510,7 @@ export class GameScene extends Phaser.Scene {
 
     this.time.delayedCall(120, () => {
       if (this.victoryVideo === video) {
-        applyCover();
+        applyFit();
       }
     });
 
@@ -2534,6 +2544,11 @@ export class GameScene extends Phaser.Scene {
       0x041009,
       0.26,
     );
+
+    // Tracked so layoutOverlays() can keep it covering the live board: the veil
+    // is a child of the victory slot, which no longer carries the overlay
+    // container's scale/offset.
+    this.victoryVeil = veil;
 
     return [video, veil];
   }
@@ -2925,11 +2940,28 @@ export class GameScene extends Phaser.Scene {
     this.layoutOverlay(this.menuOverlay, this.menuBackdrop);
     this.layoutOverlay(this.gameOverOverlay, this.resultBackdrop);
 
+    // The win slot lives inside the scaled overlay container, but the victory
+    // video and the fallback art are authored in world coordinates. Cancel the
+    // parent scale/offset so the slot renders 1:1 over the live board again;
+    // without this a portrait phone shrank it to 0.525x and pushed it left.
+    if (this.victorySlot && this.gameOverOverlay) {
+      const scale = this.uiScale || 1;
+      this.victorySlot.setScale(1 / scale);
+      this.victorySlot.setPosition(-this.uiOriginX / scale, -this.uiOriginY / scale);
+    }
+
     // The win video/fallback art is not part of a scaled container, so it has
     // to be re-centred whenever the board changes shape - and switched to the
     // other orientation cut when the board flips portrait <-> landscape.
     this.refreshVictoryVideoOrientation();
     this.fitVictoryVideo();
+
+    // The veil is a slot child too, so it is sized in world units (the slot is
+    // 1:1) rather than in design units.
+    if (this.victoryVeil && this.victoryVeil.active) {
+      this.victoryVeil.setPosition(this.cx, this.cy);
+      this.victoryVeil.setDisplaySize(this.vw, this.vh);
+    }
   }
 
   // Scale a design-space overlay container into the live board and keep its
@@ -3919,7 +3951,15 @@ export class GameScene extends Phaser.Scene {
 
     // Only the palette unlocked for this difficulty may spawn on the chain.
     const colorIndex = Phaser.Math.Between(0, this.getActiveColorCount() - 1);
-    const marble = this.createPathMarble(chain, colorIndex, 0);
+
+    // Spawn flush against the tail that is already inside the tunnel. A fixed
+    // t = 0 spawn left a hole whenever one frame moved the tail by more than a
+    // diameter, and the next rigid clamp then snapped the new marble forward.
+    const tailMarble = chain.marbles[chain.marbles.length - 1];
+    const spawnT = tailMarble
+      ? Phaser.Math.Clamp(tailMarble.t - chain.deltaT, 0, chain.deltaT)
+      : 0;
+    const marble = this.createPathMarble(chain, colorIndex, spawnT);
 
     // One mutually exclusive special roll (bomb -> reverse -> pause ->
     // sniper); the first three grow with absolute difficulty (World/Stage),
@@ -4030,48 +4070,46 @@ export class GameScene extends Phaser.Scene {
     const marbles = chain.marbles;
     const deltaT = chain.deltaT;
 
-    // If pushing a marble past the entrance would put it below t = 0, slide
-    // the whole chain forward by the deficit. The spacing relative to the
-    // insertion point is preserved, but the tail never overlaps at the start.
-    let minT = Infinity;
-    let maxT = -Infinity;
+    // The array runs head -> tail, so only the last marble can be pushed below
+    // the tunnel mouth. Slide just the CONNECTED run that touches the entrance:
+    // the first real gap absorbs the shift, so a detached section further up
+    // the track is never dragged along (that telekinetic pull was the "phantom
+    // push" that shoved balls the player never touched).
+    const tail = marbles[marbles.length - 1];
 
-    for (const marble of marbles) {
-      minT = Math.min(minT, marble.t);
-      maxT = Math.max(maxT, marble.t);
-    }
+    if (tail && tail.t < 0) {
+      const forwardShift = -tail.t;
+      tail.t = 0;
+      tail.pushOffset -= forwardShift;
 
-    if (minT < 0) {
-      const forwardShift = -minT;
-      for (const marble of marbles) {
-        marble.t += forwardShift;
+      for (let index = marbles.length - 1; index > 0; index -= 1) {
+        const behind = marbles[index];
+        const current = marbles[index - 1];
+        const gap = current.t - behind.t;
+
+        if (gap >= deltaT) {
+          // The gap absorbs the push; the run ahead of it must not move.
+          break;
+        }
+
+        const shift = deltaT - gap;
+        current.t += shift;
         // Keep the rendered marble where it was: pushOffset decays over the
-        // next frames, so the whole chain slides forward instead of snapping.
-        marble.pushOffset -= forwardShift;
-      }
-      maxT += forwardShift;
-    }
-
-    if (maxT > 1) {
-      const backwardShift = 1 - maxT;
-      for (const marble of marbles) {
-        marble.t += backwardShift;
-        marble.pushOffset -= backwardShift;
+        // next frames, so the whole run slides forward instead of snapping.
+        current.pushOffset -= shift;
       }
     }
 
-    // Safety net: no pair may be closer than one physical diameter, even
-    // after boundary shifts or floating-point drift.
-    for (let index = 1; index < marbles.length; index += 1) {
-      const maxTrailingT = marbles[index - 1].t - deltaT;
-
-      if (marbles[index].t > maxTrailingT) {
-        marbles[index].t = Math.max(0, maxTrailingT);
-      }
-    }
-
+    // Boundary safety net: never leave a marble outside the track, and always
+    // compensate pushOffset so a clamp cannot teleport it on screen.
     for (const marble of marbles) {
-      marble.t = Phaser.Math.Clamp(marble.t, 0, 1);
+      if (marble.t < 0) {
+        marble.pushOffset += marble.t;
+        marble.t = 0;
+      } else if (marble.t > 1) {
+        marble.pushOffset += marble.t - 1;
+        marble.t = 1;
+      }
     }
   }
 
@@ -4441,8 +4479,8 @@ export class GameScene extends Phaser.Scene {
 
     // Step 2: only the rearmost segment (the one still feeding in from the
     // start of the track) is pushed by the entrance. Earlier detached segments
-    // are stationary unless same-colour magnetism moves them toward the
-    // segment in front.
+    // are stationary unless same-colour magnetism backs them up toward the
+    // segment behind them.
     for (const current of segments) {
       current.speed = 0;
       current.isMagnetic = false;
@@ -4466,13 +4504,19 @@ export class GameScene extends Phaser.Scene {
       // Magnetism only closes a hole that is smaller than MAGNET_MAX_SLOTS.
       // A special marble is colour-less (colorIndex -1), so it can never be
       // magnetically pulled and never fakes a same-colour connection.
+      //
+      // The FRONT segment is the one that moves: it backs up (-t) into the
+      // rear segment. That is how Zuma reads on screen - the section ahead of
+      // the hole reverses into the feeder's colour. Slamming the rear forwards
+      // at 4.5x instead yanked the connected run away from the tunnel mouth
+      // after a bomb and snapped the freshly spawned marbles across the hole.
       if (
         rearHead.colorIndex >= 0 &&
         rearHead.colorIndex === frontTail.colorIndex &&
         holeSlots <= MAGNET_MAX_SLOTS
       ) {
-        rear.speed = catchUpTravelT;
-        rear.isMagnetic = true;
+        front.speed = -catchUpTravelT;
+        front.isMagnetic = true;
       }
 
       // Momentum transfer: once a moving rear segment is within one frame of
@@ -4485,11 +4529,15 @@ export class GameScene extends Phaser.Scene {
       // pushed like a train instead of one car at a time.
       const closingDistance = holeT - deltaT;
 
-      if (closingDistance <= rear.speed + 0.002) {
-        // The inherited speed is capped at the base chain speed. A magnetic
-        // same-colour rear moves at 4.5x to slam the gap shut, and handing
-        // that full overspeed to the car ahead would keep the gap constant
-        // forever, so the Step 3/4 magnetic combo could never fire.
+      // A segment already backsliding under magnetism keeps its own (negative)
+      // velocity: handing it the rear's forward speed would flip it mid-slide
+      // and produce a one-frame jump. The +0.0005 slack lets sub-pixel contact
+      // still count as touching.
+      if (
+        !front.isMagnetic &&
+        rear.speed > 0 &&
+        closingDistance <= rear.speed + 0.0005
+      ) {
         front.speed = Math.max(
           front.speed,
           Math.min(rear.speed, standardTravelT),
@@ -4497,13 +4545,59 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
-    // Step 3: apply movement from front to rear, rigidly clamping each rear
-    // segment against the tail of the segment ahead of it.
+    // Step 3: apply movement from front to rear. A normal segment advances its
+    // head and hangs every cart one diameter behind the car in front of it; a
+    // magnetic segment (the section ahead of a same-colour feeder) slides
+    // backwards as one rigid block and locks onto the rear segment's head.
     let comboMarble = null;
 
     for (let index = 0; index < segments.length; index += 1) {
       const current = segments[index];
       const head = current[0];
+
+      if (current.isMagnetic && index < segments.length - 1) {
+        // Backslide: the TAIL is the leading edge now, so it is the marble that
+        // moves and the rest of the run is re-hung off it towards the head
+        // (current[i].t = current[i + 1].t + deltaT). Locking the tail exactly
+        // one diameter in front of the rear head turns the hole into a real
+        // same-colour contact instead of an overlap that the next frame's rigid
+        // clamp would snap away - that snap is what teleported the chain after
+        // a bomb or a match.
+        const rearHead = segments[index + 1][0];
+        const tail = current[current.length - 1];
+        const limitT = rearHead.t + deltaT;
+        const nextTailT = tail.t + current.speed;
+        const locked = nextTailT <= limitT;
+        // Step 1 merges two runs as soon as they are within one grouping
+        // tolerance (0.002 t) of contact, which happens a frame or two before
+        // the retreating tail can physically reach the rear head at this
+        // speed. Treat that band as contact, otherwise the merge hides the
+        // same-colour connection and the cascade never detonates.
+        const touching = nextTailT <= limitT + 0.002;
+
+        if (
+          touching &&
+          !comboMarble &&
+          rearHead.colorIndex >= 0 &&
+          rearHead.colorIndex === tail.colorIndex
+        ) {
+          comboMarble = rearHead;
+        }
+
+        let cursorT = Phaser.Math.Clamp(locked ? limitT : nextTailT, 0, 1);
+
+        for (let cart = current.length - 1; cart >= 0; cart -= 1) {
+          const marble = current[cart];
+
+          marble.t = Phaser.Math.Clamp(cursorT, 0, 1);
+          // Only the moving edge is marked; the rest of the block trails it.
+          marble.magnetApproaching = cart === current.length - 1;
+          cursorT += deltaT;
+        }
+
+        continue;
+      }
+
       let nextT = head.t + current.speed;
 
       if (index > 0) {
@@ -5578,35 +5672,37 @@ export class GameScene extends Phaser.Scene {
       .setData('colorIndex', shot.colorIndex);
     insertedMarble.chain = chain;
     insertedMarble.colorIndex = shot.colorIndex;
-    insertedMarble.t = insertInFront ? hitT : hitT - chain.deltaT;
+    insertedMarble.t = insertInFront ? hitT + chain.deltaT : hitT;
     insertedMarble.pushOffset = 0;
     insertedMarble.magnetApproaching = false;
     insertedMarble.isBomb = false;
     insertedMarble.isReverse = false;
     insertedMarble.isPause = false;
+    insertedMarble.isSniper = false;
 
-    // Insert first, then propagate the pressure forwards through the chain.
-    // A sufficiently large pre-existing gap absorbs the force completely.
+    // Insert first, then push the pressure towards the head of the chain (t
+    // grows towards the goal). Pushing towards the tunnel mouth was what made
+    // the entrance marble cross t = 0 and then drag every marble on the track
+    // forward, including detached sections on the far side of a hole.
     marbles.splice(insertIndex, 0, insertedMarble);
 
-    for (
-      let index = insertIndex;
-      index < marbles.length - 1;
-      index += 1
-    ) {
+    // A rear insertion re-uses the target's own t, so the target (now living at
+    // insertIndex - 1) and its packed run are shoved towards the head as well.
+    for (let index = insertIndex; index > 0; index -= 1) {
       const current = marbles[index];
-      const behind = marbles[index + 1];
-      const gap = current.t - behind.t;
+      const ahead = marbles[index - 1];
+      const gap = ahead.t - current.t;
 
       if (gap >= chain.deltaT) {
-        // The gap is large enough to absorb the push. The rest of the chain
-        // must not move at all.
+        // An existing gap fully absorbs the push: nothing further ahead moves.
         break;
       }
 
       const shiftAmount = chain.deltaT - gap;
-      behind.t -= shiftAmount;
-      behind.pushOffset += shiftAmount;
+      ahead.t += shiftAmount;
+      // Keep the rendered marble where it was; pushOffset decays over the next
+      // frames so the shove reads as a slide instead of a jump.
+      ahead.pushOffset -= shiftAmount;
     }
 
     // Commit all pushed t values to screen coordinates BEFORE scanning for
@@ -5874,8 +5970,9 @@ export class GameScene extends Phaser.Scene {
     }
 
     // Only when the cascade pushed the tail past the entrance: slide the
-    // whole chain forward by the deficit (bounded to [0, 1]) so no marble is
-    // stranded behind t = 0. Relative spacing is preserved.
+    // connected run that touches the entrance forward by its deficit (bounded
+    // to [0, 1]) so no marble is stranded behind t = 0. The first real gap
+    // absorbs the shift, and pushOffset keeps the visible position stable.
     if (needsStartNormalize) {
       this.normalizePushedChain(chain);
     }

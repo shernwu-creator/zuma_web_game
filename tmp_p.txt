@@ -1,0 +1,1 @@
+ERR window is not defined

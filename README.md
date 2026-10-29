@@ -22,15 +22,15 @@
 - **待發射球狀態**：場景保存 `currentBulletColor` 與 `nextBulletColor`。砲台正中央 `(0, 0)` 有一顆 `scale 0.75` 的核心寶石，由 `currentBulletColor` 驅動並跟著砲台旋轉；發射後立即用 `nextBulletColor` 遞補並更新寶石顏色。
 - **插入方向判定**：碰撞時使用「撞擊點相對目標球的角度」與該處軌道切線比較，決定插入目標球陣列索引的前方或後方。
 - **PathFollower 球串**：每顆軌道球都是 `Phaser.GameObjects.PathFollower`，以 `marble.t` 手動控制它在 Spline 上的弧長位置。子彈本身也是 PathFollower，命中後直接綁定 `t` 並加入 `marbles` 陣列。
-- **空隙吸收推擠 (Cascade Push)**：`deltaT = BALL_DIAMETER / trackLength`。先將新球 `splice` 進陣列，再從插入索引往尾端逐對檢查 `gap = t[i] - t[i+1]`；只有 `gap < deltaT` 才把後方球推開 `deltaT - gap`。一旦遇到 `gap >= deltaT`，代表既有空隙已吸收推力，立即 `break`，更後方的球完全不受影響。
-- **動態區段與車尾推進 (Tail Pushing)**：每幀依 `gap > deltaT + 0.002` 將球串切成多個 segments。所有區段預設速度為 0；最靠近起點的尾段（最後一段）無條件獲得 `standardTravelT` 的推進力。從尾段往前檢查，若後段車頭與前段車尾同色，該段改以「關卡速度 × 4.5」磁吸。
-- **追尾剛性鎖與連鎖 (Combo)**：由前到後套用速度；後段車頭碰到 `frontTail.t - deltaT` 時立即鎖定。若碰撞時為同色磁吸，記錄 `comboMarble`，最後以 `findMatchRun()` 確認連續同色至少 3 顆才觸發 `resolveMatches()`。不足 3 顆只會扣合，不會爆破。
+- **空隙吸收推擠 (Cascade Push)**：`deltaT = BALL_DIAMETER / trackLength`。先將新球 `splice` 進陣列，再從插入索引往車頭（索引 0、`t` 遞增方向）逐對檢查 `gap = t[i-1] - t[i]`；只有 `gap < deltaT` 才把前方球往前推 `deltaT - gap`。一旦遇到 `gap >= deltaT`，代表既有空隙已吸收推力，立即 `break`，缺口另一側的球完全不受影響。
+- **動態區段與車尾推進 (Tail Pushing)**：每幀依 `gap > deltaT + 0.002` 將球串切成多個 segments。所有區段預設速度為 0；最靠近起點的尾段（最後一段）無條件獲得 `standardTravelT` 的推進力。從尾段往前檢查，若後段車頭與前段車尾同色，改成「前段倒退」：`front.speed = -catchUpTravelT`（關卡速度 × 4.5 的負值）。
+- **追尾剛性鎖與連鎖 (Combo)**：一般區段由前方車尾的 `frontTail.t - deltaT` 夾住推進；磁吸區段則反過來以尾部為前緣，把整段重新吊在 `rearHead.t + deltaT` 上（`current[i].t = current[i+1].t + deltaT`），因此是「前方區段倒退吸進後方車頭」。吸附成立（含 0.002 的分段容忍帶）時記錄 `comboMarble`，最後以 `findMatchRun()` 確認連續同色至少 3 顆才觸發 `resolveMatches()`。不足 3 顆只會扣合，不會爆破。
 - **剛性鏈條 (Rigid Chain)**：一旦 `gap <= deltaT + 0.002`，後車不再使用自己的速度，而是直接硬綁定為 `marble.t = ahead.t - deltaT`，維持精確且平均的一顆球直徑間距。
 - **全域減速**：成功消除時 `slowdownTimer = 1.5`，接下來 1.5 秒內車尾推進速度降為一般值的 30%，營造消除後的短暫慢動作。
 - **爆炸回饋**：消除時會產生白色閃光圓圈、20 顆高散射粒子，並讓消除區後方的第一顆球同時獲得 `pushOffset = deltaT * 1.5` 與 `t -= deltaT * 1.5` 的真正物理倒退，形成新的斷層。
 - **鏈尾完成狀態**：`chainComplete` 仍會在龍頭抵達 `t = 1` 時鎖定，龍頭不再越界；後方車廂可繼續完成收尾閉合。
-- **平滑推擠動畫**：每個被推開的球會加上 `pushOffset += shiftAmount`，在畫面上先留在原位；`updateChainPositions()` 每幀以 `Phaser.Math.Linear(pushOffset, 0, 0.15)` 遞減，位置以 `getPointAt(t + pushOffset)` 計算。
-- **防止重疊**：推擠後執行間距校正；若尾端被推出 t < 0，整串會往前平移不足的距離，使所有 `t` 保持在 0–1 且任兩球中心距至少為一顆球的直徑。
+- **平滑推擠動畫**：每個被往前推的球會加上 `pushOffset -= shiftAmount`（負值），在畫面上先留在原位；`updateChainPositions()` 每幀以 `Phaser.Math.Linear(pushOffset, 0, 0.15)` 遞減，位置以 `getPointAt(t + pushOffset)` 計算，因此推擠看起來是滑動而不是瞬移。
+- **防止重疊**：若尾端因彈性倒退被推到 `t < 0`，只會把「與起點相連的那一段」往前平移不足的距離，第一個既有空隙就會吸收位移；所有 `t` 保持在 0–1，被夾住的球會同步補上 `pushOffset`，畫面不會跳動。
 - **時序控制**：先完成推擠與座標更新，才觸發同色掃描。三消達到 3 顆以上時先一次性 `splice` 移除陣列元素，再播放放大淡出動畫，動畫結束後 `destroy()` 精靈。
 - **遊戲回饋**：插入漣漪、消除爆裂粒子、剩餘球數 HUD。
 - **開局空軌**：每次進入關卡時球串為空，第一顆球會在點擊開始（`PLAYING`）後從軌道起點動態生成，之後依尾端間距持續補球。
@@ -49,7 +49,7 @@
 
 - **狀態機**：`gameState` 包含 `MENU`、`PLAYING`、`GAMEOVER`。載入時顯示首頁，隱藏砲台與遊戲 HUD；點擊畫面進入 `PLAYING`。
 - **首頁**：中央顯示巨大「祖瑪：叢林探險」標題、最高分與閃爍的「點擊開始遊戲」。
-- **動態球串**：遊戲開始時軌道為空，每關生成 `getTotalMarbles()`（`30 + currentLevel × 10`）顆球。每當軌道尾端 `t > deltaT`，就從 `t = 0` 隨機生成新球（10% 炸彈）。
+- **動態球串**：遊戲開始時軌道為空，每關生成 `getTotalMarbles()`（`30 + currentLevel × 10`）顆球。每當軌道尾端 `t > deltaT`，就在 `t = Clamp(tail.t - deltaT, 0, deltaT)` 生成新球，讓新球緊貼洞口內的尾球（10% 炸彈）。
 - **Game Over**：最前段球（`marbles[0]`）抵達 `t = 1` 時立即切換 `GAMEOVER`、停止移動與射擊，顯示「遊戲結束」、最終分數、「球串已抵達終點」與「點擊重新開始」。
 - **Victory**：本關全部球生成且 `marbles.length === 0` 時顯示「關卡完成！」，額外獎勵 500 分，並顯示「過關獎勵」結算與「進入下一關」按鈕。
 - **加分卡補充**：`bonusTimer` 每 8 秒檢查一次；場上星星少於 3 顆時，在合法空白位置補充 1 顆。
@@ -100,12 +100,12 @@ zuma_web_game/
 
 - 球串陣列由隊首排到隊尾，`t` 由大到小。`getPointAt()` 採弧長映射，因此固定 `Δt` 即等於固定像素間距。
 - 剛性間距的目標是相鄰球中心相距 36 px（`deltaT = BALL_DIAMETER / trackLength`），由推擠與扣合邏輯維持；每次進入關卡時球串為空，球會從起點陸續生成。
-- 插入順序是「先 splice 新球 → 空隙吸收 cascade → 更新座標 → 同色掃描」。三消留下的空格會成為下一次推擠的緩衝區；若缺口兩端同色，後方會磁吸追趕並可能觸發連鎖消除。
-- `updateChainMovement()` 不再依賴單一火車頭，而是每幀動態切段。中間爆破後，前方區段靜止；尾段（最靠近起點的最後一段）不受生成進度限制，永遠以關卡速度推進，同色時以 4.5 倍速磁吸，追上後與前段合併再一起前進。
-- 每個區段內只有車頭擁有速度，其餘車廂一律以 `前車.t - deltaT` 硬性排列。磁吸段頭會標記 `marble.magnetApproaching`，追尾時再以完整同色區塊長度決定是否連鎖消除。
+- 插入順序是「先 splice 新球 → 往車頭方向推擠並由空隙吸收 → 更新座標 → 同色掃描」。三消留下的空格會成為下一次推擠的緩衝區，推擠絕不跨越既有空隙；若缺口兩端同色，缺口**前方**的區段會倒退磁吸並可能觸發連鎖消除。
+- `updateChainMovement()` 不再依賴單一火車頭，而是每幀動態切段。中間爆破後，前方區段靜止；尾段（最靠近起點的最後一段）不受生成進度限制，永遠以關卡速度推進。缺口兩端同色時改由**前方區段倒退**（`front.speed = -catchUpTravelT`，關卡速度 × 4.5 的負值）吸進後方車頭，鎖在 `rearHead.t + deltaT` 後與後段合併再一起前進。
+- 每個區段內只有移動端擁有速度：一般區段由車頭帶動，其餘車廂以 `前車.t - deltaT` 硬性排列；磁吸區段則以**尾部**為前緣，其餘車廂改以 `current[i].t = current[i+1].t + deltaT` 重新吊回車頭方向。只有真正在移動的那一顆會標記 `marble.magnetApproaching`，吸附成立時再以完整同色區塊長度決定是否連鎖消除。
 - 爆炸造成的 `pushbackMarble.t` 真正減少 `1.5 * deltaT`，因此不只是視覺抖動，而會在陣列中製造真實物理斷層，讓下一幀重新判斷異色煞車或同色磁吸。三消踢回同樣只在「後方第一顆球仍與消除區相貼（間距 ≤ `deltaT`）」時才會發生，中間隔著空洞就不會被拉回。
 - 炸彈的爆炸範圍由 `getBombBlastRange()` 以實體間距決定（見第四階段）：往車頭與車尾各最多走 `BOMB_BLAST_NEIGHBOURS` 顆，遇到 `gap > deltaT` 就 `break`，因此既有缺口會完全吸收衝擊波；爆炸後存活球的 `t` 完全不被改寫，遠距離的球不會被推擠或拉動。
-- 推擠 cascade 中每一對被處理的球，在 `behind.t -= deltaT - gap` 後，其間距都會恰好等於 `deltaT`；最近的剛性鏈條邏輯也會在下一幀再次鎖定這個不變量。
+- 推擠 cascade 中每一對被處理的球，在 `ahead.t += deltaT - gap`（往車頭方向）後，其間距都會恰好等於 `deltaT`；最近的剛性鏈條邏輯也會在下一幀再次鎖定這個不變量。遇到 `gap >= deltaT` 的空隙立即 `break`，因此隔著空隙的獨立球段絕不會被推動。
 - 調色盤只有 5 色，子彈與下一顆顏色的循環也使用同一組 0–4 索引，不會存取不存在的紋理。
 - 物理位置 `t` 與視覺位移 `pushOffset` 分離：`t` 決定最終排列與碰撞，`pushOffset` 只影響畫面上的平滑推擠，不會回饋到匹配邏輯。
 - 三消掃描使用 `while` 先找出完整連續區段，確認長度後只做一次 `splice`；不會在走訪陣列的同時刪除元素。
@@ -114,9 +114,11 @@ zuma_web_game/
 - 加分星星使用 `distanceToTrack()` 保證不壓在軌道上，並以 `shotPathCrossesTrack()` 判斷是否需要穿過球串縫隙；若子彈未撞到任何球而命中該星星，即判定為穿越射擊（Gap Shot）。
 - 炸彈球使用獨立材質 `zs-marble-bomb-*`，一般三消仍以 `colorIndex` 判斷顏色，不受外觀影響。
 - 首頁與結束畫面使用 `DEPTH.overlay = 200` 的全畫面 overlay；點擊事件會依 `gameState` 分流成開始遊戲、發射子彈、重新開始或勝利後進入下一關。
-- 動態生成會先檢查尾端球是否已離開起點超過 `deltaT`，並在 `spawnedMarblesCount === this.getTotalMarbles()` 後停止生成；但車尾推進不會因此停止。
+- 動態生成會先檢查尾端球是否已離開起點超過 `deltaT`，新球生成於 `t = Clamp(tail.t - deltaT, 0, deltaT)`（緊貼洞口內的尾球，不再固定 `t = 0` 造成空隙與隨後被夾回的跳動），並在 `spawnedMarblesCount === this.getTotalMarbles()` 後停止生成；但車尾推進不會因此停止。
 - `startGame()`（首頁開始或失敗重來）會重置 `currentLevel = 1` 與分數；`startLevel()` 只重建當前關卡、保留累計分數，供 `startNextLevel()` 呼叫。
 - HUD 關卡列由 `updateLevelHud()` 依 `getTotalMarbles()` 產生，球數列由 `updateMarbleCount()` 產生，兩者皆會在有新球生成、消除或換關時更新。
 - 滑鼠位置使用 Phaser 的 `activePointer.worldX / worldY`，可正確對應 FIT 縮放後的畫布座標。
 - 子彈與球的碰撞採兩圓半徑相加的平方距離比較，避免每幀開根號。
-- 中間爆破後，前方區段會靜止等待；尾段異色時以正常速度推進，同色時高速磁吸。兩段扣合後會自動合併成單一區段並恢復正常推進。
+- 中間爆破後，前方區段會靜止等待；尾段以正常速度持續推進，缺口兩端同色時改由前方區段倒退磁吸。兩段扣合後會自動合併成單一區段並恢復正常推進。
+- 勝利畫面會播放舞台動畫：直向棋盤使用 720×1280 直向短片，橫向棋盤使用 16:9 短片。`fitVictoryVideo()` 以 `Math.min` 做 contain 適配，換算結果直接套用 `setScale()`；Phaser 在真實影格取代佔位材質時只保留縮放（`setDisplaySize` 會把佔位圖尺寸一起鎖進去），因此縮放能安全跨過材質替換，不會裁切或變形。
+- `victorySlot` 是結束畫面容器（`uiScale` 縮放）的子物件，但影片與遮罩都以世界座標排版；`layoutOverlays()` 會反向抵銷父層 transform（`setScale(1 / uiScale)` 與對應位移），讓影片、`victoryVeil` 與實際棋盤 1:1 對齊；`destroyVictoryVideo()` 會一併清除影片、材質鍵與 `victoryVeil`。
