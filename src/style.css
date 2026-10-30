@@ -126,7 +126,7 @@ body::before {
   padding: 0 6px;
   color: rgb(180 197 159 / 54%);
   font-family: "Courier New", monospace;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.2em;
   line-height: 1.5;
@@ -160,7 +160,7 @@ noscript {
     flex-direction: column;
     gap: 2px;
     padding: 0 3px;
-    font-size: 8px;
+    font-size: 9px;
     letter-spacing: 0.16em;
   }
 }

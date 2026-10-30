@@ -1,0 +1,36 @@
+{
+  "id": "./",
+  "name": "祖瑪：叢林探險 — 同色三消 · 引爆炸彈 · 收集星星",
+  "short_name": "祖瑪探險",
+  "description": "以 Phaser 3 打造的 Zuma 風格彈珠射擊遊戲：同色三消、引爆炸彈、收集星星，3 個世界共 30 個關卡。",
+  "lang": "zh-Hant",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#071009",
+  "theme_color": "#08130c",
+  "categories": ["games", "entertainment"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

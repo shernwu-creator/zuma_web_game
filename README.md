@@ -77,12 +77,23 @@
 - **重繪正確性**：`buildLevelTracks()` 會把 `difficulty` 寫進 `layoutSpecs`（`{ portrait: true, difficulty }` 與 `{ points, difficulty }`），視窗縮放時 `rebuildTrackForView()` 可依同一份規格重建「同一關」的路線；直式路線以即時棋盤尺寸重新產生，橫式則只重新映射 800×600 設計座標。
 - **可驗證性**：`trackLayouts.js` 是純函式，可直接用 Node 驗證；專案交付前已對 30 條橫式、30 條直式（420×747、390×844、420×1500、360×800 四種棋盤）與 10 條內圈跑過「邊界、HUD／膠囊淨空、砲台淨空、尾端 68 px、車道自交距離、30 關不重複」等檢查，全數通過。
 
+## 第八階段：畫質、可讀性與安裝（PWA）
+
+- **2× 超取樣渲染**：`viewport.js` 新增 `computeRenderScale()`，棋盤仍以 CSS 像素計算，但 canvas 以 `renderScale` 倍裝置像素建立（`main.js` 用 `setGameSize(width × scale, height × scale)`），再由主攝影機 `setZoom(scale)` + `centerOn(vw / 2, vh / 2)` 縮回棋盤大小。因此軌道線、1px 邊框、膠囊與所有文字都是「真的畫在更多像素上」，而不是讓瀏覽器把 1:1 的點陣圖放大到 hi-dpi 螢幕（那正是畫面看起來像低解析度影像的原因）。
+  - 目標倍率為 **2×**（一般 1× 螢幕也吃得到超取樣），`devicePixelRatio` 更高的手機可到 3×，但一律受 `MAX_RENDER_PIXELS`（約 8.3M 裝置像素）預算限制，4K 大小的棋盤才退回 1×，避免用幀率換銳利度。
+  - `GameScene#applyViewport()` 會把 `gameSize` **除以** `renderScale` 再得到 `vw / vh`，因此所有既有排版、碰撞與命中判定仍以原本的 CSS 像素為單位，行為完全不變；倍率透過 `game.registry`（`RENDER_SCALE_KEY`）從 `main.js` 傳給場景。
+- **文字解析度**：Phaser 的 `Text` 會把字形畫進自己的 canvas，因此 `applyTextResolution()` 會包裝 `add.text` / `make.text`，讓每個文字（HUD、首頁、結算面板、浮動加分）都以 `renderScale` 烘焙字形，小字不再因放大而模糊。
+- **球與星星材質同步 2× 烘焙**：`createMarbleTextures()` 與 `createBonusTexture()` 以 `graphics.setScale(bakeScale)` + 加大畫布的方式烘焙（繪圖座標完全不變），顯示時再以 `1 / bakeScale` 縮回原尺寸（`getMarbleDisplayScale()` / `getBonusDisplayScale()` 直接由材質實際像素寬度推算），球面漸層與高光因此是真的原生解析度；爆裂／消除動畫的放大值也改成相對倍率，不會因材質放大而彈得太大。
+- **小字全面放大**：HUD 與面板的 11–13px 小字調到 13–15px（`目前分數`、`最高分`、操作提示、關卡列、首頁世界／關卡標籤、音樂與返回膠囊等），`createFloatingText()` 預設字級 18px，並同步調整右側 HUD 的垂直間距避免重疊。
+- **特殊球 +20%**：`SPECIAL_MARBLE_SCALE = 1.2`，特殊球（炸彈／時間倒流／時間暫停／狙擊）會以 1.2 倍顯示，**且命中半徑同步放大**（`getMarbleRadius()`）；`findMarbleHit()`、`findSweptMarbleHit()` 與狙擊雷射 `findSniperRayTarget()` 都改用單顆球的半徑，所以特殊球真的更容易被擊中。一般球的半徑與鏈距（`deltaT`）完全不變。
+- **PWA 可安裝化**：`public/manifest.webmanifest`（`standalone`、`orientation: any`、192／512／maskable 圖示）、`public/icons/*.png`（由 `zlib` 直接產生的 PNG，無額外相依）、`public/sw.js`（shell 預快取 + 導覽 network-first + 雜湊資源 cache-first，影音與 Range 請求不攔截）與 `main.js` 的 production-only 註冊。`index.html` 以 `%BASE_URL%` 指向 manifest 與 apple-touch-icon，因此在 GitHub Pages 的子路徑下也能安裝；先前的版本沒有任何 manifest／service worker，Android Chrome 只會提供「加到主畫面」的普通連結。
+
 ## 介面語言與字型
 
 - 全部遊戲介面採**繁體中文（台灣用語）**：首頁、HUD、過關／失敗面板、浮動文字、`index.html` 頁面標題／說明列與 canvas 無障礙標籤皆已在地化。
 - 所有 Phaser 文字樣式統一使用安全的中文無襯線字型堆疊：`"Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif`；不再使用 Georgia 等英文襯線字型。
 - 動態數值（目前分數、最高分、關卡進度、剩餘球數）由遊戲邏輯即時更新，翻譯只替換固定文案。
-- 首頁大標題「祖瑪：叢林探險」以 54px 呈現，HUD 與結算文字調整了字級與位置，確保在 800 × 600 畫布內完整顯示；已用無頭瀏覽器截圖與字圖比對確認無缺字（tofu）。
+- 首頁大標題「祖瑪：叢林探險」以 54px 呈現；HUD 小字為 13–14px、面板小字 14–15px、按鈕 22–24px，並以 `renderScale` 等級的字形解析度烘焙，確保在 800 × 600 畫布與手機直式棋盤上都清楚可讀；已用無頭瀏覽器截圖確認無缺字（tofu）也沒有重疊。
 
 ## 開發指令
 
@@ -97,16 +108,20 @@ pnpm preview   # 預覽 production build
 
 ```text
 zuma_web_game/
-├── index.html
+├── index.html                # 頁面外框、manifest / apple-touch-icon 連結
 ├── public/
-│   └── favicon.svg
+│   ├── favicon.svg
+│   ├── manifest.webmanifest  # PWA manifest（standalone、192/512/maskable 圖示）
+│   ├── sw.js                 # PWA service worker（shell 預快取、離線開啟）
+│   ├── icons/                # PWA 圖示（192 / 512 / maskable 512 / apple-touch 180）
+│   └── *.mp3, *.mp4          # 背景音樂與過關短片
 ├── src/
-│   ├── main.js               # Phaser Game 設定與啟動
+│   ├── main.js               # Phaser Game 設定、renderScale 倍率、service worker 註冊
 │   ├── style.css             # 頁面與遊戲外框樣式
 │   └── scenes/
 │       ├── GameScene.js      # 球串、射擊、插入推擠、三消與關卡流程
 │       ├── trackLayouts.js   # 30 關橫式／直式／世界三內圈的地圖幾何（純函式）
-│       └── viewport.js       # 依視窗比例計算棋盤尺寸
+│       └── viewport.js       # 依視窗比例計算棋盤尺寸與渲染倍率
 ├── vite.config.js
 └── package.json
 ```
@@ -140,4 +155,9 @@ zuma_web_game/
 - 地圖幾何全部是 `trackLayouts.js` 裡的純函式（不碰 Phaser、不讀場景狀態），因此 30＋30 條路線可以用 Node 直接驗證；`GameScene` 只傳入即時棋盤（`portraitTrackFrame(this.vw, this.vh, BALL_DIAMETER)`）並消費回傳的點列。
 - `sanitizeDesignPoints()` 是橫式路線的安全網：先把點夾回棋盤，再把誤入 HUD／膠囊矩形的點推到「仍在棋盤內且不在矩形內」的最近邊界（外側邊界對貼齊棋盤邊緣的 HUD 沒有意義，只會又被夾回去），最後以 104 px（5 組手繪蛇行，保留原本貼近砲台的收尾）或 118 px（3 組產生型母體）的投影保護砲台。
 - 直式蛇行的每條水平跑道都留在入場半場，收尾會以 `PORTRAIT_BYPASS_RADIUS` 環繞砲台；環繞方向由「繞行點與跑道的最小淨空」兩個候選自動二選一，避免收尾直接橫切自己的跑道（早期版本實測淨空只剩 1.9 px）。
+- `renderScale` 是「canvas 裝置像素 ÷ CSS 棋盤像素」，由 `main.js` 決定並寫進 `game.registry`；`GameScene` 只讀不猜（讀不到就當 1×），所以任何未經過 `main.js` 的啟動方式（測試腳本）仍會得到與舊版完全相同的 1:1 行為。
+- 材質烘焙倍率一律從**材質實際寬度**回推（`getMarbleTextureScale()`、`getBonusDisplayScale()`），而不是直接拿 `renderScale`：材質管理器在整個 session 共用，若中途換到不同 DPI 的螢幕導致倍率改變，舊材質仍會以正確尺寸顯示（只是維持原本的銳利度），不會出現球忽然變大或變小的問題。
+- 特殊球雖然顯示與命中半徑都放大 1.2 倍，但**不影響任何規則**：`deltaT` 間距、三消長度、磁吸、爆炸範圍與生成機率全部沿用原值，只是視覺上會與左右鄰球稍微重疊（那正是「比較好打」的來源）。
+- service worker 只在 production build 註冊（`import.meta.env.PROD`）：`vite dev` 期間若也註冊，會把未打包的模組快取住，造成改程式碼卻看到舊畫面的問題。`sw.js` 也不攔截 `.mp4` 與帶 `Range` 的請求，過關短片的 seeking 才不會被快取破壞。
+
 - 直式圈距是「回推」出來的：`laneStep` 由 `radiusX`、圈數、波浪振幅與 68 px 砲台淨空一起算出並夾在 `BALL_DIAMETER + 11 … + 22`，因此窄螢幕會自動縮小圈距，優先保住砲台淨空與尾端可射擊距離。

@@ -1,12 +1,22 @@
 import Phaser from 'phaser';
 import './style.css';
 import { GameScene } from './scenes/GameScene.js';
-import { computeViewSize } from './scenes/viewport.js';
+import {
+  computeRenderScale,
+  computeViewSize,
+  RENDER_SCALE_KEY,
+} from './scenes/viewport.js';
 
 // The logical playfield follows the stage aspect ratio (16:9 stays 16:9,
 // 9:16 becomes a tall portrait board). FIT then scales that board up to the
 // whole stage, so the player gets the biggest possible picture without any
 // sprite, turret or glyph being stretched.
+//
+// The canvas itself is created `renderScale` times larger than that board (see
+// computeRenderScale in viewport.js): the scene still measures everything in
+// board/CSS pixels, but every edge is rasterised with 2x the device pixels and
+// the main camera zooms back out, which is what keeps the picture crisp instead
+// of letting the browser upscale a 1:1 bitmap onto a hi-dpi screen.
 const measureStage = () => {
   const element = document.getElementById('game');
   const rect = element ? element.getBoundingClientRect() : null;
@@ -23,11 +33,25 @@ const initialView = computeViewSize(
   measureStage(),
 );
 
+// Hi-dpi / supersampled render size. Phaser's FIT scale mode then reports the
+// canvas as exactly the CSS board size again, so nothing outside this file has
+// to know about the extra texels; the scene reads the factor back from the
+// registry to divide its measurements (see GameScene#applyViewport).
+const initialRenderScale = computeRenderScale(
+  initialView,
+  typeof window === 'undefined' ? null : window,
+);
+const toCanvasSize = (view, renderScale) => ({
+  width: Math.max(1, Math.round(view.width * renderScale)),
+  height: Math.max(1, Math.round(view.height * renderScale)),
+});
+const initialCanvasSize = toCanvasSize(initialView, initialRenderScale);
+
 const game = new Phaser.Game({
   type: Phaser.AUTO,
   parent: 'game',
-  width: initialView.width,
-  height: initialView.height,
+  width: initialCanvasSize.width,
+  height: initialCanvasSize.height,
   backgroundColor: '#1a3320',
   scene: [GameScene],
   scale: {
@@ -44,6 +68,10 @@ const game = new Phaser.Game({
   },
 });
 
+// Published before the scene boots (Phaser boots on the next tick), because
+// GameScene#create() divides the canvas size by it on its very first layout.
+game.registry.set(RENDER_SCALE_KEY, initialRenderScale);
+
 // Handy for checking game state from the browser console during phase 01.
 window.__ZUMA_GAME__ = game;
 
@@ -57,13 +85,22 @@ window.__ZUMA_GAME__ = game;
 // Returns true when the board (and therefore the canvas) was rebuilt.
 const syncViewSize = () => {
   const size = computeViewSize(window, measureStage());
+  const renderScale = computeRenderScale(size, window);
+  const canvasSize = toCanvasSize(size, renderScale);
   const current = game.scale.gameSize;
 
-  if (current.width === size.width && current.height === size.height) {
+  // Re-publish on every sync: dragging the window to a different-DPI monitor
+  // changes the factor without changing the CSS board size.
+  game.registry.set(RENDER_SCALE_KEY, renderScale);
+
+  if (
+    current.width === canvasSize.width &&
+    current.height === canvasSize.height
+  ) {
     return false;
   }
 
-  game.scale.setGameSize(size.width, size.height);
+  game.scale.setGameSize(canvasSize.width, canvasSize.height);
   return true;
 };
 
@@ -254,3 +291,43 @@ const armImmersiveOnFirstGesture = () => {
 };
 
 armImmersiveOnFirstGesture();
+
+/* ------------------------------------------------------------------ */
+/* PWA                                                                 */
+/* ------------------------------------------------------------------ */
+
+// The manifest (index.html + public/manifest.webmanifest) is what makes the
+// game installable; the service worker is what turns the installed shortcut
+// into a real app (own window, offline shell) and is also part of Chrome's
+// install criteria, which is why "加到主畫面" only ever produced a plain link
+// once the old registration was lost.
+//
+// Production only: a service worker on `vite dev` would cache the unbundled
+// modules and serve stale code while editing.
+const registerServiceWorker = () => {
+  if (!import.meta.env.PROD) {
+    return;
+  }
+
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+    return;
+  }
+
+  const register = () => {
+    // Relative to the document, so it resolves under the GitHub Pages subpath
+    // too (base: './'). The scope defaults to the script's own folder, which is
+    // exactly the deploy root of the game.
+    navigator.serviceWorker.register('./sw.js').catch(() => {
+      // A failed registration only costs offline support: the game still runs
+      // straight from the network.
+    });
+  };
+
+  if (document.readyState === 'complete') {
+    register();
+  } else {
+    window.addEventListener('load', register, { once: true });
+  }
+};
+
+registerServiceWorker();

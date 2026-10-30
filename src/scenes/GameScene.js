@@ -1,5 +1,9 @@
 import Phaser from 'phaser';
-import { computeViewSize, DESIGN_HEIGHT, DESIGN_WIDTH } from './viewport.js';
+import {
+  DESIGN_HEIGHT,
+  DESIGN_WIDTH,
+  RENDER_SCALE_KEY,
+} from './viewport.js';
 import {
   dualInnerTrackPoints,
   landscapeTrackPoints,
@@ -69,6 +73,12 @@ const SPECIAL_COLOR_INDEX = -1;
 // Neutral stone body used by every special marble texture, so a power-up can
 // never be mistaken for a matchable colour.
 const SPECIAL_MARBLE_BODY = 0x5f6f63;
+// Special marbles are drawn (and hit-tested) 20% larger than a plain marble.
+// Their whole point is that the player *wants* to shoot them, so a power-up that
+// is the same size as the balls packed around it was too easy to miss by a
+// hair; the extra radius makes them the obvious target without changing the
+// chain spacing, the match rules or any special-marble chance.
+const SPECIAL_MARBLE_SCALE = 1.2;
 // Spread the specials out: at least SPECIAL_SPAWN_GAP marbles must spawn
 // between two specials, and the first SPECIAL_MIN_SPAWN marbles are always
 // plain colours so a stage never opens with a cluster of power-ups.
@@ -529,6 +539,14 @@ export class GameScene extends Phaser.Scene {
     this.bonusItems = [];
     this.exitButtonDownTime = null;
     this.menuControlDownTime = null;
+    // main.js renders the canvas `renderScale` times larger than the CSS board
+    // (see computeRenderScale in viewport.js). Everything below still measures
+    // in CSS pixels: applyViewport divides the canvas size back down and zooms
+    // the main camera in by the same factor.
+    this.renderScale = this.resolveRenderScale();
+    // Text is baked into its own canvas, so it has to be told about the extra
+    // device pixels before the first label is created.
+    this.applyTextResolution(this.renderScale);
     // Derive the live board rectangle from the configured game size before
     // anything is built, so every layer below uses the responsive geometry.
     this.applyViewport(true);
@@ -1835,7 +1853,7 @@ export class GameScene extends Phaser.Scene {
     const kicker = this.add
       .text(CENTER_X, 104, `${theme.name}探險`, {
         fontFamily: UI_FONT,
-        fontSize: '13px',
+        fontSize: '15px',
         color: theme.accent,
       })
       .setOrigin(0.5)
@@ -1866,7 +1884,7 @@ export class GameScene extends Phaser.Scene {
         `最高分  ${this.formatScore(this.highScore)}`,
         {
           fontFamily: UI_FONT,
-          fontSize: '13px',
+          fontSize: '15px',
           color: '#d9c68c',
         },
       )
@@ -1909,7 +1927,7 @@ export class GameScene extends Phaser.Scene {
       record.label = this.add
         .text(x, y, label, {
           fontFamily: UI_FONT,
-          fontSize: '13px',
+          fontSize: '15px',
           color: '#d9c68c',
         })
         .setOrigin(0.5);
@@ -1951,7 +1969,7 @@ export class GameScene extends Phaser.Scene {
     const worldCaption = this.add
       .text(worldStartX - 10, worldY, '世界', {
         fontFamily: UI_FONT,
-        fontSize: '11px',
+        fontSize: '13px',
         color: theme.accent,
       })
       .setOrigin(1, 0.5)
@@ -2002,7 +2020,7 @@ export class GameScene extends Phaser.Scene {
     const stageCaption = this.add
       .text(stageStartX - 10, stageY, '關卡', {
         fontFamily: UI_FONT,
-        fontSize: '11px',
+        fontSize: '13px',
         color: theme.accent,
       })
       .setOrigin(1, 0.5)
@@ -2039,7 +2057,7 @@ export class GameScene extends Phaser.Scene {
         `第 ${this.selectedWorld} 世界 · 第 ${this.selectedStage} 關`,
         {
           fontFamily: UI_FONT,
-          fontSize: '13px',
+          fontSize: '15px',
           color: '#ffe39a',
         },
       )
@@ -2049,7 +2067,7 @@ export class GameScene extends Phaser.Scene {
     const hint = this.add
       .text(CENTER_X, 402, '同色三消 · 引爆炸彈 · 收集星星', {
         fontFamily: UI_FONT,
-        fontSize: '12px',
+        fontSize: '14px',
         color: '#a9bd96',
       })
       .setOrigin(0.5)
@@ -2058,7 +2076,7 @@ export class GameScene extends Phaser.Scene {
     const startButton = this.add
       .text(CENTER_X, 442, '點擊開始遊戲', {
         fontFamily: UI_FONT,
-        fontSize: '22px',
+        fontSize: '24px',
         color: '#ffe39a',
       })
       .setOrigin(0.5)
@@ -2525,7 +2543,9 @@ export class GameScene extends Phaser.Scene {
           'zs-bonus-star',
         )
         .setAlpha(rng.realInRange(0.25, 0.7))
-        .setScale(rng.realInRange(0.45, 0.95))
+        // The star texture is baked at the render scale, so the authored
+        // 0.45..0.95 sizes have to be converted back to world units.
+        .setScale(this.getBonusDisplayScale() * rng.realInRange(0.45, 0.95))
         .setAngle(rng.between(-22, 22));
 
       stars.push(star);
@@ -2628,7 +2648,7 @@ export class GameScene extends Phaser.Scene {
       ? this.add
           .text(CENTER_X, 228, `過關獎勵  +${WIN_BONUS}`, {
             fontFamily: UI_FONT,
-            fontSize: '13px',
+            fontSize: '15px',
             color: '#d9ee9f',
           })
           .setOrigin(0.5)
@@ -2636,7 +2656,7 @@ export class GameScene extends Phaser.Scene {
       : this.add
           .text(CENTER_X, 228, '球串已抵達終點', {
             fontFamily: UI_FONT,
-            fontSize: '13px',
+            fontSize: '15px',
             color: '#d3b2a2',
           })
           .setOrigin(0.5)
@@ -2645,7 +2665,7 @@ export class GameScene extends Phaser.Scene {
     const finalLabel = this.add
       .text(CENTER_X, 278, '最終分數', {
         fontFamily: UI_FONT,
-        fontSize: '12px',
+        fontSize: '14px',
         color: '#c4d3b0',
       })
       .setOrigin(0.5)
@@ -2667,7 +2687,7 @@ export class GameScene extends Phaser.Scene {
         `最高分  ${this.formatScore(this.highScore)}`,
         {
           fontFamily: UI_FONT,
-          fontSize: '12px',
+          fontSize: '14px',
           color: '#b8c7a4',
         },
       )
@@ -2677,7 +2697,7 @@ export class GameScene extends Phaser.Scene {
     const restartButton = this.add
       .text(CENTER_X, 420, isWin ? '進入下一關' : '重玩本關', {
         fontFamily: UI_FONT,
-        fontSize: '20px',
+        fontSize: '22px',
         color: '#ffe39a',
       })
       .setOrigin(0.5)
@@ -2716,10 +2736,71 @@ export class GameScene extends Phaser.Scene {
   // Derive every live geometry value from the current game size. `initial` is
   // true exactly once (inside create(), where nothing else exists yet); later
   // calls come from the RESIZE handler and re-map the running board in place.
+  // Factor between the canvas pixels main.js allocated and the CSS board the
+  // scene measures in. Published on the global registry (shared by every scene)
+  // right after the Phaser.Game was constructed.
+  resolveRenderScale() {
+    const stored = this.registry.get(RENDER_SCALE_KEY);
+
+    if (typeof stored === 'number' && Number.isFinite(stored) && stored >= 1) {
+      return stored;
+    }
+
+    // No published factor means the canvas was not supersampled: render 1:1.
+    return 1;
+  }
+
+  // Phaser bakes every Text into a private canvas at `resolution`x its font
+  // size and then draws that canvas at the font size again. At 1x the glyph
+  // canvas only has as many texels as the CSS board, so zooming the camera by
+  // `renderScale` would magnify a 1x glyph atlas and blur all small text. The
+  // two text factories are wrapped once so every label of this scene (HUD,
+  // menu, result panel, floating score popups) is baked at the render scale.
+  applyTextResolution(scale) {
+    if (!(scale > 1) || this.textResolution === scale) {
+      return;
+    }
+
+    const bake = (text) =>
+      text && typeof text.setResolution === 'function'
+        ? text.setResolution(scale)
+        : text;
+
+    const addText = this.add.text;
+    const makeText = this.make.text;
+
+    this.add.text = (...args) => bake(addText.apply(this.add, args));
+    this.make.text = (...args) => bake(makeText.apply(this.make, args));
+    this.textResolution = scale;
+  }
+
+  // Zoom the main camera out of the supersampled framebuffer so it shows
+  // exactly the CSS-pixel board (0..vw, 0..vh). Every vector - lanes, rings,
+  // capsules, glyphs - is then rasterised natively instead of being stretched.
+  applyCameraScale(renderScale = this.renderScale || 1) {
+    const camera = this.cameras.main;
+    const size = this.scale.gameSize;
+
+    camera.setSize(size.width, size.height);
+    camera.setZoom(renderScale);
+    camera.centerOn(this.vw / 2, this.vh / 2);
+  }
+
+  // Authoring space of this scene. `width`/`height` are the live board in CSS
+  // pixels, i.e. the canvas divided by the render scale, so all existing
+  // measurements, layouts and hit tests keep their original meaning.
   applyViewport(initial = false) {
     const size = this.scale.gameSize;
-    const width = Math.round(size.width || VIEW_WIDTH);
-    const height = Math.round(size.height || VIEW_HEIGHT);
+    // Re-read the published factor on every layout: moving the window to a
+    // monitor with another DPR changes it without changing the CSS board size.
+    this.renderScale = this.resolveRenderScale();
+    const renderScale = this.renderScale || 1;
+    const width = Math.round(
+      (size.width || VIEW_WIDTH * renderScale) / renderScale,
+    );
+    const height = Math.round(
+      (size.height || VIEW_HEIGHT * renderScale) / renderScale,
+    );
     const wasPortrait = this.isPortraitView;
 
     this.vw = Math.max(320, width);
@@ -2727,6 +2808,7 @@ export class GameScene extends Phaser.Scene {
     this.cx = this.vw / 2;
     this.cy = this.vh / 2;
     this.isPortraitView = this.vh > this.vw;
+    this.applyCameraScale(renderScale);
 
     // The turret always sits in the middle of the board: the landscape
     // serpentines wrap around it and the portrait spiral opens right above it.
@@ -3109,7 +3191,7 @@ export class GameScene extends Phaser.Scene {
     const label = this.add
       .text(left + width / 2, top + height / 2, '♪ 音樂', {
         fontFamily: UI_FONT,
-        fontSize: '13px',
+        fontSize: '15px',
         color: '#f7efd2',
       })
       .setOrigin(0.5);
@@ -3922,6 +4004,8 @@ export class GameScene extends Phaser.Scene {
       marble.colorIndex = SPECIAL_COLOR_INDEX;
       marble.setData('colorIndex', SPECIAL_COLOR_INDEX);
       marble.setTexture(this.getSpecialTextureKey(marble));
+      // Specials are the one marble type that is larger than the lane spacing.
+      marble.setScale(this.getMarbleDisplayScale(marble));
       this.lastSpecialSpawnIndex = this.spawnedMarblesCount;
     }
 
@@ -3969,6 +4053,7 @@ export class GameScene extends Phaser.Scene {
     const marble = this.add
       .follower(chain.track, x, y, `zs-marble-${colorIndex}`)
       .setDepth(DEPTH.balls)
+      .setScale(this.getMarbleDisplayScale())
       .setData('type', 'marble')
       .setData('colorIndex', colorIndex);
 
@@ -4036,7 +4121,42 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  // Marble textures are baked `marbleTextureScale`x larger than the authored
+  // 54px art so a ball is drawn from a texture that has as many texels as the
+  // framebuffer has pixels (see computeRenderScale in viewport.js). Every
+  // marble sprite therefore renders at 1/bakeScale of its texture; the factor is
+  // read back from the baked frame, so a texture that was already generated at
+  // a different render scale still displays at exactly the authored size.
+  getMarbleTextureScale() {
+    const authored = BALL_RADIUS * 2 + 18;
+    const frame =
+      this.textures && this.textures.exists('zs-marble-0')
+        ? this.textures.getFrame('zs-marble-0')
+        : null;
+
+    return frame && frame.width > 0 ? frame.width / authored : 1;
+  }
+
+  // Display scale of a marble sprite: compensate the baked texture size, then
+  // enlarge specials by SPECIAL_MARBLE_SCALE so power-ups stand out.
+  getMarbleDisplayScale(marble = null) {
+    const base = 1 / this.getMarbleTextureScale();
+
+    return this.isSpecialMarble(marble) ? base * SPECIAL_MARBLE_SCALE : base;
+  }
+
+  // Physical radius used by every shot/hit test. A special marble is drawn 20%
+  // larger, so its hit circle grows with it: hitting a power-up is the reward,
+  // so it must be objectively easier to hit than the balls packed around it.
+  getMarbleRadius(marble = null) {
+    return this.isSpecialMarble(marble)
+      ? BALL_RADIUS * SPECIAL_MARBLE_SCALE
+      : BALL_RADIUS;
+  }
+
   createMarbleTextures() {
+    const authoredSize = BALL_RADIUS * 2 + 18;
+
     if (
       this.textures.exists('zs-marble-0') &&
       this.textures.exists('zs-marble-bomb-0') &&
@@ -4044,13 +4164,23 @@ export class GameScene extends Phaser.Scene {
       this.textures.exists('zs-marble-pause-0') &&
       this.textures.exists('zs-marble-sniper-0')
     ) {
-      this.createNeutralSpecialTextures(BALL_RADIUS * 2 + 18);
+      this.createNeutralSpecialTextures(
+        Math.round(authoredSize * this.getMarbleTextureScale()),
+      );
       return;
     }
 
-    const size = BALL_RADIUS * 2 + 18;
-    const center = size / 2;
+    const bakeScale =
+      typeof this.renderScale === 'number' && this.renderScale > 1
+        ? this.renderScale
+        : 1;
+    // Drawing stays in authored units; `graphics.setScale()` maps them onto the
+    // larger target canvas, so none of the coordinates below had to change.
+    const size = Math.round(authoredSize * bakeScale);
+    const center = authoredSize / 2;
     const graphics = this.make.graphics({ x: 0, y: 0, add: false });
+
+    graphics.setScale(bakeScale, bakeScale);
 
     MARBLE_COLORS.forEach((hex, index) => {
       const color = Phaser.Display.Color.HexStringToColor(hex).color;
@@ -4917,7 +5047,7 @@ export class GameScene extends Phaser.Scene {
     // the cannon as a single display object.
     this.shooterIndicator = this.add
       .image(0, 0, `zs-marble-${this.currentBulletColor}`)
-      .setScale(SHOOTER_BALL_SCALE)
+      .setScale(SHOOTER_BALL_SCALE / this.getMarbleTextureScale())
       .setName('shooter-indicator')
       .setData('type', 'shooter-indicator')
       .setData('colorIndex', this.currentBulletColor);
@@ -5120,6 +5250,7 @@ export class GameScene extends Phaser.Scene {
     const sprite = this.add
       .follower(this.track, muzzleX, muzzleY, `zs-marble-${colorIndex}`)
       .setDepth(DEPTH.shots)
+      .setScale(this.getMarbleDisplayScale())
       .setData('type', 'projectile')
       .setData('colorIndex', colorIndex);
     sprite.pushOffset = 0;
@@ -5200,8 +5331,6 @@ export class GameScene extends Phaser.Scene {
   }
 
   findMarbleHit(shot) {
-    const hitDistanceSq = (SHOT_RADIUS + BALL_RADIUS) ** 2;
-
     // Shots search every active chain; the hit marble carries a back-reference
     // to its own chain so insertion/matching can never leak across tracks.
     for (const chain of this.chains) {
@@ -5210,6 +5339,9 @@ export class GameScene extends Phaser.Scene {
           continue;
         }
 
+        // Per-marble radius: a special marble is 20% larger (and therefore
+        // 20% easier to hit) than a plain colour marble.
+        const hitDistanceSq = (SHOT_RADIUS + this.getMarbleRadius(marble)) ** 2;
         const dx = marble.x - shot.sprite.x;
         const dy = marble.y - shot.sprite.y;
 
@@ -5282,7 +5414,7 @@ export class GameScene extends Phaser.Scene {
         dirY,
         marble.x,
         marble.y,
-        BALL_RADIUS,
+        this.getMarbleRadius(marble),
       );
 
       if (entry !== null && (!best || entry < best.distance)) {
@@ -5456,7 +5588,6 @@ export class GameScene extends Phaser.Scene {
   // crosses, across EVERY chain, so high speed cannot tunnel or pick the wrong
   // track (the hit marble keeps its chain back-reference for resolveHit).
   findSweptMarbleHit(fromX, fromY, toX, toY) {
-    const radius = SHOT_RADIUS + BALL_RADIUS;
     const segmentX = toX - fromX;
     const segmentY = toY - fromY;
     const segmentLengthSq = segmentX * segmentX + segmentY * segmentY;
@@ -5468,6 +5599,9 @@ export class GameScene extends Phaser.Scene {
         continue;
       }
 
+      // Per-marble radius again, so the sniper laser and the swept hit agree
+      // with findMarbleHit for the enlarged special marbles.
+      const radius = SHOT_RADIUS + this.getMarbleRadius(marble);
       const entry = this.segmentCircleEntry(
         fromX,
         fromY,
@@ -5567,7 +5701,7 @@ export class GameScene extends Phaser.Scene {
 
       this.tweens.add({
         targets: hitMarble,
-        scale: 1.35,
+        scale: this.getMarbleDisplayScale(hitMarble) * 1.35,
         alpha: 0,
         angle: hitMarble.angle - 70,
         duration: 220,
@@ -5611,7 +5745,7 @@ export class GameScene extends Phaser.Scene {
 
       this.tweens.add({
         targets: hitMarble,
-        scale: 1.3,
+        scale: this.getMarbleDisplayScale(hitMarble) * 1.3,
         alpha: 0,
         angle: hitMarble.angle + 40,
         duration: 240,
@@ -5651,7 +5785,7 @@ export class GameScene extends Phaser.Scene {
 
       this.tweens.add({
         targets: hitMarble,
-        scale: 1.3,
+        scale: this.getMarbleDisplayScale(hitMarble) * 1.3,
         alpha: 0,
         angle: hitMarble.angle - 35,
         duration: 240,
@@ -5842,7 +5976,7 @@ export class GameScene extends Phaser.Scene {
 
       this.tweens.add({
         targets: marble,
-        scale: 1.8,
+        scale: this.getMarbleDisplayScale(marble) * 1.8,
         alpha: 0,
         angle: marble.angle + 60,
         duration: 320,
@@ -6026,7 +6160,7 @@ export class GameScene extends Phaser.Scene {
     matched.forEach((marble, index) => {
       this.tweens.add({
         targets: marble,
-        scale: 1.45,
+        scale: this.getMarbleDisplayScale(marble) * 1.45,
         alpha: 0,
         angle: marble.angle + 24,
         duration: MATCH_FADE_DURATION,
@@ -6257,9 +6391,19 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    const size = 44;
-    const center = size / 2;
+    // Same supersampling rule as the marble textures: bake the 44px star art
+    // `bakeScale`x so it is drawn with real device pixels, then display it at
+    // 1/bakeScale (see getBonusDisplayScale).
+    const authored = 44;
+    const bakeScale =
+      typeof this.renderScale === 'number' && this.renderScale > 1
+        ? this.renderScale
+        : 1;
+    const size = Math.round(authored * bakeScale);
+    const center = authored / 2;
     const graphics = this.make.graphics({ x: 0, y: 0, add: false });
+
+    graphics.setScale(bakeScale, bakeScale);
 
     graphics.fillStyle(0x000000, 0.35);
     graphics.fillCircle(center + 1, center + 3, 18);
@@ -6304,6 +6448,17 @@ export class GameScene extends Phaser.Scene {
 
     graphics.generateTexture('zs-bonus-star', size, size);
     graphics.destroy();
+  }
+
+  // Display scale that keeps the (possibly supersampled) star texture at its
+  // authored 44px size.
+  getBonusDisplayScale() {
+    const frame =
+      this.textures && this.textures.exists('zs-bonus-star')
+        ? this.textures.getFrame('zs-bonus-star')
+        : null;
+
+    return frame && frame.width > 0 ? 44 / frame.width : 1;
   }
 
   // Curated pickup anchors as fractions of the live board, so the same layout
@@ -6423,7 +6578,10 @@ export class GameScene extends Phaser.Scene {
     const glow = this.add
       .circle(0, 0, 25, 0xffd76a, 0.17)
       .setBlendMode(Phaser.BlendModes.ADD);
-    const star = this.add.image(0, 0, 'zs-bonus-star');
+    const starScale = this.getBonusDisplayScale();
+    const star = this.add
+      .image(0, 0, 'zs-bonus-star')
+      .setScale(starScale);
     const item = this.add
       .container(x, y, [glow, star])
       .setDepth(DEPTH.bonus);
@@ -6437,7 +6595,7 @@ export class GameScene extends Phaser.Scene {
 
     this.tweens.add({
       targets: star,
-      scale: { from: 0.94, to: 1.16 },
+      scale: { from: starScale * 0.94, to: starScale * 1.16 },
       angle: { from: -8, to: 8 },
       duration: 620,
       ease: 'Sine.easeInOut',
@@ -6513,7 +6671,7 @@ export class GameScene extends Phaser.Scene {
       y,
       requiresGap ? `穿越射擊！+${points}` : `+${points}`,
       requiresGap ? '#fff2bb' : '#ffd76a',
-      requiresGap ? 18 : 15,
+      requiresGap ? 20 : 17,
     );
   }
 
@@ -6556,7 +6714,7 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  createFloatingText(x, y, message, color, size = 16) {
+  createFloatingText(x, y, message, color, size = 18) {
     const label = this.add
       .text(x, y - 18, message, {
         fontFamily: UI_FONT,
@@ -6635,7 +6793,7 @@ export class GameScene extends Phaser.Scene {
     this.levelText = this.add
       .text(30, 51, '', {
         fontFamily: UI_FONT,
-        fontSize: '11px',
+        fontSize: '14px',
         color: '#b4c79d',
       })
       .setAlpha(0.7)
@@ -6667,7 +6825,7 @@ export class GameScene extends Phaser.Scene {
     const homeLabel = this.add
       .text(-homeWidth / 2, -homeHeight / 2, '退出回首頁', {
         fontFamily: UI_FONT,
-        fontSize: '13px',
+        fontSize: '15px',
         color: '#f7efd2',
       })
       .setOrigin(0.5);
@@ -6754,7 +6912,7 @@ export class GameScene extends Phaser.Scene {
     const scoreLabel = this.add
       .text(770, 18, '目前分數', {
         fontFamily: UI_FONT,
-        fontSize: '11px',
+        fontSize: '13px',
         color: '#d8c387',
       })
       .setOrigin(1, 0)
@@ -6762,7 +6920,7 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     this.scoreText = this.add
-      .text(770, 31, this.formatScore(this.score), {
+      .text(770, 34, this.formatScore(this.score), {
         fontFamily: UI_FONT,
         fontSize: '24px',
         color: '#ffe39a',
@@ -6773,9 +6931,9 @@ export class GameScene extends Phaser.Scene {
     this.scoreText.setShadow(0, 2, '#000000', 8, false, true);
 
     this.highScoreText = this.add
-      .text(770, 62, `最高分 ${this.formatScore(this.highScore)}`, {
+      .text(770, 68, `最高分 ${this.formatScore(this.highScore)}`, {
         fontFamily: UI_FONT,
-        fontSize: '11px',
+        fontSize: '13px',
         color: '#c8d8b2',
       })
       .setOrigin(1, 0)
@@ -6783,9 +6941,9 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     const hintText = this.add
-      .text(770, 77, '移動滑鼠瞄準，點擊發射', {
+      .text(770, 90, '移動滑鼠瞄準，點擊發射', {
         fontFamily: UI_FONT,
-        fontSize: '11px',
+        fontSize: '13px',
         color: '#c8d8b2',
       })
       .setOrigin(1, 0)
@@ -6793,9 +6951,9 @@ export class GameScene extends Phaser.Scene {
       .setDepth(DEPTH.hud);
 
     this.marbleCountText = this.add
-      .text(770, 92, '', {
+      .text(770, 112, '', {
         fontFamily: UI_FONT,
-        fontSize: '11px',
+        fontSize: '13px',
         color: '#c8d8b2',
       })
       .setOrigin(1, 0)

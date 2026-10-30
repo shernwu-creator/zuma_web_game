@@ -17,7 +17,19 @@
       name="description"
       content="祖瑪：叢林探險 — 以 Phaser 3 打造的 Zuma 風格彈珠射擊遊戲原型。同色三消、引爆炸彈、收集星星。"
     />
+    <meta name="application-name" content="祖瑪：叢林探險" />
+    <meta name="apple-mobile-web-app-title" content="祖瑪探險" />
+    <!-- PWA: the manifest is what makes the game installable on Android/desktop
+         Chrome ("安裝應用程式") instead of only being reachable as a link. Both
+         URLs are emitted relative to the deploy folder so they also resolve
+         under the GitHub Pages subpath. -->
+    <link rel="manifest" href="%BASE_URL%manifest.webmanifest" />
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link
+      rel="apple-touch-icon"
+      sizes="180x180"
+      href="%BASE_URL%icons/apple-touch-icon.png"
+    />
     <title>祖瑪：叢林探險 — 同色三消 · 引爆炸彈 · 收集星星</title>
   </head>
   <body>
