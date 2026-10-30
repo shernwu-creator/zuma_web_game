@@ -87,6 +87,10 @@
 - **小字全面放大**：HUD 與面板的 11–13px 小字調到 13–15px（`目前分數`、`最高分`、操作提示、關卡列、首頁世界／關卡標籤、音樂與返回膠囊等），`createFloatingText()` 預設字級 18px，並同步調整右側 HUD 的垂直間距避免重疊。
 - **特殊球 +20%**：`SPECIAL_MARBLE_SCALE = 1.2`，特殊球（炸彈／時間倒流／時間暫停／狙擊）會以 1.2 倍顯示，**且命中半徑同步放大**（`getMarbleRadius()`）；`findMarbleHit()`、`findSweptMarbleHit()` 與狙擊雷射 `findSniperRayTarget()` 都改用單顆球的半徑，所以特殊球真的更容易被擊中。一般球的半徑與鏈距（`deltaT`）完全不變。
 - **PWA 可安裝化**：`public/manifest.webmanifest`（`standalone`、`orientation: any`、192／512／maskable 圖示）、`public/icons/*.png`（由 `zlib` 直接產生的 PNG，無額外相依）、`public/sw.js`（shell 預快取 + 導覽 network-first + 雜湊資源 cache-first，影音與 Range 請求不攔截）與 `main.js` 的 production-only 註冊。`index.html` 以 `%BASE_URL%` 指向 manifest 與 apple-touch-icon，因此在 GitHub Pages 的子路徑下也能安裝；先前的版本沒有任何 manifest／service worker，Android Chrome 只會提供「加到主畫面」的普通連結。
+- **專屬 App ID（可與其他 PWA 並存安裝）**：manifest 的 `id` 明確設為 `/zuma_web_game/`。`id` 是瀏覽器辨識「這個 App 是誰」的唯一鍵——同一部裝置上即使裝了多個 PWA（例如同一個 GitHub Pages 帳號底下的 `shernwu-creator.github.io/<各專案>/`），只要 `id` 不同就會被視為不同 App，主畫面／桌面可以同時存在、名稱與圖示各自獨立，也不會互相覆蓋或跳出「已安裝」而擋掉第二次安裝。
+  - `id` 解析後與 `start_url` 完全相同（`https://<帳號>.github.io/zuma_web_game/`），所以既有安裝者不會因為這次改動多出第二個圖示；但也因為 `id` 一旦安裝就等於身分，**之後不可再改**，否則會被當成另一個新 App。
+  - 其他會在同一個 origin 上撞名的資源也都已各自命名：service worker 範圍 `./`、快取名稱 `zuma-v1-shell` / `zuma-v1-runtime`、`localStorage` 全部以 `zuma*` 開頭（`zumaHighScore`、`zumaMaxWorld`、`zumaMaxStage`、`zumaMaxLevel`、`zumaJungleMusicMuted`），App 名稱（`祖瑪：叢林探險` / `祖瑪探險`）與圖示也與其他專案不同。
+  - iOS 的「加入主畫面」是以 `start_url` 當身分，同樣因為路徑不同而不會與其他專案衝突。
 
 ## 介面語言與字型
 
@@ -111,7 +115,7 @@ zuma_web_game/
 ├── index.html                # 頁面外框、manifest / apple-touch-icon 連結
 ├── public/
 │   ├── favicon.svg
-│   ├── manifest.webmanifest  # PWA manifest（standalone、192/512/maskable 圖示）
+│   ├── manifest.webmanifest  # PWA manifest（id /zuma_web_game/、standalone、192/512/maskable 圖示）
 │   ├── sw.js                 # PWA service worker（shell 預快取、離線開啟）
 │   ├── icons/                # PWA 圖示（192 / 512 / maskable 512 / apple-touch 180）
 │   └── *.mp3, *.mp4          # 背景音樂與過關短片
@@ -159,5 +163,6 @@ zuma_web_game/
 - 材質烘焙倍率一律從**材質實際寬度**回推（`getMarbleTextureScale()`、`getBonusDisplayScale()`），而不是直接拿 `renderScale`：材質管理器在整個 session 共用，若中途換到不同 DPI 的螢幕導致倍率改變，舊材質仍會以正確尺寸顯示（只是維持原本的銳利度），不會出現球忽然變大或變小的問題。
 - 特殊球雖然顯示與命中半徑都放大 1.2 倍，但**不影響任何規則**：`deltaT` 間距、三消長度、磁吸、爆炸範圍與生成機率全部沿用原值，只是視覺上會與左右鄰球稍微重疊（那正是「比較好打」的來源）。
 - service worker 只在 production build 註冊（`import.meta.env.PROD`）：`vite dev` 期間若也註冊，會把未打包的模組快取住，造成改程式碼卻看到舊畫面的問題。`sw.js` 也不攔截 `.mp4` 與帶 `Range` 的請求，過關短片的 seeking 才不會被快取破壞。
+- manifest 的 `id` 是「應用程式身分」而不是路徑宣告：瀏覽器（Chromium 系）在安裝時以 `new URL(id, manifestUrl)` 當成唯一鍵，只要同一個 origin 上的兩個專案解析出不同的 `id` URL，就會是兩個獨立 App。這裡刻意寫成絕對路徑 `/zuma_web_game/` 而不是相對的 `./`：相對寫法會隨 manifest 被搬到哪個資料夾而改變身分，絕對路徑則固定對應到本專案的部署目錄（也仍在 `scope: "./"` 之內），同時與先前的解析結果相同，既有安裝不會被複製成第二個圖示。
 
 - 直式圈距是「回推」出來的：`laneStep` 由 `radiusX`、圈數、波浪振幅與 68 px 砲台淨空一起算出並夾在 `BALL_DIAMETER + 11 … + 22`，因此窄螢幕會自動縮小圈距，優先保住砲台淨空與尾端可射擊距離。
