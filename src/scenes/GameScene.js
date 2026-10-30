@@ -1598,6 +1598,14 @@ export class GameScene extends Phaser.Scene {
     this.unlockBgmAudio();
   }
 
+  // Loss overlay tap ("重玩本關"): replay the stage that was just failed instead
+  // of dropping back to World 1 Stage 1. `currentWorld` / `currentStage` still
+  // hold the failed stage here, so passing them through startGame() rebuilds the
+  // exact same board while the run score starts from zero again.
+  restartStage() {
+    this.startGame(this.currentWorld, this.currentStage);
+  }
+
   // Begin (or continue into) the current World/Stage. Score, currentWorld and
   // currentStage are intentionally NOT reset here so clearing a stage keeps
   // the cumulative run score.
@@ -2667,7 +2675,7 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.6);
 
     const restartButton = this.add
-      .text(CENTER_X, 420, isWin ? '進入下一關' : '點擊重新開始', {
+      .text(CENTER_X, 420, isWin ? '進入下一關' : '重玩本關', {
         fontFamily: UI_FONT,
         fontSize: '20px',
         color: '#ffe39a',
@@ -4343,8 +4351,11 @@ export class GameScene extends Phaser.Scene {
     const catchUpTravelT =
       (chainSpeed * CATCH_UP_MULTIPLIER * step) / trackLength;
 
-    // Step 1: split the array wherever a real physical gap exists.
+    // Step 1: split the array wherever a real physical gap exists. Every split
+    // is also recorded as a `seam`: a hole that exists when the frame starts
+    // and may therefore close during this very frame (checked in Step 5).
     const segments = [];
+    const seams = [];
     let segment = [marbles[0]];
 
     for (let index = 1; index < marbles.length; index += 1) {
@@ -4354,6 +4365,7 @@ export class GameScene extends Phaser.Scene {
       if (ahead.t - marble.t > deltaT + 0.002) {
         segments.push(segment);
         segment = [marble];
+        seams.push({ ahead, rear: marble });
       } else {
         segment.push(marble);
       }
@@ -4561,7 +4573,119 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
+    // Step 5: the magnetic test above measures the gap against the rear head's
+    // position from BEFORE the frame moved. When the rear segment's own step is
+    // the one that finishes the contact (it snaps onto frontTail.t - deltaT in
+    // this same frame) no combo was recorded, Step 1 merged the pair into one
+    // segment on the next frame, and the same-colour group was never tested
+    // again - that is the "three (or more) matching balls touch but nothing
+    // pops" bug. Re-testing every seam against the post-movement positions
+    // catches both closing directions, and a seam by definition only exists for
+    // a real hole, so already-packed runs (spawns, earlier merges) never pop.
+    // This runs even when Step 4 already popped elsewhere: a sealed seam is a
+    // second, independent collision and must detonate in the same frame.
+    if (this.resolveSeamMatches(chain, seams)) {
+      this.slowdownTimer = 1.5;
+    }
+
     this.refreshChainMetrics(chain);
+  }
+
+  // Chained detonation for a hole that physically closed during this frame:
+  // both sides of the seam are now touching and same-coloured, so the joined
+  // run must be resolved exactly like a magnetic combo.
+  resolveSeamMatches(chain, seams) {
+    if (!seams || seams.length === 0) {
+      return false;
+    }
+
+    let popped = false;
+
+    for (const seam of seams) {
+      const { ahead, rear } = seam;
+
+      // An earlier seam in the same frame may have removed either side.
+      if (
+        !ahead ||
+        !rear ||
+        rear.chain !== chain ||
+        chain.marbles.indexOf(ahead) === -1 ||
+        chain.marbles.indexOf(rear) === -1
+      ) {
+        continue;
+      }
+
+      const gap = ahead.t - rear.t;
+
+      if (!(gap <= chain.deltaT + 0.002)) {
+        continue;
+      }
+
+      if (rear.colorIndex < 0 || rear.colorIndex !== ahead.colorIndex) {
+        continue;
+      }
+
+      // Gaps must not be counted: two same-coloured groups separated by another
+      // hole are not connected, even though findMatchRun() counts them.
+      const run = this.findTouchingMatchRun(rear);
+
+      if (!run || run.length < MIN_MATCH) {
+        continue;
+      }
+
+      if (this.resolveMatches(rear, true) > 0) {
+        popped = true;
+      }
+    }
+
+    return popped;
+  }
+
+  // Same-colour run that is physically connected to `marble`. Unlike
+  // findMatchRun() - which counts a colour streak across holes - the walk stops
+  // at the first gap wider than the rigid-chain tolerance.
+  findTouchingMatchRun(marble) {
+    const chain = marble.chain ?? this.chains[0];
+
+    if (!chain) {
+      return null;
+    }
+
+    const marbles = chain.marbles;
+    const startIndex = marbles.indexOf(marble);
+
+    if (startIndex === -1) {
+      return null;
+    }
+
+    const colorIndex = marble.colorIndex;
+    const contact = chain.deltaT + 0.002;
+    let start = startIndex;
+    let end = startIndex;
+
+    while (start > 0) {
+      const current = marbles[start];
+      const ahead = marbles[start - 1];
+
+      if (ahead.colorIndex !== colorIndex || ahead.t - current.t > contact) {
+        break;
+      }
+
+      start -= 1;
+    }
+
+    while (end < marbles.length - 1) {
+      const current = marbles[end];
+      const behind = marbles[end + 1];
+
+      if (behind.colorIndex !== colorIndex || current.t - behind.t > contact) {
+        break;
+      }
+
+      end += 1;
+    }
+
+    return { start, end, length: end - start + 1 };
   }
 
   updateChainPositions() {
@@ -4877,9 +5001,10 @@ export class GameScene extends Phaser.Scene {
       if (this.levelWon) {
         this.startNextLevel();
       } else {
-        // A lost run restarts a fresh run at World 1 Stage 1 with a zeroed
-        // score. Unlocked progress and the high score are preserved.
-        this.startGame(1, 1);
+        // A lost run replays the stage that was just failed (not World 1
+        // Stage 1). The run score starts over; unlocked progress and the high
+        // score are preserved.
+        this.restartStage();
       }
       return;
     }

@@ -25,6 +25,7 @@
 - **空隙吸收推擠 (Cascade Push)**：`deltaT = BALL_DIAMETER / trackLength`。先將新球 `splice` 進陣列，再從插入索引往車頭（索引 0、`t` 遞增方向）逐對檢查 `gap = t[i-1] - t[i]`；只有 `gap < deltaT` 才把前方球往前推 `deltaT - gap`。一旦遇到 `gap >= deltaT`，代表既有空隙已吸收推力，立即 `break`，缺口另一側的球完全不受影響。
 - **動態區段與車尾推進 (Tail Pushing)**：每幀依 `gap > deltaT + 0.002` 將球串切成多個 segments。所有區段預設速度為 0；最靠近起點的尾段（最後一段）無條件獲得 `standardTravelT` 的推進力。從尾段往前檢查，若後段車頭與前段車尾同色，改成「前段倒退」：`front.speed = -catchUpTravelT`（關卡速度 × 4.5 的負值）。
 - **追尾剛性鎖與連鎖 (Combo)**：一般區段由前方車尾的 `frontTail.t - deltaT` 夾住推進；磁吸區段則反過來以尾部為前緣，把整段重新吊在 `rearHead.t + deltaT` 上（`current[i].t = current[i+1].t + deltaT`），因此是「前方區段倒退吸進後方車頭」。吸附成立（含 0.002 的分段容忍帶）時記錄 `comboMarble`，最後以 `findMatchRun()` 確認連續同色至少 3 顆才觸發 `resolveMatches()`。不足 3 顆只會扣合，不會爆破。
+- **缺口封閉複查 (Seam Check)**：Step 1 切段時會把每個缺口（`seam`，前方車尾與後方車頭這一對）記錄下來；移動結束後 `resolveSeamMatches()` 再以**移動後的座標**複查一次：只要缺口兩端已經相貼（`gap <= deltaT + 0.002`）且同色，就用 `findTouchingMatchRun()`（遇到 `gap` 就停，不跨洞數同色球）確認「實際相連」長度 ≥ 3 才觸發連鎖消除，且同一幀的多個缺口各自獨立判定。磁吸判定用的是移動前的車頭座標，若接觸是由**後方車頭自己的夾具推進**（`frontTail.t - deltaT`）完成，舊版不會記錄 `comboMarble`，下一幀 Step 1 就把兩段併成同一段，同色 3 顆從此再也不會被檢查——這正是「3 顆以上同色貼在一起卻不爆」的成因。因為 `seam` 只存在於真實缺口，開局或既有的緊貼球（例如隨機生成就相鄰的同色球）不會被誤爆。
 - **剛性鏈條 (Rigid Chain)**：一旦 `gap <= deltaT + 0.002`，後車不再使用自己的速度，而是直接硬綁定為 `marble.t = ahead.t - deltaT`，維持精確且平均的一顆球直徑間距。
 - **全域減速**：成功消除時 `slowdownTimer = 1.5`，接下來 1.5 秒內車尾推進速度降為一般值的 30%，營造消除後的短暫慢動作。
 - **爆炸回饋**：消除時會產生白色閃光圓圈、20 顆高散射粒子，並讓消除區後方的第一顆球同時獲得 `pushOffset = deltaT * 1.5` 與 `t -= deltaT * 1.5` 的真正物理倒退，形成新的斷層。
@@ -50,10 +51,10 @@
 - **狀態機**：`gameState` 包含 `MENU`、`PLAYING`、`GAMEOVER`。載入時顯示首頁，隱藏砲台與遊戲 HUD；點擊畫面進入 `PLAYING`。
 - **首頁**：中央顯示巨大「祖瑪：叢林探險」標題、最高分與閃爍的「點擊開始遊戲」。
 - **動態球串**：遊戲開始時軌道為空，每關生成 `getTotalMarbles()`（`30 + currentLevel × 10`）顆球。每當軌道尾端 `t > deltaT`，就在 `t = Clamp(tail.t - deltaT, 0, deltaT)` 生成新球，讓新球緊貼洞口內的尾球（10% 炸彈）。
-- **Game Over**：最前段球（`marbles[0]`）抵達 `t = 1` 時立即切換 `GAMEOVER`、停止移動與射擊，顯示「遊戲結束」、最終分數、「球串已抵達終點」與「點擊重新開始」。
+- **Game Over**：最前段球（`marbles[0]`）抵達 `t = 1` 時立即切換 `GAMEOVER`、停止移動與射擊，顯示「遊戲結束」、最終分數、「球串已抵達終點」與閃爍的「重玩本關」。
 - **Victory**：本關全部球生成且 `marbles.length === 0` 時顯示「關卡完成！」，額外獎勵 500 分，並顯示「過關獎勵」結算與「進入下一關」按鈕。
 - **加分卡補充**：`bonusTimer` 每 8 秒檢查一次；場上星星少於 3 顆時，在合法空白位置補充 1 顆。
-- **失敗重來**：失敗後點擊「點擊重新開始」會清除舊球串、子彈與星星，回到第 1 關、分數歸零；最高分仍保留。
+- **失敗重來**：失敗後點擊「重玩本關」會呼叫 `restartStage()` → `startGame(currentWorld, currentStage)`，直接重玩剛剛失敗的同一個 World/Stage（不會退回第 1 關）；舊球串、子彈與星星一併清除，該局分數歸零，已解鎖進度與最高分仍保留。
 
 ## 第六階段：關卡系統
 
@@ -61,7 +62,7 @@
 - **每關球數**：`30 + currentLevel × 10`（L1 = 40、L2 = 50、L3 = 60…）。生成上限、勝利判定與 HUD 進度全部改用 `getTotalMarbles()`，不再寫死 40。
 - **每關速度**：`40 + currentLevel × 5` px/s（L1 = 45、L2 = 50、L3 = 55…）；同色磁吸速度為關卡速度 × 4.5。
 - **車尾永遠推進**：最靠近起點的尾段每幀都無條件獲得標準推進力，不再受「本關球是否全部生成」或 `tailPushActive` 限制；即使中段被打斷，後段仍會持續收尾，最終龍頭可自然抵達 `t = 1` 觸發 Game Over。
-- **過關流程**：勝利面板按「進入下一關」→ `currentLevel += 1`、分數累計保留，重建新關卡的球串／子彈／星星與計時器後直接開局；失敗則重新從第 1 關開始、分數歸零。
+- **過關流程**：勝利面板按「進入下一關」→ `currentLevel += 1`、分數累計保留，重建新關卡的球串／子彈／星星與計時器後直接開局；失敗則由 `restartStage()` 重玩同一個 World/Stage、分數歸零。
 - **HUD 顯示**：左上角顯示「祖瑪：叢林探險」與「第 N 關 / 共 X 顆球」，右上角顯示「目前分數」、「最高分」、「移動滑鼠瞄準，點擊發射」與「軌道上 X 顆 · 已生成 Y/N」，數值全部即時更新。
 
 ## 第七階段：30 關獨立地圖
@@ -127,9 +128,9 @@ zuma_web_game/
 - `zumaHighScore` 以數字字串存在 `localStorage`；每次加分若超過紀錄就立即寫入，重新載入頁面後仍會顯示。
 - 加分星星使用 `distanceToTrack()` 保證不壓在軌道上，並以 `shotPathCrossesTrack()` 判斷是否需要穿過球串縫隙；若子彈未撞到任何球而命中該星星，即判定為穿越射擊（Gap Shot）。
 - 炸彈球使用獨立材質 `zs-marble-bomb-*`，一般三消仍以 `colorIndex` 判斷顏色，不受外觀影響。
-- 首頁與結束畫面使用 `DEPTH.overlay = 200` 的全畫面 overlay；點擊事件會依 `gameState` 分流成開始遊戲、發射子彈、重新開始或勝利後進入下一關。
+- 首頁與結束畫面使用 `DEPTH.overlay = 200` 的全畫面 overlay；點擊事件會依 `gameState` 分流成開始遊戲、發射子彈、失敗重玩本關（`restartStage()`）或勝利後進入下一關。
 - 動態生成會先檢查尾端球是否已離開起點超過 `deltaT`，新球生成於 `t = Clamp(tail.t - deltaT, 0, deltaT)`（緊貼洞口內的尾球，不再固定 `t = 0` 造成空隙與隨後被夾回的跳動），並在 `spawnedMarblesCount === this.getTotalMarbles()` 後停止生成；但車尾推進不會因此停止。
-- `startGame()`（首頁開始或失敗重來）會重置 `currentLevel = 1` 與分數；`startLevel()` 只重建當前關卡、保留累計分數，供 `startNextLevel()` 呼叫。
+- `startGame()`（首頁開始或失敗重來）會重置分數；首頁開始走 `startGame()` 的 World/Stage 選擇流程，失敗重來則由 `restartStage()` 帶入 `currentWorld` / `currentStage`，因此重玩的是同一個關卡而不是第 1 關。`startLevel()` 只重建當前關卡、保留累計分數，供 `startNextLevel()` 呼叫。
 - HUD 關卡列由 `updateLevelHud()` 依 `getTotalMarbles()` 產生，球數列由 `updateMarbleCount()` 產生，兩者皆會在有新球生成、消除或換關時更新。
 - 滑鼠位置使用 Phaser 的 `activePointer.worldX / worldY`，可正確對應 FIT 縮放後的畫布座標。
 - 子彈與球的碰撞採兩圓半徑相加的平方距離比較，避免每幀開根號。
