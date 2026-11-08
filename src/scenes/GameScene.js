@@ -678,6 +678,8 @@ export class GameScene extends Phaser.Scene {
 
     this.menuButton = null;
     this.restartButton = null;
+    this.returnMenuButton = null;
+    this.returnMenuHitArea = null;
     this.menuLevelText = null;
     this.menuArrowLeft = null;
     this.menuArrowRight = null;
@@ -714,7 +716,9 @@ export class GameScene extends Phaser.Scene {
 
   // Absolute difficulty D = (world - 1) * MAX_STAGE + stage, 1..30.
   getDifficulty() {
-    return (this.currentWorld - 1) * MAX_STAGE + this.currentStage;
+    const world = Number.isFinite(this.currentWorld) ? this.currentWorld : 1;
+    const stage = Number.isFinite(this.currentStage) ? this.currentStage : 1;
+    return (world - 1) * MAX_STAGE + stage;
   }
 
   // World 3 (D >= 21) runs two independent tracks/chains. A portrait board is
@@ -994,10 +998,18 @@ export class GameScene extends Phaser.Scene {
       1,
       Math.max(1, this.maxUnlockedWorld),
     );
+    const maxAllowedStage =
+      this.selectedWorld === this.maxUnlockedWorld
+        ? Math.min(
+            this.maxUnlockedStage,
+            this.getMaxStageForWorld(this.selectedWorld),
+          )
+        : this.getMaxStageForWorld(this.selectedWorld);
+
     this.selectedStage = Phaser.Math.Clamp(
       Math.round(this.selectedStage) || 1,
       1,
-      Math.max(1, this.getMaxStageForWorld(this.selectedWorld)),
+      Math.max(1, maxAllowedStage),
     );
     this.selectedLevel = this.worldStageToLevel(
       this.selectedWorld,
@@ -1596,7 +1608,14 @@ export class GameScene extends Phaser.Scene {
         1,
         Math.max(1, this.maxUnlockedWorld),
       );
-      const maxStage = Math.max(1, this.getMaxStageForWorld(targetWorld));
+      const maxStageLimit =
+        targetWorld === this.maxUnlockedWorld
+          ? Math.min(
+              this.maxUnlockedStage,
+              this.getMaxStageForWorld(targetWorld),
+            )
+          : this.getMaxStageForWorld(targetWorld);
+      const maxStage = Math.max(1, maxStageLimit);
       target = {
         world: targetWorld,
         stage: Phaser.Math.Clamp(Math.round(stage) || 1, 1, maxStage),
@@ -2695,13 +2714,43 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.6);
 
     const restartButton = this.add
-      .text(CENTER_X, 420, isWin ? '進入下一關' : '重玩本關', {
+      .text(CENTER_X, 412, isWin ? '進入下一關' : '重玩本關', {
         fontFamily: UI_FONT,
         fontSize: '22px',
         color: '#ffe39a',
       })
       .setOrigin(0.5)
       .setShadow(0, 2, '#000000', 8, false, true);
+
+    const returnMenuButton = this.add
+      .text(CENTER_X, 460, '返回主選單', {
+        fontFamily: UI_FONT,
+        fontSize: '16px',
+        color: '#b8c7a4',
+      })
+      .setOrigin(0.5)
+      .setAlpha(0.85);
+
+    const returnMenuHitArea = this.add
+      .zone(CENTER_X, 460, 160, 36)
+      .setOrigin(0.5)
+      .setInteractive({ useHandCursor: true });
+
+    returnMenuHitArea.on('pointerover', () => {
+      returnMenuButton.setColor('#fff4c9');
+      returnMenuButton.setAlpha(1);
+    });
+
+    returnMenuHitArea.on('pointerout', () => {
+      returnMenuButton.setColor('#b8c7a4');
+      returnMenuButton.setAlpha(0.85);
+    });
+
+    returnMenuHitArea.on('pointerdown', (pointer, _localX, _localY, event) => {
+      event.stopPropagation();
+      this.menuControlDownTime = pointer.downTime;
+      this.returnToMenu();
+    });
 
     overlay.add([
       backdrop,
@@ -2712,11 +2761,15 @@ export class GameScene extends Phaser.Scene {
       finalScore,
       highLine,
       restartButton,
+      returnMenuButton,
+      returnMenuHitArea,
     ]);
 
     this.gameOverOverlay = overlay;
     this.resultBackdrop = backdrop;
     this.restartButton = restartButton;
+    this.returnMenuButton = returnMenuButton;
+    this.returnMenuHitArea = returnMenuHitArea;
     this.layoutOverlays();
 
     this.tweens.add({
@@ -3015,6 +3068,14 @@ export class GameScene extends Phaser.Scene {
   resolveLayoutPoints(spec) {
     if (!spec) {
       return this.buildPortraitTrack(1);
+    }
+
+    // World 3 inner spline: maps the inner circuit centered around the turret.
+    if (spec.isInner) {
+      return this.mapDesignLayout(
+        spec.points ??
+          this.buildDualInnerTrack(spec.difficulty ?? this.getDifficulty()),
+      );
     }
 
     // A portrait board can never host the wide landscape serpentines.
@@ -3428,33 +3489,41 @@ export class GameScene extends Phaser.Scene {
     return colors;
   }
 
-  // Next queued ammo colour. While marbles still spawn the queue simply walks
-  // the active palette; once everything has spawned it can only serve colours
-  // that are still on the board, so a leftover run can always be finished
-  // instead of the launcher cycling through colours that no longer exist.
+  // Next queued ammo colour. Prioritises colours currently present on the
+  // board, weighted by their marble frequency, so the launcher consistently
+  // provides solvable matches instead of useless colours. Falls back to a random
+  // active colour if the board is empty.
   pickNextBulletColor(previousColor) {
-    const activeCount = this.getActiveColorCount();
-    const fallback = (previousColor + 1) % activeCount;
+    const activeCount = Math.max(1, (typeof this.getActiveColorCount === 'function' ? this.getActiveColorCount() : 0) || 4);
+    const counts = new Map();
 
-    if (this.spawnedMarblesCount < this.getTotalMarbles()) {
-      return fallback;
-    }
-
-    const remaining = this.getColorsOnChain();
-
-    if (remaining.length === 0) {
-      return fallback;
-    }
-
-    for (let step = 1; step <= activeCount; step += 1) {
-      const candidate = (previousColor + step) % activeCount;
-
-      if (remaining.includes(candidate)) {
-        return candidate;
+    for (const chain of this.chains || []) {
+      for (const marble of chain.marbles || []) {
+        const index = marble.colorIndex;
+        if (index >= 0 && index < activeCount) {
+          counts.set(index, (counts.get(index) || 0) + 1);
+        }
       }
     }
 
-    return fallback;
+    if (counts.size > 0) {
+      let totalMarbles = 0;
+      for (const count of counts.values()) {
+        totalMarbles += count;
+      }
+
+      let roll = Math.random() * totalMarbles;
+      for (const [color, count] of counts.entries()) {
+        roll -= count;
+        if (roll <= 0) {
+          return color;
+        }
+      }
+
+      return Array.from(counts.keys())[0];
+    }
+
+    return Phaser.Math.Between(0, activeCount - 1);
   }
 
   /* ------------------------------------------------------------------ */
@@ -3657,12 +3726,16 @@ export class GameScene extends Phaser.Scene {
     // routes are rebuilt from the difficulty against the live board, landscape
     // ones are simply re-mapped from their stored design points.
     const specs = this.isPortraitView
-      ? [{ portrait: true, difficulty }]
-      : [{ points: this.buildLandscapeTrack(difficulty), difficulty }];
+      ? [{ portrait: true, difficulty, isInner: false }]
+      : [{ points: this.buildLandscapeTrack(difficulty), difficulty, isInner: false }];
 
     // World 3 (D >= 21) gets a second, independent inner spline.
     if (this.isDualTrack()) {
-      specs.push({ points: this.buildDualInnerTrack(difficulty), difficulty });
+      specs.push({
+        points: this.buildDualInnerTrack(difficulty),
+        difficulty,
+        isInner: true,
+      });
     }
 
     this.layoutSpecs = specs;
@@ -4777,7 +4850,7 @@ export class GameScene extends Phaser.Scene {
   findTouchingMatchRun(marble) {
     const chain = marble.chain ?? this.chains[0];
 
-    if (!chain) {
+    if (!chain || marble.colorIndex < 0) {
       return null;
     }
 
@@ -4789,7 +4862,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     const colorIndex = marble.colorIndex;
-    const contact = chain.deltaT + 0.002;
+    const contact = chain.deltaT + 0.005;
     let start = startIndex;
     let end = startIndex;
 
@@ -5211,6 +5284,237 @@ export class GameScene extends Phaser.Scene {
     );
   }
 
+  // Powerful piercing laser shot: penetrates through all marbles on the
+  // ray, exploding normal balls and doubling special marble effects.
+  firePiercingLaser(muzzleX, muzzleY, angle) {
+    const dirX = Math.cos(angle);
+    const dirY = Math.sin(angle);
+    const edge = this.sniperEdgePoint(muzzleX, muzzleY, dirX, dirY);
+
+    // 1. High-impact laser beam visual
+    const beam = this.add.graphics().setDepth(DEPTH.shots + 2);
+    beam.lineStyle(24, 0xff2222, 0.4);
+    beam.lineBetween(muzzleX, muzzleY, edge.x, edge.y);
+    beam.lineStyle(10, 0xff7777, 0.85);
+    beam.lineBetween(muzzleX, muzzleY, edge.x, edge.y);
+    beam.lineStyle(3.5, 0xffffff, 1.0);
+    beam.lineBetween(muzzleX, muzzleY, edge.x, edge.y);
+
+    this.tweens.add({
+      targets: beam,
+      alpha: 0,
+      duration: 220,
+      ease: 'Quad.easeOut',
+      onComplete: () => beam.destroy(),
+    });
+
+    this.cameras.main.shake(160, 0.012);
+    this.createMuzzleFlash(muzzleX, muzzleY);
+    this.playShootSound();
+
+    // 2. Ray geometry
+    const segX = edge.x - muzzleX;
+    const segY = edge.y - muzzleY;
+    const segLenSq = segX * segX + segY * segY;
+
+    if (segLenSq <= 0) {
+      return;
+    }
+
+    const hitRecords = [];
+
+    for (const chain of this.chains) {
+      for (const marble of chain.marbles) {
+        if (!marble || marble.active === false) {
+          continue;
+        }
+
+        const radius = this.getMarbleRadius(marble) + 8;
+        const radiusSq = radius * radius;
+        const dx = marble.x - muzzleX;
+        const dy = marble.y - muzzleY;
+        const t = Phaser.Math.Clamp((dx * segX + dy * segY) / segLenSq, 0, 1);
+        const projX = muzzleX + t * segX;
+        const projY = muzzleY + t * segY;
+        const distSq = (marble.x - projX) ** 2 + (marble.y - projY) ** 2;
+
+        if (distSq <= radiusSq) {
+          hitRecords.push({
+            marble,
+            chain,
+            distFromMuzzle: Math.hypot(projX - muzzleX, projY - muzzleY),
+          });
+        }
+      }
+    }
+
+    // Sort closest to farthest along the beam
+    hitRecords.sort((a, b) => a.distFromMuzzle - b.distFromMuzzle);
+
+    // 3. Collect any bonus stars along the laser ray
+    for (let bIndex = this.bonusItems.length - 1; bIndex >= 0; bIndex -= 1) {
+      const bonus = this.bonusItems[bIndex];
+      if (!bonus || bonus.active === false) continue;
+      const t = Phaser.Math.Clamp(
+        ((bonus.x - muzzleX) * segX + (bonus.y - muzzleY) * segY) / segLenSq,
+        0,
+        1,
+      );
+      const projX = muzzleX + t * segX;
+      const projY = muzzleY + t * segY;
+      if ((bonus.x - projX) ** 2 + (bonus.y - projY) ** 2 <= (BONUS_RADIUS + 12) ** 2) {
+        this.collectBonus(bonus, { colorIndex: this.currentBulletColor });
+      }
+    }
+
+    if (hitRecords.length === 0) {
+      return;
+    }
+
+    // 4. Detonate and penetrate all hit marbles with amplified special effects
+    const affectedChains = new Set();
+    let normalHitCount = 0;
+
+    for (const record of hitRecords) {
+      const { marble, chain } = record;
+      affectedChains.add(chain);
+
+      const mIndex = chain.marbles.indexOf(marble);
+      if (mIndex === -1) {
+        continue;
+      }
+
+      const mx = marble.x;
+      const my = marble.y;
+      const color = marble.colorIndex;
+
+      if (marble.isBomb) {
+        chain.marbles.splice(mIndex, 1);
+        marble.destroy();
+
+        // Doubled blast range: 4 neighbors each way
+        const doubleBlastNeighbours = BOMB_BLAST_NEIGHBOURS * 2;
+        let start = mIndex;
+        let end = mIndex;
+        for (let s = 0; s < doubleBlastNeighbours; s += 1) {
+          const idx = start - 1;
+          if (idx < 0) break;
+          const gap = chain.marbles[idx].t - chain.marbles[idx + 1].t;
+          if (!Number.isFinite(gap) || gap > chain.deltaT + 0.005) break;
+          start = idx;
+        }
+        for (let s = 0; s < doubleBlastNeighbours; s += 1) {
+          const idx = end;
+          if (idx >= chain.marbles.length) break;
+          if (idx > 0) {
+            const gap = chain.marbles[idx - 1].t - chain.marbles[idx].t;
+            if (!Number.isFinite(gap) || gap > chain.deltaT + 0.005) break;
+          }
+          end = idx + 1;
+        }
+
+        const blasted = chain.marbles.splice(start, Math.max(0, end - start));
+        blasted.forEach((m, idx) => {
+          this.tweens.add({
+            targets: m,
+            scale: this.getMarbleDisplayScale(m) * 2.0,
+            alpha: 0,
+            angle: m.angle + 75,
+            duration: 320,
+            delay: idx * 16,
+            ease: 'Back.easeIn',
+            onComplete: () => m.destroy(),
+          });
+        });
+
+        const bombScore = BOMB_SCORE * 2;
+        this.addScore(bombScore);
+        this.createMatchBurst(mx, my, color);
+        this.createFloatingText(mx, my, `超級炸彈！+${bombScore}`, '#fff1b9', 24);
+        this.cameras.main.shake(260, 0.016);
+        this.playExplosionSound();
+      } else if (marble.isReverse) {
+        chain.marbles.splice(mIndex, 1);
+        this.tweens.add({
+          targets: marble,
+          scale: this.getMarbleDisplayScale(marble) * 1.5,
+          alpha: 0,
+          angle: marble.angle - 90,
+          duration: 220,
+          ease: 'Cubic.easeOut',
+          onComplete: () => marble.destroy(),
+        });
+        this.reverseTimer = REVERSE_DURATION * 2;
+        this.createMatchBurst(mx, my, color);
+        this.createFloatingText(mx, my, '超級時間倒流！(2x)', '#aef7ff', 24);
+        this.cameras.main.flash(200, 90, 200, 255);
+      } else if (marble.isPause) {
+        chain.marbles.splice(mIndex, 1);
+        this.tweens.add({
+          targets: marble,
+          scale: this.getMarbleDisplayScale(marble) * 1.5,
+          alpha: 0,
+          angle: marble.angle + 60,
+          duration: 240,
+          ease: 'Cubic.easeOut',
+          onComplete: () => marble.destroy(),
+        });
+        this.reverseTimer = 0;
+        this.pauseTimer = PAUSE_DURATION * 2;
+        this.createMatchBurst(mx, my, color);
+        this.createFloatingText(mx, my, '超級時間暫停！(2x)', '#bfe6ff', 24);
+        this.cameras.main.flash(200, 120, 200, 255);
+      } else if (marble.isSniper) {
+        chain.marbles.splice(mIndex, 1);
+        this.tweens.add({
+          targets: marble,
+          scale: this.getMarbleDisplayScale(marble) * 1.5,
+          alpha: 0,
+          duration: 240,
+          ease: 'Cubic.easeOut',
+          onComplete: () => marble.destroy(),
+        });
+        this.sniperTimer += SNIPER_BUFF_DURATION * 2;
+        this.createMatchBurst(mx, my, color);
+        this.createFloatingText(mx, my, '雷射強化延長！(2x)', '#ff9a9a', 24);
+        this.cameras.main.flash(200, 255, 90, 90);
+      } else {
+        // Normal marble: pierced and obliterated!
+        chain.marbles.splice(mIndex, 1);
+        this.tweens.add({
+          targets: marble,
+          scale: this.getMarbleDisplayScale(marble) * 1.6,
+          alpha: 0,
+          duration: 200,
+          ease: 'Back.easeIn',
+          onComplete: () => marble.destroy(),
+        });
+        this.createMatchBurst(mx, my, color);
+        this.addScore(100);
+        normalHitCount += 1;
+      }
+    }
+
+    if (normalHitCount > 0) {
+      const first = hitRecords[0].marble;
+      this.createFloatingText(
+        first.x,
+        first.y - 20,
+        `雷射貫穿！${normalHitCount}球 +${normalHitCount * 100}`,
+        '#ff7b7b',
+        22,
+      );
+      this.playMatchSound();
+    }
+
+    for (const chain of affectedChains) {
+      this.refreshChainMetrics(chain);
+    }
+    this.syncPrimaryAliases();
+    this.updateMarbleCount();
+    this.slowdownTimer = 1.5;
+  }
+
   shootAt(targetX, targetY) {
     if (!this.cannon) {
       return;
@@ -5243,6 +5547,13 @@ export class GameScene extends Phaser.Scene {
     this.nextBulletColor = this.pickNextBulletColor(this.currentBulletColor);
     this.updateShooterIndicator();
     this.cannon.setRotation(angle);
+
+    // Powerful piercing laser shot when sniper buff is active:
+    // penetrates and obliterates all balls in path with double special effects!
+    if (this.sniperBuffActive) {
+      this.firePiercingLaser(muzzleX, muzzleY, angle);
+      return;
+    }
 
     // Projectiles are PathFollowers too. While in flight they are moved
     // manually in a straight line; on impact the very same object is rebound
@@ -5289,29 +5600,26 @@ export class GameScene extends Phaser.Scene {
       shot.sprite.x += shot.vx * step;
       shot.sprite.y += shot.vy * step;
 
-      // Sniper instant-fire shots cover up to 10000 px/s, so point tests
-      // would tunnel straight through the target. Sweep the travel segment.
-      const marble = this.sniperBuffActive
-        ? this.findSweptMarbleHit(
-            previousX,
-            previousY,
-            shot.sprite.x,
-            shot.sprite.y,
-          )
-        : this.findMarbleHit(shot);
+      // Continuous swept segment collision for all shots: prevents tunnelling
+      // on mobile frame drops or high velocities and always hits the first
+      // obstacle along the trajectory.
+      const marble = this.findSweptMarbleHit(
+        previousX,
+        previousY,
+        shot.sprite.x,
+        shot.sprite.y,
+      );
       if (marble) {
         this.resolveHit(shot, marble);
         continue;
       }
 
-      const bonus = this.sniperBuffActive
-        ? this.findSweptBonusHit(
-            previousX,
-            previousY,
-            shot.sprite.x,
-            shot.sprite.y,
-          )
-        : this.findBonusHit(shot);
+      const bonus = this.findSweptBonusHit(
+        previousX,
+        previousY,
+        shot.sprite.x,
+        shot.sprite.y,
+      );
       if (bonus) {
         this.collectBonus(bonus, shot);
         continue;
@@ -5456,8 +5764,8 @@ export class GameScene extends Phaser.Scene {
     };
   }
 
-  // Red aiming laser from the cannon centre to the nearest marble on either
-  // track (or the screen edge). Drawn above balls/track depth.
+  // Red aiming laser from the cannon centre to the screen edge along the aim
+  // ray, showing the entire piercing path that will be blasted.
   updateSniperLaser() {
     if (!this.sniperBuffActive) {
       this.hideSniperLaser();
@@ -5469,15 +5777,7 @@ export class GameScene extends Phaser.Scene {
     const angle = this.cannon ? this.cannon.rotation : -Math.PI / 2;
     const dirX = Math.cos(angle);
     const dirY = Math.sin(angle);
-    const rayTarget = this.findSniperRayTarget(originX, originY, dirX, dirY);
     const edge = this.sniperEdgePoint(originX, originY, dirX, dirY);
-    const end = rayTarget
-      ? {
-          x: originX + dirX * rayTarget.distance,
-          y: originY + dirY * rayTarget.distance,
-          distance: rayTarget.distance,
-        }
-      : edge;
 
     if (!this.sniperLaser) {
       this.sniperLaser = this.add.graphics().setDepth(SNIPER_LASER_DEPTH);
@@ -5487,23 +5787,23 @@ export class GameScene extends Phaser.Scene {
     laser.clear();
     laser.setVisible(true);
 
-    // Outer glow, solid core, then a hot inner line.
-    laser.lineStyle(7, 0xff2222, 0.16);
-    laser.lineBetween(originX, originY, end.x, end.y);
-    laser.lineStyle(2.4, 0xff3b3b, 0.82);
-    laser.lineBetween(originX, originY, end.x, end.y);
-    laser.lineStyle(1, 0xffd0d0, 0.95);
-    laser.lineBetween(originX, originY, end.x, end.y);
+    // Outer glow, solid core, then a hot inner line through the whole screen.
+    laser.lineStyle(8, 0xff2222, 0.2);
+    laser.lineBetween(originX, originY, edge.x, edge.y);
+    laser.lineStyle(3, 0xff4444, 0.85);
+    laser.lineBetween(originX, originY, edge.x, edge.y);
+    laser.lineStyle(1.2, 0xffe0e0, 0.95);
+    laser.lineBetween(originX, originY, edge.x, edge.y);
 
-    // Reticle at the impact point (bigger when a marble is targeted).
+    // Reticle at the edge point
     laser.lineStyle(2, 0xff5252, 0.9);
-    laser.strokeCircle(end.x, end.y, rayTarget ? BALL_RADIUS + 4 : 9);
+    laser.strokeCircle(edge.x, edge.y, 10);
     laser.lineStyle(1.2, 0xffb0b0, 0.85);
-    laser.lineBetween(end.x - 12, end.y, end.x + 12, end.y);
-    laser.lineBetween(end.x, end.y - 12, end.x, end.y + 12);
+    laser.lineBetween(edge.x - 12, edge.y, edge.x + 12, edge.y);
+    laser.lineBetween(edge.x, edge.y - 12, edge.x, edge.y + 12);
 
-    this.sniperLaserTarget = rayTarget ? rayTarget.marble : null;
-    this.sniperLaserEnd = { x: end.x, y: end.y, distance: end.distance };
+    this.sniperLaserTarget = null;
+    this.sniperLaserEnd = { x: edge.x, y: edge.y, distance: edge.distance };
     this.sniperLaserVisible = true;
   }
 
@@ -5800,7 +6100,7 @@ export class GameScene extends Phaser.Scene {
       this.sniperBuffActive = true;
       this.sniperTimer = SNIPER_BUFF_DURATION;
       this.createMatchBurst(sniperX, sniperY, sniperColor);
-      this.createFloatingText(sniperX, sniperY, '狙擊模式！', '#ff9a9a', 20);
+      this.createFloatingText(sniperX, sniperY, '強力貫穿雷射！', '#ff9a9a', 22);
       this.cameras.main.flash(160, 255, 90, 90);
       this.updateSniperLaser();
       return;
@@ -6007,39 +6307,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   findMatchRun(marble) {
-    const chain = marble.chain ?? this.chains[0];
-
-    if (!chain) {
-      return null;
-    }
-
-    const marbles = chain.marbles;
-    const insertedIndex = marbles.indexOf(marble);
-
-    if (insertedIndex === -1) {
-      return null;
-    }
-
-    const colorIndex = marble.colorIndex;
-    let start = insertedIndex;
-    let end = insertedIndex;
-
-    while (start > 0 && marbles[start - 1].colorIndex === colorIndex) {
-      start -= 1;
-    }
-
-    while (
-      end < marbles.length - 1 &&
-      marbles[end + 1].colorIndex === colorIndex
-    ) {
-      end += 1;
-    }
-
-    return {
-      start,
-      end,
-      length: end - start + 1,
-    };
+    return this.findTouchingMatchRun(marble);
   }
 
   resolveMatches(insertedMarble, isCombo = false) {
@@ -6350,15 +6618,15 @@ export class GameScene extends Phaser.Scene {
       positions.push({ x: spot.x, y: spot.y, clearance: 48 });
     }
 
-    // One star sits above the top track: reaching it requires firing through
-    // a gap in the chain, so it is worth the 300-point Gap Shot bonus. It is
-    // only added once the world's cap leaves room for a second pickup.
+    // One star sits above the track: reaching it requires firing through
+    // a gap in the chain, so it is worth the 300-point Gap Shot bonus. Placed
+    // safely below the top HUD (y >= 72) so it never overlaps text or buttons.
     if (cap > 1) {
       let gapX = Phaser.Math.Between(
-        this.cx + this.vw * 0.1,
-        this.cx + this.vw * 0.25,
+        this.cx + this.vw * 0.08,
+        this.cx + this.vw * 0.22,
       );
-      let gapY = Phaser.Math.Between(24, 34);
+      let gapY = Phaser.Math.Between(72, 88);
 
       if (
         this.distanceToTrack(gapX, gapY) < TRACK_CLEARANCE ||
@@ -6370,8 +6638,8 @@ export class GameScene extends Phaser.Scene {
         ) ||
         !this.shotPathCrossesTrack(gapX, gapY)
       ) {
-        gapX = this.cx + this.vw * 0.175;
-        gapY = 28;
+        gapX = this.cx + this.vw * 0.15;
+        gapY = 78;
       }
 
       positions.push({
@@ -6940,8 +7208,16 @@ export class GameScene extends Phaser.Scene {
       .setAlpha(0.54)
       .setDepth(DEPTH.hud);
 
+    const isTouch =
+      typeof window !== 'undefined' &&
+      (('ontouchstart' in window) ||
+        (window.matchMedia &&
+          (window.matchMedia('(pointer: coarse)').matches ||
+            window.matchMedia('(hover: none)').matches)));
+    const hintMessage = isTouch ? '點擊螢幕瞄準發射' : '移動滑鼠瞄準，點擊發射';
+
     const hintText = this.add
-      .text(770, 90, '移動滑鼠瞄準，點擊發射', {
+      .text(770, 90, hintMessage, {
         fontFamily: UI_FONT,
         fontSize: '13px',
         color: '#c8d8b2',
