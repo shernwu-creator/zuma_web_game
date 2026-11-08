@@ -89,11 +89,10 @@ const MUSIC_STORAGE_KEY = 'zumaJungleMusicMuted';
 const REVERSE_DURATION = 2.0;
 const PAUSE_DURATION = 3.0;
 // Sniper marble: documented ~5% special chance (mutually exclusive with
-// bomb/reverse/pause) that grants an aiming laser + instant-fire shots. The
-// buff window was doubled from the original 3 s to 6 s so the reward is
-// actually worth playing around.
+// bomb/reverse/pause) that grants an aiming laser + instant piercing shots.
+// Balanced at 4.0 s to keep gameplay challenging yet impactful.
 const SNIPER_CHANCE = 0.05;
-const SNIPER_BUFF_DURATION = 6.0;
+const SNIPER_BUFF_DURATION = 4.0;
 const SNIPER_SHOT_SPEED = 10000; // instant-fire shot speed while buffed
 const SNIPER_LASER_DEPTH = 11; // above balls (5) and launcher (9)
 const BOMB_BLAST_NEIGHBOURS = 2;
@@ -332,6 +331,7 @@ export class GameScene extends Phaser.Scene {
     // (see SPECIAL_SPAWN_GAP / SPECIAL_MIN_SPAWN).
     this.lastSpecialSpawnIndex = -SPECIAL_SPAWN_GAP;
     this.bonusTimer = 0;
+    this.consecutiveLosses = 0;
     this.levelWon = false;
     this.menuOverlay = null;
     this.gameOverOverlay = null;
@@ -534,6 +534,7 @@ export class GameScene extends Phaser.Scene {
     this.spawnChainCursor = 0;
     this.spawnedMarblesCount = 0;
     this.bonusTimer = 0;
+    this.consecutiveLosses = 0;
     this.levelWon = false;
     this.gameState = 'MENU';
     this.bonusItems = [];
@@ -659,7 +660,7 @@ export class GameScene extends Phaser.Scene {
     // torn down through its own helper (stops playback, frees the texture).
     this.destroyVictoryVideo();
 
-    if (this.victoryFallbackTweens.length > 0) {
+    if (this.victoryFallbackTweens && this.victoryFallbackTweens.length > 0) {
       for (const tween of this.victoryFallbackTweens) {
         if (tween) {
           tween.remove();
@@ -705,11 +706,33 @@ export class GameScene extends Phaser.Scene {
     this.shots = [];
 
     for (const item of this.bonusItems) {
-      item.each((child) => this.tweens.killTweensOf(child));
-      this.tweens.killTweensOf(item);
-      item.destroy();
+      if (item) {
+        if (typeof item.each === 'function') {
+          item.each((child) => this.tweens.killTweensOf(child));
+        }
+        this.tweens.killTweensOf(item);
+        if (typeof item.destroy === 'function') {
+          item.destroy();
+        }
+      }
     }
     this.bonusItems = [];
+
+    // Defensively sweep any orphaned bonus containers from the display list
+    if (this.children && Array.isArray(this.children.list)) {
+      const orphans = this.children.list.filter(
+        (child) => child && child.name === 'bonus-item',
+      );
+      for (const orphan of orphans) {
+        if (typeof orphan.each === 'function') {
+          orphan.each((child) => this.tweens.killTweensOf(child));
+        }
+        this.tweens.killTweensOf(orphan);
+        if (typeof orphan.destroy === 'function') {
+          orphan.destroy();
+        }
+      }
+    }
 
     this.updateMarbleCount();
   }
@@ -763,12 +786,18 @@ export class GameScene extends Phaser.Scene {
   getSpecialChances() {
     const difficulty = this.getDifficultyRatio();
 
+    // Mercy assist: consecutive losses (>= 2) slightly boost special marble drop rates
+    // (especially bomb and laser/sniper) to prevent players from being permanently stuck.
+    const assistMultiplier = this.consecutiveLosses >= 2
+      ? Math.min(1.6, 1.0 + (this.consecutiveLosses - 1) * 0.2)
+      : 1.0;
+
     return {
-      bomb: BOMB_BASE_CHANCE + BOMB_LEVEL_CHANCE * difficulty,
-      reverse: REVERSE_LEVEL_CHANCE * difficulty,
-      pause: PAUSE_BASE_CHANCE + PAUSE_LEVEL_CHANCE * difficulty,
-      // Fixed ~5% documented chance: an instant-fire sniper marble.
-      sniper: SNIPER_CHANCE,
+      bomb: (BOMB_BASE_CHANCE + BOMB_LEVEL_CHANCE * difficulty) * assistMultiplier,
+      reverse: (REVERSE_LEVEL_CHANCE * difficulty) * assistMultiplier,
+      pause: (PAUSE_BASE_CHANCE + PAUSE_LEVEL_CHANCE * difficulty) * assistMultiplier,
+      // Documented base ~5% chance boosted when on a losing streak
+      sniper: SNIPER_CHANCE * assistMultiplier,
     };
   }
 
@@ -1622,6 +1651,10 @@ export class GameScene extends Phaser.Scene {
       };
     }
 
+    if (this.currentWorld !== target.world || this.currentStage !== target.stage) {
+      this.consecutiveLosses = 0;
+    }
+
     this.currentWorld = target.world;
     this.currentStage = target.stage;
     this.selectedWorld = target.world;
@@ -1746,6 +1779,7 @@ export class GameScene extends Phaser.Scene {
     this.hideSniperLaser();
 
     if (isWin) {
+      this.consecutiveLosses = 0;
       this.addScore(WIN_BONUS);
 
       // Clearing a stage unlocks the next one (Stage 10 -> next World Stage
@@ -1782,6 +1816,7 @@ export class GameScene extends Phaser.Scene {
       this.stopBgm();
       this.playBgm(BGM_KEYS.victory);
     } else {
+      this.consecutiveLosses = (this.consecutiveLosses || 0) + 1;
       // Loss: gameplay music stops; the menu theme resumes on return.
       this.stopBgm();
     }
@@ -2182,6 +2217,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.gameState = 'MENU';
+    this.consecutiveLosses = 0;
     this.clearRoundObjects();
 
     // The home screen must not show any part of the abandoned run's track:
@@ -4549,8 +4585,18 @@ export class GameScene extends Phaser.Scene {
     }
 
     const chainSpeed = this.getChainSpeed();
+    const headT = marbles[0].t;
+
+    // Dynamic rubberbanding: when chain head enters danger zone (t > 0.85),
+    // apply clutch slowdown (up to 20% reduction) to allow clutch comebacks!
+    let dangerMultiplier = 1.0;
+    if (headT > 0.85 && !isReversing) {
+      const dangerRatio = Phaser.Math.Clamp((headT - 0.85) / 0.13, 0, 1);
+      dangerMultiplier = 1.0 - 0.20 * dangerRatio;
+    }
+
     const standardTravelT =
-      (chainSpeed * (isSlowed ? 0.3 : 1) * step) / trackLength;
+      (chainSpeed * (isSlowed ? 0.3 : 1) * dangerMultiplier * step) / trackLength;
     const catchUpTravelT =
       (chainSpeed * CATCH_UP_MULTIPLIER * step) / trackLength;
 
@@ -5363,7 +5409,7 @@ export class GameScene extends Phaser.Scene {
       const projX = muzzleX + t * segX;
       const projY = muzzleY + t * segY;
       if ((bonus.x - projX) ** 2 + (bonus.y - projY) ** 2 <= (BONUS_RADIUS + 12) ** 2) {
-        this.collectBonus(bonus, { colorIndex: this.currentBulletColor });
+        this.collectBonus(bonus, null);
       }
     }
 
@@ -5609,18 +5655,26 @@ export class GameScene extends Phaser.Scene {
         shot.sprite.x,
         shot.sprite.y,
       );
-      if (marble) {
-        this.resolveHit(shot, marble);
-        continue;
-      }
-
       const bonus = this.findSweptBonusHit(
         previousX,
         previousY,
         shot.sprite.x,
         shot.sprite.y,
       );
-      if (bonus) {
+
+      // If both obstacles intersect the travel segment, hit the closer one first
+      if (marble && bonus) {
+        if ((bonus._sweptEntry ?? 0) <= (marble._sweptEntry ?? 0)) {
+          this.collectBonus(bonus, shot);
+          continue;
+        } else {
+          this.resolveHit(shot, marble);
+          continue;
+        }
+      } else if (marble) {
+        this.resolveHit(shot, marble);
+        continue;
+      } else if (bonus) {
         this.collectBonus(bonus, shot);
         continue;
       }
@@ -5919,6 +5973,10 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
+    if (best) {
+      best._sweptEntry = bestEntry;
+    }
+
     return best;
   }
 
@@ -5951,6 +6009,10 @@ export class GameScene extends Phaser.Scene {
         bestEntry = entry;
         best = item;
       }
+    }
+
+    if (best) {
+      best._sweptEntry = bestEntry;
     }
 
     return best;
@@ -6572,6 +6634,19 @@ export class GameScene extends Phaser.Scene {
 
   createBonusItems() {
     this.createBonusTexture();
+    if (Array.isArray(this.bonusItems) && this.bonusItems.length > 0) {
+      for (const item of this.bonusItems) {
+        if (item) {
+          if (typeof item.each === 'function') {
+            item.each((child) => this.tweens.killTweensOf(child));
+          }
+          this.tweens.killTweensOf(item);
+          if (typeof item.destroy === 'function') {
+            item.destroy();
+          }
+        }
+      }
+    }
     this.bonusItems = [];
 
     const cap = this.getBonusCap();
@@ -6903,18 +6978,24 @@ export class GameScene extends Phaser.Scene {
     return null;
   }
 
-  collectBonus(item, shot) {
+  collectBonus(item, shot = null) {
+    if (!item || item.active === false) {
+      return;
+    }
+    item.active = false;
+
     const bonusIndex = this.bonusItems.indexOf(item);
     if (bonusIndex !== -1) {
       this.bonusItems.splice(bonusIndex, 1);
     }
 
-    const shotIndex = this.shots.indexOf(shot);
-    if (shotIndex !== -1) {
-      this.shots.splice(shotIndex, 1);
+    if (shot && shot.sprite && typeof shot.sprite.destroy === 'function') {
+      const shotIndex = this.shots.indexOf(shot);
+      if (shotIndex !== -1) {
+        this.shots.splice(shotIndex, 1);
+      }
+      shot.sprite.destroy();
     }
-
-    shot.sprite.destroy();
 
     const requiresGap = item.getData('requiresGap') === true;
     const points = requiresGap ? GAP_SHOT_SCORE : BONUS_SCORE;
