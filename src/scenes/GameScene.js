@@ -35,11 +35,15 @@ const INITIAL_NEXT_COLOR = 1;
 // World/Stage progression: 3 worlds x 10 stages. The absolute difficulty is
 //   D = (world - 1) * 10 + stage        (W1S1 = 1 ... W3S10 = 30)
 //   total marbles = 30 + D * 5          (W1S1 = 35 ... W3S10 = 180)
-//   chain speed   = 35 + D * 2.5        (W1S1 = 37.5 ... W3S10 = 110 px/s)
+// Speed overhaul: all stages start at uniform base speed (38 px/s), accelerating
+// smoothly over active round time instead of starting brutally fast on late stages.
 const LEVEL_BASE_MARBLES = 30;
 const LEVEL_MARBLES_STEP = 5;
-const LEVEL_BASE_SPEED = 35; // pixels per second
-const LEVEL_SPEED_STEP = 2.5;
+const UNIFORM_BASE_SPEED = 38; // pixels per second for all levels at start
+const SPEED_RAMP_RATE = 0.85; // speed increase per second of active round play
+const SPEED_RAMP_MAX = 65; // cap on speed increase from elapsed time
+const LEVEL_BASE_SPEED = UNIFORM_BASE_SPEED;
+const LEVEL_SPEED_STEP = 0; // speed depends on round time, not stage difficulty
 const MAX_WORLD = 3;
 const MAX_STAGE = 10;
 // Same-colour magnetism may pull a rear segment across a fairly large hole.
@@ -96,6 +100,10 @@ const SNIPER_BUFF_DURATION = 4.0;
 const SNIPER_SHOT_SPEED = 10000; // instant-fire shot speed while buffed
 const SNIPER_LASER_DEPTH = 11; // above balls (5) and launcher (9)
 const BOMB_BLAST_NEIGHBOURS = 2;
+// 2D Euclidean radius for bomb explosions: destroys packed marbles along the chain
+// and catches marbles on adjacent tracks/parallel loops within physical reach.
+const BOMB_PHYSICAL_RADIUS = 92;
+const SUPER_BOMB_PHYSICAL_RADIUS = 150;
 const BOMB_SCORE = 300;
 const BONUS_COUNT = 3;
 const BONUS_RADIUS = 16;
@@ -521,6 +529,8 @@ export class GameScene extends Phaser.Scene {
     this.sniperLaserTarget = null;
     this.sniperLaserEnd = null;
     this.sniperLaserVisible = false;
+    this.levelElapsedTime = 0;
+    this.specialHaloGraphics = this.add.graphics().setDepth(DEPTH.balls + 0.2);
     // BGM state is rebuilt every scene create; stop any stale track first.
     this.stopBgm();
     this.bgmTracks = {};
@@ -598,6 +608,10 @@ export class GameScene extends Phaser.Scene {
     }
 
     const step = Math.min(delta, MAX_FRAME_DELTA) / 1000;
+
+    if (this.pauseTimer <= 0) {
+      this.levelElapsedTime = (this.levelElapsedTime || 0) + step;
+    }
 
     this.updateChainMovement(step);
 
@@ -688,6 +702,10 @@ export class GameScene extends Phaser.Scene {
   }
 
   clearRoundObjects() {
+    if (this.specialHaloGraphics) {
+      this.specialHaloGraphics.clear();
+    }
+
     for (const chain of this.chains) {
       for (const marble of chain.marbles) {
         this.tweens.killTweensOf(marble);
@@ -755,7 +773,9 @@ export class GameScene extends Phaser.Scene {
   }
 
   getChainSpeed() {
-    return LEVEL_BASE_SPEED + this.getDifficulty() * LEVEL_SPEED_STEP;
+    const elapsed = Math.max(0, this.levelElapsedTime || 0);
+    const timeAcceleration = Math.min(SPEED_RAMP_MAX, elapsed * SPEED_RAMP_RATE);
+    return UNIFORM_BASE_SPEED + timeAcceleration;
   }
 
   // 0.1..1.0 across World 1 (matching the old W1/L1..L10 ramp exactly), then
@@ -1608,6 +1628,67 @@ export class GameScene extends Phaser.Scene {
     lfo.stop(now + duration);
   }
 
+  playLaserBeamSound(hitCount = 1) {
+    if (!this.audioCtx) {
+      return;
+    }
+
+    const now = this.audioCtx.currentTime;
+
+    // 1. High-tech laser discharge sweep: 1800 Hz down to 320 Hz
+    const osc = this.audioCtx.createOscillator();
+    const gain = this.audioCtx.createGain();
+
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(1800, now);
+    osc.frequency.exponentialRampToValueAtTime(320, now + 0.22);
+
+    gain.gain.setValueAtTime(0.35, now);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+
+    osc.connect(gain);
+    gain.connect(this.audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.24);
+
+    // 2. Punchy sub-bass transient: 100 Hz down to 35 Hz
+    const sub = this.audioCtx.createOscillator();
+    const subGain = this.audioCtx.createGain();
+
+    sub.type = 'sine';
+    sub.frequency.setValueAtTime(100, now);
+    sub.frequency.exponentialRampToValueAtTime(35, now + 0.18);
+
+    subGain.gain.setValueAtTime(0.4, now);
+    subGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+
+    sub.connect(subGain);
+    subGain.connect(this.audioCtx.destination);
+    sub.start(now);
+    sub.stop(now + 0.2);
+
+    // 3. Multi-tone ascending pitches for each pierced target
+    const count = Math.min(10, Math.max(1, hitCount));
+    for (let i = 0; i < count; i += 1) {
+      const toneOsc = this.audioCtx.createOscillator();
+      const toneGain = this.audioCtx.createGain();
+      const startTime = now + 0.02 + i * 0.025;
+      const freq = 520 * Math.pow(1.12, i);
+
+      toneOsc.type = 'triangle';
+      toneOsc.frequency.setValueAtTime(freq, startTime);
+
+      toneGain.gain.setValueAtTime(0.0001, startTime);
+      toneGain.gain.linearRampToValueAtTime(0.2, startTime + 0.005);
+      toneGain.gain.exponentialRampToValueAtTime(0.0001, startTime + 0.07);
+
+      toneOsc.connect(toneGain);
+      toneGain.connect(this.audioCtx.destination);
+      toneOsc.start(startTime);
+      toneOsc.stop(startTime + 0.075);
+    }
+  }
+
   // Fresh run from the home menu or after a loss: start the selected level
   // with a zeroed run score. `startLevel` handles the rest of the setup.
   startGame(world = this.selectedWorld, stage = this.selectedStage) {
@@ -1694,6 +1775,7 @@ export class GameScene extends Phaser.Scene {
     this.createTracks();
 
     this.gameState = 'PLAYING';
+    this.levelElapsedTime = 0;
     this.spawnedMarblesCount = 0;
     this.spawnChainCursor = 0;
     this.lastSpecialSpawnIndex = -SPECIAL_SPAWN_GAP;
@@ -4958,6 +5040,51 @@ export class GameScene extends Phaser.Scene {
         marble.setPosition(position.x, position.y);
       }
     }
+
+    this.updateSpecialHalos();
+  }
+
+  updateSpecialHalos() {
+    if (!this.specialHaloGraphics) {
+      return;
+    }
+
+    this.specialHaloGraphics.clear();
+
+    if (this.gameState !== 'PLAYING') {
+      return;
+    }
+
+    const time = this.time ? this.time.now : Date.now();
+    const pulse = 0.5 + 0.5 * Math.sin(time * 0.007);
+    const haloRadius = BALL_RADIUS * SPECIAL_MARBLE_SCALE + 2.5 + pulse * 4.5;
+    const haloAlpha = 0.5 + pulse * 0.45;
+
+    for (const chain of this.chains) {
+      for (const marble of chain.marbles) {
+        if (!marble || marble.active === false || !marble.visible) {
+          continue;
+        }
+
+        let color = null;
+        if (marble.isBomb) {
+          color = 0xff5522;
+        } else if (marble.isSniper) {
+          color = 0xff2266;
+        } else if (marble.isReverse) {
+          color = 0x22ccff;
+        } else if (marble.isPause) {
+          color = 0x99eeff;
+        }
+
+        if (color !== null) {
+          this.specialHaloGraphics.lineStyle(2, color, haloAlpha);
+          this.specialHaloGraphics.strokeCircle(marble.x, marble.y, haloRadius);
+          this.specialHaloGraphics.lineStyle(4.5, color, haloAlpha * 0.35);
+          this.specialHaloGraphics.strokeCircle(marble.x, marble.y, haloRadius + 2.5);
+        }
+      }
+    }
   }
 
   getTrackPoint(distance, chain = this.chains[0]) {
@@ -5356,7 +5483,6 @@ export class GameScene extends Phaser.Scene {
 
     this.cameras.main.shake(160, 0.012);
     this.createMuzzleFlash(muzzleX, muzzleY);
-    this.playShootSound();
 
     // 2. Ray geometry
     const segX = edge.x - muzzleX;
@@ -5414,8 +5540,12 @@ export class GameScene extends Phaser.Scene {
     }
 
     if (hitRecords.length === 0) {
+      this.playLaserBeamSound(1);
       return;
     }
+
+    // Piercing laser sound with ascending note feedback for each pierced marble
+    this.playLaserBeamSound(hitRecords.length);
 
     // 4. Detonate and penetrate all hit marbles with amplified special effects
     const affectedChains = new Set();
@@ -5435,48 +5565,62 @@ export class GameScene extends Phaser.Scene {
       const color = marble.colorIndex;
 
       if (marble.isBomb) {
-        chain.marbles.splice(mIndex, 1);
-        marble.destroy();
-
-        // Doubled blast range: 4 neighbors each way
-        const doubleBlastNeighbours = BOMB_BLAST_NEIGHBOURS * 2;
-        let start = mIndex;
-        let end = mIndex;
-        for (let s = 0; s < doubleBlastNeighbours; s += 1) {
-          const idx = start - 1;
-          if (idx < 0) break;
-          const gap = chain.marbles[idx].t - chain.marbles[idx + 1].t;
-          if (!Number.isFinite(gap) || gap > chain.deltaT + 0.005) break;
-          start = idx;
-        }
-        for (let s = 0; s < doubleBlastNeighbours; s += 1) {
-          const idx = end;
-          if (idx >= chain.marbles.length) break;
-          if (idx > 0) {
-            const gap = chain.marbles[idx - 1].t - chain.marbles[idx].t;
-            if (!Number.isFinite(gap) || gap > chain.deltaT + 0.005) break;
+        // Spatial radius explosion: captures marbles across all chains within SUPER_BOMB_PHYSICAL_RADIUS
+        const blastHits = this.getMarblesInRadius(mx, my, SUPER_BOMB_PHYSICAL_RADIUS);
+        const blastByChain = new Map();
+        for (const hit of blastHits) {
+          affectedChains.add(hit.chain);
+          let list = blastByChain.get(hit.chain);
+          if (!list) {
+            list = [];
+            blastByChain.set(hit.chain, list);
           }
-          end = idx + 1;
+          list.push(hit.marble);
         }
 
-        const blasted = chain.marbles.splice(start, Math.max(0, end - start));
-        blasted.forEach((m, idx) => {
-          this.tweens.add({
-            targets: m,
-            scale: this.getMarbleDisplayScale(m) * 2.0,
-            alpha: 0,
-            angle: m.angle + 75,
-            duration: 320,
-            delay: idx * 16,
-            ease: 'Back.easeIn',
-            onComplete: () => m.destroy(),
-          });
-        });
+        if (!blastByChain.has(chain)) {
+          blastByChain.set(chain, [marble]);
+        } else if (!blastByChain.get(chain).includes(marble)) {
+          blastByChain.get(chain).push(marble);
+        }
 
-        const bombScore = BOMB_SCORE * 2;
+        let totalBlastedCount = 0;
+        for (const [targetChain, targetMarbles] of blastByChain) {
+          const marbleSet = new Set(targetMarbles);
+          for (let i = targetChain.marbles.length - 1; i >= 0; i -= 1) {
+            const m = targetChain.marbles[i];
+            if (marbleSet.has(m)) {
+              targetChain.marbles.splice(i, 1);
+              totalBlastedCount += 1;
+              m.magnetApproaching = false;
+              this.tweens.add({
+                targets: m,
+                scale: this.getMarbleDisplayScale(m) * 2.0,
+                alpha: 0,
+                angle: m.angle + 75,
+                duration: 320,
+                delay: (totalBlastedCount % 8) * 16,
+                ease: 'Back.easeIn',
+                onComplete: () => m.destroy(),
+              });
+            }
+          }
+        }
+
+        this.createBombShockwave(mx, my, SUPER_BOMB_PHYSICAL_RADIUS, 0xff2222);
+
+        const bombScore = Math.max(BOMB_SCORE * 2, totalBlastedCount * 120);
         this.addScore(bombScore);
         this.createMatchBurst(mx, my, color);
-        this.createFloatingText(mx, my, `超級炸彈！+${bombScore}`, '#fff1b9', 24);
+        this.createFloatingText(
+          mx,
+          my,
+          totalBlastedCount > 1
+            ? `超級炸彈！+${bombScore} (${totalBlastedCount}球)`
+            : `超級炸彈！+${bombScore}`,
+          '#fff1b9',
+          24,
+        );
         this.cameras.main.shake(260, 0.016);
         this.playExplosionSound();
       } else if (marble.isReverse) {
@@ -6259,6 +6403,60 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  // Collect all marbles across all active tracks within a 2D Euclidean radius.
+  getMarblesInRadius(centerX, centerY, radius) {
+    const radiusSq = radius * radius;
+    const hits = [];
+
+    for (const chain of this.chains) {
+      for (let index = 0; index < chain.marbles.length; index += 1) {
+        const marble = chain.marbles[index];
+        if (!marble || marble.active === false) {
+          continue;
+        }
+
+        const dx = marble.x - centerX;
+        const dy = marble.y - centerY;
+        const distSq = dx * dx + dy * dy;
+
+        if (distSq <= radiusSq) {
+          hits.push({
+            chain,
+            marble,
+            index,
+            dist: Math.sqrt(distSq),
+          });
+        }
+      }
+    }
+
+    return hits;
+  }
+
+  // Visual expanding shockwave ring showing physical blast reach.
+  createBombShockwave(x, y, targetRadius, color = 0xff7722) {
+    const shockwave = this.add.graphics().setDepth(DEPTH.shots + 1);
+    const ring = { radius: 12, alpha: 0.95 };
+
+    this.tweens.add({
+      targets: ring,
+      radius: targetRadius,
+      alpha: 0,
+      duration: 320,
+      ease: 'Quad.easeOut',
+      onUpdate: () => {
+        shockwave.clear();
+        shockwave.lineStyle(4, color, ring.alpha);
+        shockwave.strokeCircle(x, y, ring.radius);
+        shockwave.lineStyle(1.5, 0xffffff, ring.alpha * 0.85);
+        shockwave.strokeCircle(x, y, Math.max(0, ring.radius - 3));
+      },
+      onComplete: () => {
+        shockwave.destroy();
+      },
+    });
+  }
+
   // Inclusive [start, end] index range destroyed by a bomb. The chain array is
   // ordered head -> tail (t descending), so the shockwave simply walks outwards
   // from the bomb index and stops at the first real gap. Two neighbouring
@@ -6310,9 +6508,6 @@ export class GameScene extends Phaser.Scene {
   resolveBombHit(shot, bombMarble, bombIndex) {
     this.playExplosionSound();
 
-    const chain = bombMarble.chain ?? this.chains[0];
-    const marbles = chain ? chain.marbles : [];
-
     const shotIndex = this.shots.indexOf(shot);
     if (shotIndex !== -1) {
       this.shots.splice(shotIndex, 1);
@@ -6322,46 +6517,65 @@ export class GameScene extends Phaser.Scene {
     const bombX = bombMarble.x;
     const bombY = bombMarble.y;
     const colorIndex = bombMarble.colorIndex;
-    // Blast radius measured along the track: only the marbles physically
-    // packed against the blast group are destroyed, and the survivors below
-    // keep their own t. No push is applied anywhere else, so a hole in the
-    // chain stops the shockwave instead of shoving distant marbles into it.
-    const { start, end } = this.getBombBlastRange(
-      marbles,
-      bombIndex,
-      chain ? chain.deltaT : 0,
-    );
+    const hitChain = bombMarble.chain ?? this.chains[0];
 
-    const destroyed = marbles.splice(start, end - start + 1);
-    destroyed.forEach((marble, index) => {
-      marble.magnetApproaching = false;
+    // Spatial radius explosion: captures marbles on the same track AND adjacent tracks
+    const blastHits = this.getMarblesInRadius(bombX, bombY, BOMB_PHYSICAL_RADIUS);
+    const blastByChain = new Map();
+    for (const hit of blastHits) {
+      let list = blastByChain.get(hit.chain);
+      if (!list) {
+        list = [];
+        blastByChain.set(hit.chain, list);
+      }
+      list.push(hit.marble);
+    }
 
-      this.tweens.add({
-        targets: marble,
-        scale: this.getMarbleDisplayScale(marble) * 1.8,
-        alpha: 0,
-        angle: marble.angle + 60,
-        duration: 320,
-        delay: index * 22,
-        ease: 'Back.easeIn',
-        onComplete: () => marble.destroy(),
-      });
-    });
+    if (hitChain && !blastByChain.has(hitChain)) {
+      blastByChain.set(hitChain, [bombMarble]);
+    } else if (hitChain && !blastByChain.get(hitChain).includes(bombMarble)) {
+      blastByChain.get(hitChain).push(bombMarble);
+    }
 
-    if (chain) {
+    let totalDestroyed = 0;
+    for (const [chain, targetMarbles] of blastByChain) {
+      const marbleSet = new Set(targetMarbles);
+      for (let i = chain.marbles.length - 1; i >= 0; i -= 1) {
+        const marble = chain.marbles[i];
+        if (marbleSet.has(marble)) {
+          chain.marbles.splice(i, 1);
+          totalDestroyed += 1;
+          marble.magnetApproaching = false;
+
+          this.tweens.add({
+            targets: marble,
+            scale: this.getMarbleDisplayScale(marble) * 1.8,
+            alpha: 0,
+            angle: marble.angle + 60,
+            duration: 320,
+            delay: (totalDestroyed % 8) * 22,
+            ease: 'Back.easeIn',
+            onComplete: () => marble.destroy(),
+          });
+        }
+      }
+
       this.refreshChainMetrics(chain);
     }
 
     this.syncPrimaryAliases();
     this.updateMarbleCount();
 
-    this.addScore(BOMB_SCORE);
+    this.createBombShockwave(bombX, bombY, BOMB_PHYSICAL_RADIUS, 0xff7722);
+
+    const points = Math.max(BOMB_SCORE, totalDestroyed * 60);
+    this.addScore(points);
     this.slowdownTimer = 1.5;
     this.createMatchBurst(bombX, bombY, colorIndex);
     this.createFloatingText(
       bombX,
       bombY,
-      `炸彈！+${BOMB_SCORE}`,
+      totalDestroyed > 1 ? `炸彈！+${points} (${totalDestroyed}球)` : `炸彈！+${points}`,
       '#fff1b9',
       20,
     );
