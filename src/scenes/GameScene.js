@@ -6,6 +6,7 @@ import {
 } from './viewport.js';
 import {
   dualInnerTrackPoints,
+  dualLandscapeTracks,
   landscapeTrackPoints,
   portraitTrackFrame,
   portraitTrackPoints,
@@ -530,7 +531,9 @@ export class GameScene extends Phaser.Scene {
     this.sniperLaserEnd = null;
     this.sniperLaserVisible = false;
     this.levelElapsedTime = 0;
+    this.comboStreak = 0;
     this.specialHaloGraphics = this.add.graphics().setDepth(DEPTH.balls + 0.2);
+    this.aimAssistGraphics = this.add.graphics().setDepth(DEPTH.effects - 1);
     // BGM state is rebuilt every scene create; stop any stale track first.
     this.stopBgm();
     this.bgmTracks = {};
@@ -625,6 +628,7 @@ export class GameScene extends Phaser.Scene {
     this.updateBonusSpawner(step);
     this.aimAtPointer();
     this.updateSniper(step);
+    this.updateAimAssist();
     this.checkWinCondition();
   }
 
@@ -702,6 +706,10 @@ export class GameScene extends Phaser.Scene {
   }
 
   clearRoundObjects() {
+    if (this.aimAssistGraphics) {
+      this.aimAssistGraphics.clear();
+    }
+
     if (this.specialHaloGraphics) {
       this.specialHaloGraphics.clear();
     }
@@ -1517,13 +1525,15 @@ export class GameScene extends Phaser.Scene {
     osc.stop(now + 0.055);
   }
 
-  playMatchSound() {
+  playMatchSound(streak = 1) {
     if (!this.audioCtx) {
       return;
     }
 
     const now = this.audioCtx.currentTime;
     const notes = [523, 659, 783];
+    const semitones = Math.min(10, Math.max(0, streak - 1) * 2);
+    const pitchFactor = Math.pow(2, semitones / 12);
 
     notes.forEach((frequency, index) => {
       const start = now + index * 0.08;
@@ -1531,7 +1541,7 @@ export class GameScene extends Phaser.Scene {
       const gain = this.audioCtx.createGain();
 
       osc.type = 'sine';
-      osc.frequency.setValueAtTime(frequency, start);
+      osc.frequency.setValueAtTime(frequency * pitchFactor, start);
 
       gain.gain.setValueAtTime(0.0001, start);
       gain.gain.linearRampToValueAtTime(0.12, start + 0.008);
@@ -1781,8 +1791,12 @@ export class GameScene extends Phaser.Scene {
     this.lastSpecialSpawnIndex = -SPECIAL_SPAWN_GAP;
     this.bonusTimer = 0;
     this.slowdownTimer = 0;
+    this.comboStreak = 0;
     this.reverseTimer = 0;
     this.pauseTimer = 0;
+    if (this.aimAssistGraphics) {
+      this.aimAssistGraphics.clear();
+    }
     this.sniperBuffActive = false;
     this.sniperTimer = 0;
     if (this.sniperLaser) {
@@ -1856,9 +1870,13 @@ export class GameScene extends Phaser.Scene {
     this.gameState = 'GAMEOVER';
     this.levelWon = isWin;
     this.slowdownTimer = 0;
+    this.comboStreak = 0;
     this.sniperBuffActive = false;
     this.sniperTimer = 0;
     this.hideSniperLaser();
+    if (this.aimAssistGraphics) {
+      this.aimAssistGraphics.clear();
+    }
 
     if (isWin) {
       this.consecutiveLosses = 0;
@@ -3258,6 +3276,11 @@ export class GameScene extends Phaser.Scene {
     return landscapeTrackPoints(difficulty).points;
   }
 
+  // World 3 dual-track layouts (guaranteed non-overlapping outer & inner tracks).
+  buildDualLandscapeTracks(difficulty = this.getDifficulty()) {
+    return dualLandscapeTracks(difficulty);
+  }
+
   // World 3's second, inner spline for one stage (three authored rings x four
   // transforms + a stage wave).
   buildDualInnerTrack(difficulty = this.getDifficulty()) {
@@ -3843,17 +3866,24 @@ export class GameScene extends Phaser.Scene {
     // regenerate exactly the same stage layout after a window resize: portrait
     // routes are rebuilt from the difficulty against the live board, landscape
     // ones are simply re-mapped from their stored design points.
-    const specs = this.isPortraitView
-      ? [{ portrait: true, difficulty, isInner: false }]
-      : [{ points: this.buildLandscapeTrack(difficulty), difficulty, isInner: false }];
-
-    // World 3 (D >= 21) gets a second, independent inner spline.
-    if (this.isDualTrack()) {
-      specs.push({
-        points: this.buildDualInnerTrack(difficulty),
-        difficulty,
-        isInner: true,
-      });
+    let specs;
+    if (this.isPortraitView) {
+      specs = [{ portrait: true, difficulty, isInner: false }];
+      if (this.isDualTrack()) {
+        specs.push({
+          points: this.buildDualInnerTrack(difficulty),
+          difficulty,
+          isInner: true,
+        });
+      }
+    } else if (this.isDualTrack()) {
+      const dual = this.buildDualLandscapeTracks(difficulty);
+      specs = [
+        { points: dual.outer, difficulty, isInner: false },
+        { points: dual.inner, difficulty, isInner: true },
+      ];
+    } else {
+      specs = [{ points: this.buildLandscapeTrack(difficulty), difficulty, isInner: false }];
     }
 
     this.layoutSpecs = specs;
@@ -4269,45 +4299,47 @@ export class GameScene extends Phaser.Scene {
     const marbles = chain.marbles;
     const deltaT = chain.deltaT;
 
-    // The array runs head -> tail, so only the last marble can be pushed below
-    // the tunnel mouth. Slide just the CONNECTED run that touches the entrance:
-    // the first real gap absorbs the shift, so a detached section further up
-    // the track is never dragged along (that telekinetic pull was the "phantom
-    // push" that shoved balls the player never touched).
-    const tail = marbles[marbles.length - 1];
-
-    if (tail && tail.t < 0) {
-      const forwardShift = -tail.t;
-      tail.t = 0;
-      tail.pushOffset -= forwardShift;
-
-      for (let index = marbles.length - 1; index > 0; index -= 1) {
-        const behind = marbles[index];
-        const current = marbles[index - 1];
-        const gap = current.t - behind.t;
-
-        if (gap >= deltaT) {
-          // The gap absorbs the push; the run ahead of it must not move.
-          break;
-        }
-
-        const shift = deltaT - gap;
-        current.t += shift;
-        // Keep the rendered marble where it was: pushOffset decays over the
-        // next frames, so the whole run slides forward instead of snapping.
-        current.pushOffset -= shift;
+    // Boundary check from tail: if tail or rear marbles were pushed past t = 0 (entrance),
+    // clamp them safely to t = 0 with bounded pushOffset so they never accumulate negative offsets.
+    for (let index = marbles.length - 1; index >= 0; index -= 1) {
+      const marble = marbles[index];
+      if (marble.t < 0) {
+        marble.pushOffset = Phaser.Math.Clamp(
+          (marble.pushOffset ?? 0) + marble.t,
+          -deltaT * 1.5,
+          deltaT * 1.5,
+        );
+        marble.t = 0;
       }
     }
 
-    // Boundary safety net: never leave a marble outside the track, and always
-    // compensate pushOffset so a clamp cannot teleport it on screen.
+    // Ensure adjacent marbles preserve spatial ordering (ahead.t >= behind.t)
+    // without runaway exponential forward shoves.
+    for (let index = marbles.length - 1; index > 0; index -= 1) {
+      const behind = marbles[index];
+      const ahead = marbles[index - 1];
+      if (ahead.t < behind.t + deltaT * 0.5) {
+        const targetT = Math.min(1, behind.t + deltaT);
+        const shift = targetT - ahead.t;
+        if (shift > 0 && shift <= deltaT) {
+          ahead.t = targetT;
+          ahead.pushOffset = Phaser.Math.Clamp(
+            (ahead.pushOffset ?? 0) - shift,
+            -deltaT * 1.5,
+            deltaT * 1.5,
+          );
+        }
+      }
+    }
+
+    // Boundary safety net: never leave a marble outside [0, 1]
     for (const marble of marbles) {
       if (marble.t < 0) {
-        marble.pushOffset += marble.t;
         marble.t = 0;
+        marble.pushOffset = Math.max(-deltaT, marble.pushOffset ?? 0);
       } else if (marble.t > 1) {
-        marble.pushOffset += marble.t - 1;
         marble.t = 1;
+        marble.pushOffset = Math.min(deltaT, marble.pushOffset ?? 0);
       }
     }
   }
@@ -4841,6 +4873,16 @@ export class GameScene extends Phaser.Scene {
         ) {
           comboMarble = rearHead;
         }
+
+        // Settling recoil on physical collision impact (終點向起點撞擊帶回退微彈反饋)
+        if (locked && !tail._wasLockedLastFrame) {
+          rearHead.pushOffset = Math.min(
+            deltaT * 0.8,
+            (rearHead.pushOffset ?? 0) + deltaT * 0.45,
+          );
+          rearHead.t = Math.max(0, rearHead.t - deltaT * 0.35);
+        }
+        tail._wasLockedLastFrame = locked;
 
         let cursorT = Phaser.Math.Clamp(locked ? limitT : nextTailT, 0, 1);
 
@@ -6038,6 +6080,82 @@ export class GameScene extends Phaser.Scene {
     this.updateSniperLaser();
   }
 
+  // Dual-track aiming aid (World 3): indicates track collision order and displays
+  // a color-coded micro prediction reticle (Amber = Outer Track, Cyan = Inner Track).
+  updateAimAssist() {
+    if (!this.aimAssistGraphics) {
+      return;
+    }
+
+    if (
+      !this.isDualTrack() ||
+      this.gameState !== 'PLAYING' ||
+      this.sniperBuffActive
+    ) {
+      this.aimAssistGraphics.clear();
+      return;
+    }
+
+    const originX = this.launcherX;
+    const originY = this.launcherY;
+    const angle = this.cannon ? this.cannon.rotation : -Math.PI / 2;
+    const dirX = Math.cos(angle);
+    const dirY = Math.sin(angle);
+    const maxRange = 900;
+    const toX = originX + dirX * maxRange;
+    const toY = originY + dirY * maxRange;
+
+    const hit = this.findSweptMarbleHit(originX, originY, toX, toY);
+    const g = this.aimAssistGraphics;
+    g.clear();
+
+    if (hit && hit._sweptEntry !== undefined && hit._sweptEntry <= 1) {
+      const hitDist = maxRange * hit._sweptEntry;
+      const hitX = originX + dirX * hitDist;
+      const hitY = originY + dirY * hitDist;
+      const isInner = Boolean(hit.chain && hit.chain.isInner);
+      const trackColor = isInner ? 0x00e5ff : 0xffb300; // Cyan = Inner, Amber = Outer
+
+      // Dotted trajectory line to the impact point
+      const dashLen = 7;
+      const gapLen = 5;
+      const stepDist = dashLen + gapLen;
+      const count = Math.floor(hitDist / stepDist);
+
+      g.lineStyle(1.6, trackColor, 0.5);
+      for (let i = 0; i < count; i += 1) {
+        const d1 = i * stepDist + 22; // Start past cannon muzzle
+        const d2 = Math.min(hitDist - 4, d1 + dashLen);
+        if (d1 < hitDist - 4) {
+          g.lineBetween(
+            originX + dirX * d1,
+            originY + dirY * d1,
+            originX + dirX * d2,
+            originY + dirY * d2,
+          );
+        }
+      }
+
+      // Micro prediction reticle at impact point
+      const time = this.time ? this.time.now : Date.now();
+      const pulse = 0.5 + 0.5 * Math.sin(time * 0.008);
+      const reticleRadius = 10 + pulse * 2.5;
+
+      // Outer color ring
+      g.lineStyle(2, trackColor, 0.85);
+      g.strokeCircle(hitX, hitY, reticleRadius);
+
+      // Inner white crosshair
+      g.lineStyle(1.2, 0xffffff, 0.9);
+      g.lineBetween(hitX - 4, hitY, hitX + 4, hitY);
+      g.lineBetween(hitX, hitY - 4, hitX, hitY + 4);
+
+      // Outer micro bracket
+      g.lineStyle(1.2, trackColor, 0.6);
+      g.strokeCircle(hitX, hitY, reticleRadius + 4);
+    }
+  }
+
   // Entry parameter (0..1) of a segment against a circle, or null when missed.
   segmentCircleEntry(
     fromX,
@@ -6378,11 +6496,24 @@ export class GameScene extends Phaser.Scene {
         break;
       }
 
-      const shiftAmount = chain.deltaT - gap;
-      ahead.t += shiftAmount;
+      const effectiveGap = Math.max(0, gap);
+      const shiftAmount = Phaser.Math.Clamp(
+        chain.deltaT - effectiveGap,
+        0,
+        chain.deltaT,
+      );
+      if (shiftAmount <= 0) {
+        break;
+      }
+
+      ahead.t = Math.min(1, ahead.t + shiftAmount);
       // Keep the rendered marble where it was; pushOffset decays over the next
       // frames so the shove reads as a slide instead of a jump.
-      ahead.pushOffset -= shiftAmount;
+      ahead.pushOffset = Phaser.Math.Clamp(
+        (ahead.pushOffset ?? 0) - shiftAmount,
+        -chain.deltaT * 1.5,
+        chain.deltaT * 1.5,
+      );
     }
 
     // Commit all pushed t values to screen coordinates BEFORE scanning for
@@ -6399,6 +6530,7 @@ export class GameScene extends Phaser.Scene {
     const matchLength = this.resolveMatches(insertedMarble);
 
     if (matchLength === 0) {
+      this.comboStreak = 0;
       this.playClickSound();
     }
   }
@@ -6450,6 +6582,30 @@ export class GameScene extends Phaser.Scene {
         shockwave.strokeCircle(x, y, ring.radius);
         shockwave.lineStyle(1.5, 0xffffff, ring.alpha * 0.85);
         shockwave.strokeCircle(x, y, Math.max(0, ring.radius - 3));
+      },
+      onComplete: () => {
+        shockwave.destroy();
+      },
+    });
+  }
+
+  // Visual expanding shockwave ring for combo elimination impact.
+  createComboShockwave(x, y, targetRadius = 80, color = 0xffe066) {
+    const shockwave = this.add.graphics().setDepth(DEPTH.effects);
+    const ring = { radius: 10, alpha: 0.95 };
+
+    this.tweens.add({
+      targets: ring,
+      radius: targetRadius,
+      alpha: 0,
+      duration: 340,
+      ease: 'Cubic.easeOut',
+      onUpdate: () => {
+        shockwave.clear();
+        shockwave.lineStyle(3.5, color, ring.alpha);
+        shockwave.strokeCircle(x, y, ring.radius);
+        shockwave.lineStyle(1.5, 0xffffff, ring.alpha * 0.9);
+        shockwave.strokeCircle(x, y, Math.max(0, ring.radius - 2.5));
       },
       onComplete: () => {
         shockwave.destroy();
@@ -6560,6 +6716,33 @@ export class GameScene extends Phaser.Scene {
         }
       }
 
+      // Apply blast recoil knockback to the marble directly behind the blast on this chain
+      let firstRearMarble = null;
+      for (const marble of chain.marbles) {
+        if (marble && marble.t < (bombMarble.chain === chain ? bombMarble.t : 1)) {
+          firstRearMarble = marble;
+          break;
+        }
+      }
+      if (firstRearMarble) {
+        const blastRecoil = chain.deltaT * 2.0;
+        firstRearMarble.t = Math.max(0, firstRearMarble.t - blastRecoil);
+        firstRearMarble.pushOffset = blastRecoil;
+        const rearIdx = chain.marbles.indexOf(firstRearMarble);
+        if (rearIdx !== -1) {
+          for (let k = rearIdx; k < chain.marbles.length - 1; k += 1) {
+            const curr = chain.marbles[k];
+            const next = chain.marbles[k + 1];
+            const gap = curr.t - next.t;
+            if (!Number.isFinite(gap) || gap >= chain.deltaT) break;
+            const overlap = chain.deltaT - gap;
+            if (overlap <= 0) break;
+            next.t = Math.max(0, next.t - overlap);
+            next.pushOffset = (next.pushOffset ?? 0) + overlap;
+          }
+        }
+      }
+
       this.refreshChainMetrics(chain);
     }
 
@@ -6600,14 +6783,20 @@ export class GameScene extends Phaser.Scene {
       return 0;
     }
 
+    // Update combo streak
+    if (isCombo) {
+      this.comboStreak = (this.comboStreak || 1) + 1;
+    } else {
+      this.comboStreak = 1;
+    }
+
     const { start, end } = run;
     const matchLength = run.length;
     const colorIndex = insertedMarble.colorIndex;
 
     const basePoints = 30 + Math.max(0, matchLength - 3) * 20;
-    const earnedPoints = isCombo
-      ? Math.round(basePoints * 1.5)
-      : basePoints;
+    const comboMultiplier = isCombo ? 1.0 + (this.comboStreak - 1) * 0.5 : 1.0;
+    const earnedPoints = Math.round(basePoints * comboMultiplier);
     this.addScore(earnedPoints);
 
     // The marble directly after the removed run receives an elastic kickback,
@@ -6615,6 +6804,10 @@ export class GameScene extends Phaser.Scene {
     // before the splice, while both marbles still exist. A rear marble that
     // sits across an existing hole must not be yanked backwards across it
     // (that telekinetic pull was the old pushback bug).
+    // Combo multiplier increases recoil knockback on chained eliminations!
+    const comboRecoilBonus = Math.min(2.5, (this.comboStreak - 1) * 0.8);
+    const recoilAmount = chain.deltaT * (1.5 + comboRecoilBonus);
+
     const pushbackMarble = marbles[end + 1] ?? null;
     const pushbackGap = pushbackMarble
       ? marbles[end].t - pushbackMarble.t
@@ -6636,13 +6829,13 @@ export class GameScene extends Phaser.Scene {
 
     if (pushbackMarble) {
       if (pushbackTouching) {
-        pushbackMarble.pushOffset = chain.deltaT * 1.5;
+        pushbackMarble.pushOffset = recoilAmount;
         pushbackMarble.t = Math.max(
           0,
-          pushbackMarble.t - chain.deltaT * 1.5,
+          pushbackMarble.t - recoilAmount,
         );
 
-        // The elastic kick opens a 1.5-diameter hole at the match site, but
+        // The elastic kick opens a hole at the match site, but
         // the marbles packed behind the kicked marble still hold the old
         // spacing. Without propagating that overlap they are rigid-clamped
         // against each other on the next movement frame, which teleports
@@ -6699,6 +6892,24 @@ export class GameScene extends Phaser.Scene {
     this.syncPrimaryAliases();
     this.updateMarbleCount();
 
+    // Trigger Combo Shockwave and floating text for combo streak >= 2
+    if (isCombo && this.comboStreak >= 2) {
+      this.createComboShockwave(
+        centerX,
+        centerY,
+        80 + Math.min(60, this.comboStreak * 16),
+        0xffe066,
+      );
+      this.createFloatingText(
+        centerX,
+        centerY,
+        `連鎖 ${this.comboStreak}x！擊退！+${earnedPoints}`,
+        '#ffe066',
+        22,
+      );
+      this.cameras.main.shake(160, Math.min(0.012, 0.003 * this.comboStreak));
+    }
+
     // Remove from the collision array immediately, then let the visuals
     // pop/fade away safely before destroying the sprites.
     matched.forEach((marble, index) => {
@@ -6715,7 +6926,7 @@ export class GameScene extends Phaser.Scene {
     });
 
     this.createMatchBurst(centerX, centerY, colorIndex);
-    this.playMatchSound();
+    this.playMatchSound(this.comboStreak);
     return matchLength;
   }
 
